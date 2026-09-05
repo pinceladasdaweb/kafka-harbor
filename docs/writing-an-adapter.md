@@ -11,13 +11,15 @@ about 150 lines, no logic beyond translation.
 ## The contract
 
 ```ts
-interface ClientAdapter {
-  readonly name: string
-  connect (config: BrokerConfig): Promise<void>
-  disconnect (): Promise<void>
-  produce (records: readonly RawRecord[]): Promise<void>
-  consume (options: ConsumeOptions): Promise<ConsumerHandle>
-  readonly admin: { createTopics, topicExists }
+import type { AdminApi, BrokerConfig, ClientAdapter, ConsumeOptions, ConsumerHandle, RawRecord } from 'kafka-harbor'
+
+const shape: ClientAdapter = {
+  name: 'mine',
+  connect: async (config: BrokerConfig) => {},
+  disconnect: async () => {},
+  produce: async (records: readonly RawRecord[]) => {},
+  consume: async (options: ConsumeOptions): Promise<ConsumerHandle> => ({ commit: async () => {}, stop: async () => {} }),
+  admin: { createTopics: async () => {}, topicExists: async () => false } satisfies AdminApi
 }
 ```
 
@@ -76,24 +78,28 @@ adapter's own unit tests run without a native binding.
 
 ## Proving it
 
-Run the shared contract suite against the real backend:
+Run the shared contract suite, exported from `kafka-harbor/testing`, against the real backend:
 
 ```ts
-import { runAdapterContract } from '../contract/adapter-contract'
+import { runAdapterContract } from 'kafka-harbor/testing'
 
 runAdapterContract('mine', async () => {
   const adapter = myAdapter()
   await adapter.connect({ clientId: 'contract', brokers })
   return {
     adapter,
-    topic: async (label, partitions = 1) => { /* create a unique topic, return its name */ },
+    topic: async (label, partitions = 1) => {
+      const topic = `${label}-${run}`
+      await adapter.admin.createTopics([{ topic, partitions, replicationFactor: 1 }])
+      return topic
+    },
     group: (label) => `${label}-${run}`,
     teardown: () => adapter.disconnect()
   }
 })
 ```
 
-The eight invariants are listed in the suite's header. An adapter that
+The suite is a `node:test` suite; run the file with `node --test`. The nine invariants are listed in its header. An adapter that
 passes them can be dropped into any harbor; an adapter that needs one of them
 relaxed has found either a bug in the client or a leak in the contract, and
 both are worth an issue.

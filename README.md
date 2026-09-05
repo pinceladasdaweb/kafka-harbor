@@ -38,6 +38,7 @@ harbor.enableSignalHandlers()        // SIGTERM -> finish in-flight handlers, co
 ## Table of contents
 
 - [Why another Kafka library?](#why-another-kafka-library)
+- [What it does not do](#what-it-does-not-do)
 - [Install](#install)
 - [Core concepts](#core-concepts)
 - [Producer](#producer)
@@ -57,18 +58,36 @@ harbor.enableSignalHandlers()        // SIGTERM -> finish in-flight handlers, co
 
 It is not a client. kafka-harbor runs **on top of** a client through a small `ClientAdapter` interface (connect, produce, consume, commit, pause, resume, admin). The default adapter wraps [`@confluentinc/kafka-javascript`](https://github.com/confluentinc/confluent-kafka-javascript), Confluent's supported client with librdkafka underneath; a second adapter for `@platformatic/kafka` is planned, and the interface is designed so that the core never sees a client type.
 
-What the core gives you, and what you would otherwise write yourself:
+Every Node.js team using Kafka ends up writing the same application layer on top of whichever client they picked, because the clients stop at the protocol. The comparison below is against the clients themselves, which is the honest one: kafka-harbor is not a replacement for them, it runs on top of one.
 
-| Concern | kafka-harbor | A raw client |
-|---|---|---|
-| Retry with backoff | Retry topics with a delay per level, tracking headers, `retryIf` predicate | Your loop, your headers, your topics |
-| Dead-letter queue | Automatic after the last level, original bytes intact, full failure trail | Your producer call in a catch block |
-| Offset semantics | Committed **after** the handler, and after any retry/DLQ produce was acknowledged | Auto-commit (at-most-once by accident) or manual bookkeeping |
-| Graceful shutdown | Stops fetching, waits for handlers, commits, leaves, disconnects; explicit error if it had to abandon work | Whatever `process.on('SIGTERM')` you wrote |
-| Serialization | Strict JSON by default (nothing silently flattened), pluggable per topic | `JSON.parse(value.toString())` everywhere |
-| Observability | Typed events for every outcome, correlation id propagated in headers | Logs |
+| | kafka-harbor | [@confluentinc/kafka-javascript](https://github.com/confluentinc/confluent-kafka-javascript) | [kafkajs](https://github.com/tulios/kafkajs) | [@platformatic/kafka](https://github.com/platformatic/kafka) |
+|---|---|---|---|---|
+| **Retry topics with a delay per level**, tracking headers, `retryIf` predicate | ✅ `orders-retry-1..N`, delays honored, headers validated as network input | ➖ you build it | ➖ you build it | ➖ you build it |
+| **Dead-letter topic** with the original bytes and the failure trail | ✅ automatic after the last level | ➖ | ➖ | ➖ |
+| Draining the DLQ back into service | ✅ `harbor.redrive()`, resumable, filterable | ➖ | ➖ | ➖ |
+| Offset committed only after the retry/DLQ produce was **acknowledged** | ✅ by construction; a failed produce stops the consumer instead of committing | ➖ your ordering | ➖ your ordering | ➖ your ordering |
+| Graceful shutdown: wait for handlers with a deadline, commit, leave, disconnect, **report** what was abandoned | ✅ `ShutdownTimeoutError` names the count | ➖ `disconnect()` waits for the running handler, no deadline, no report | ➖ same | ➖ `close()` |
+| `harbor.abort()`: stop without committing when reprocessing is the right call | ✅ | ➖ throw and hope auto-commit is off | ➖ | ➖ |
+| Serialization that never silently flattens (`Map`, `undefined`, `NaN` rejected) | ✅ strict JSON default, pluggable per topic | ➖ bytes | ➖ bytes | ✅ pluggable serdes, schema registry |
+| In-memory broker for unit tests, same core code, no Docker | ✅ `kafka-harbor/testing` | ❌ | ❌ | ❌ |
+| Client-agnostic: swap the client without touching handlers | ✅ `ClientAdapter`, contract suite for authors | n/a | n/a | n/a |
+| Typed outcome events (`messageRetried`, `messageDeadLettered`, ...) with correlation id | ✅ | ➖ client events | ➖ instrumentation events | ➖ |
+| Health snapshot for probes | ✅ `isHealthy()` / `health()` | ➖ | ➖ | ➖ |
+| Idempotent producer and `acks=all` on by default | ✅ set by the adapter, cannot be overridden by accident | ➖ opt-in | ➖ opt-in | ➖ opt-in |
+| Runtime dependencies | breakwater + the client you choose | native librdkafka | none (pure JS) | none (pure TS) |
+
+The rows are not a knock on the clients: transactions, exactly-once, schema registry, fetch tuning and wire performance are theirs, and the Confluent client is the one kafka-harbor recommends underneath. The rows are the layer every project rebuilds by hand, done once, with the ordering guarantees tested against a real broker.
 
 The design principle behind every decision: **losing a message is never the default.** Every failure ends in a retry topic, in the DLQ, or in an explicit stop of the consumer. There is no silent path.
+
+### What it does not do
+
+- **At-least-once only.** Duplicates are possible after a crash between handler and commit, a rebalance mid-handler, or an abandoned shutdown; [docs/delivery-semantics.md](docs/delivery-semantics.md) lists every case. Exactly-once effects come from deduplicating in the handler (the planned integration is [quayside](https://github.com/pinceladasdaweb/quayside)).
+- **One retry ladder per topic.** Three levels times twenty topics is sixty topics. A shared retry topic per service is not in 1.0.
+- **A retry delay must fit under the poll interval** (`maxProcessingTime`, default 5 minutes), because the retry consumer waits the delay before the handler runs. Longer ladders need a longer `max.poll.interval.ms` on the client. Pausing the partition on a timer instead is planned.
+- **Retry breaks ordering.** A message that goes through a retry topic is processed after later messages on the original topic. The alternative, blocking the partition until it succeeds, is what `harbor.abort()` gives you.
+- **The default adapter has a native dependency.** `@confluentinc/kafka-javascript` ships prebuilt binaries for Node 22 and 24 on Linux (glibc and musl) and macOS; Node 26 compiles librdkafka at install. A pure-TypeScript adapter over `@platformatic/kafka` is planned.
+- **No transactions, no batch handlers, no metrics exporters yet.** Batch consumption, Prometheus/OpenTelemetry entry points and NestJS decorators are on the roadmap.
 
 ## Install
 
@@ -99,7 +118,9 @@ await producer.sendBatch('orders', [
 ])
 
 // A serializer for this producer only, and a tighter retry ladder.
-const events = harbor.producer<Event>({
+import { exponential } from 'breakwater'
+
+const events = harbor.producer<OrderEvent>({
   serializer: avroSerializer(schema),
   retry: { attempts: 3, backoff: exponential({ initial: 50, max: 1_000 }) }
 })
@@ -238,9 +259,10 @@ Synchronous and cheap: it reads the state the harbor already tracks and never ca
 The default is JSON, strict. `JSON.stringify` turns `Map`, `Set`, typed arrays, `RegExp`, `Error` and `Promise` into `{}` without a word, drops `undefined` inside objects, and encodes `NaN` as `null`. kafka-harbor rejects every one of those shapes with `SerializationError` before a byte is produced, so the handler always gets what the producer meant. `Date` is the single conversion accepted (encoded as ISO-8601, decoded as a string).
 
 ```ts
-import { jsonSerializer, rawSerializer, stringSerializer, type Serializer } from 'kafka-harbor'
+import { createHarbor, jsonSerializer, rawSerializer, stringSerializer, type Serializer } from 'kafka-harbor'
+import { confluentAdapter } from 'kafka-harbor/adapters/confluent'
 
-const harbor = createHarbor({ serializer: jsonSerializer(), ... })        // default
+const harbor = createHarbor({ clientId: 'orders-service', brokers, adapter: confluentAdapter(), serializer: jsonSerializer() }) // default
 harbor.producer({ serializer: rawSerializer() })                          // Buffer in, Buffer out
 consumer.subscribe('logs', handler, { serializer: stringSerializer() })   // UTF-8 text
 
@@ -257,7 +279,13 @@ A serializer applies harbor-wide, per producer, per consumer or per topic, most 
 Headers are strings, both ways. The automatic ones use the `x-` prefix (shared with the RabbitMQ sibling library); change it per harbor:
 
 ```ts
-createHarbor({
+import { createHarbor } from 'kafka-harbor'
+import { confluentAdapter } from 'kafka-harbor/adapters/confluent'
+
+const harbor = createHarbor({
+  clientId: 'orders-service',
+  brokers,
+  adapter: confluentAdapter(),
   headers: {
     prefix: '',                                   // 'correlation-id', 'retry-count', ...
     correlationId: () => asyncLocalStorage.getStore()?.requestId ?? randomUUID()
@@ -275,7 +303,7 @@ harbor
   .on('messageProcessed', ({ topic, partition, offset, groupId, durationMs, correlationId }) => {})
   .on('messageFailed', ({ topic, offset, error, outcome }) => {})   // outcome: 'retry' | 'dead-letter' | 'abort' | 'crash'
   .on('messageRetried', ({ topic, retryTopic, level, attempt, error }) => {})
-  .on('messageDeadLettered', ({ topic, dlqTopic, attempts, error }) => alert(...))
+  .on('messageDeadLettered', ({ topic, dlqTopic, attempts, error }) => alert(`${topic}: ${attempts} attempts, now in ${dlqTopic}`))
   .on('messageRedriven', ({ from, to, offset }) => {})
   .on('consumerStopped', ({ groupId, reason }) => {})               // reason: 'shutdown' | 'abort' | 'crash'
   .on('error', ({ error, scope, groupId, topic }) => {})
@@ -314,7 +342,7 @@ confluentAdapter({
 
 The Confluent adapter sets `acks=all` and `enable.idempotence=true` on the producer, `enable.auto.commit=false` on consumers, and loads the client module on first connect, so importing the adapter never touches the native binding. The three properties the offset policy depends on (`enable.auto.commit`, `enable.auto.offset.store`, `auto.offset.reset`) cannot be overridden through the passthrough; `fromBeginning` drives the reset policy. Client failures are retryable unless their code is definitive (authorization, oversized record, invalid argument), regardless of the client's own `retriable` flag, which only describes transactions.
 
-Writing your own adapter means implementing `ClientAdapter` (about 150 lines for the Confluent one) and running the shared contract suite in `tests/contract/adapter-contract.ts` against your backend. The contract is small on purpose: connect, disconnect, produce with acknowledgment, consume with per-partition ordering and a settled-promise gate, commit, stop, optional pause/resume, and two admin calls. Everything else lives in the core.
+Writing your own adapter means implementing `ClientAdapter` (about 150 lines for the Confluent one) and running `runAdapterContract` from `kafka-harbor/testing` against your backend. The contract is small on purpose: connect, disconnect, produce with acknowledgment, consume with per-partition ordering and a settled-promise gate, commit, stop, optional pause/resume, and two admin calls. Everything else lives in the core.
 
 ## Testing your handlers
 
@@ -336,7 +364,7 @@ adapter.committed('g', 'orders', 0)   // '1'
 adapter.calls                         // every adapter call, in order
 ```
 
-No Docker, no broker, real pipeline: the same core code that runs in production drives an in-memory broker with topics, partitions, consumer groups and committed offsets.
+No Docker, no broker, real pipeline: the same core code that runs in production drives an in-memory broker with topics, partitions, consumer groups and committed offsets. [examples/testing-handlers.ts](examples/testing-handlers.ts) is a complete handler test written this way; [examples/retry-dlq-flow.ts](examples/retry-dlq-flow.ts) runs the whole retry and DLQ flow against the broker from `docker-compose.yml`.
 
 ## Development
 
@@ -348,6 +376,7 @@ npm run test:integration   # the same contract on a real Kafka, plus the retry/D
 npm run lint
 npm run check:types && npm run check:types:next
 npm run check:dist         # build, then compile a consumer against the published declarations
+npm run check:docs         # every ```ts block in the docs type-checks against src/; every anchor resolves
 npm run api:check          # public API frozen by the report in etc/
 npm run test:mutation:changed
 ```

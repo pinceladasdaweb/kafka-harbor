@@ -55,6 +55,11 @@ jobs:
       - name: Examples
         run: npm run examples
 
+      # Documentation compiles: every ts block in README and docs/ is
+      # type-checked against src/, and every in-page anchor resolves.
+      - name: Documentation snippets
+        run: npm run check:docs
+
       - name: Build
         run: npm run build
 

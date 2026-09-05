@@ -48,7 +48,7 @@ const englishOnlyPlugin = {
 export default [
   ...neostandard({
     ts: true,
-    ignores: ['dist', 'reports', '.stryker-tmp']
+    ignores: ['dist', 'reports', '.stryker-tmp', 'temp', 'coverage']
   }),
   {
     plugins: {

@@ -29,8 +29,9 @@ npm run lint                  # neostandard + the project rules
 npm run check:types           # TypeScript 6
 npm run check:types:next      # the same surface under TypeScript 7
 npm run check:dist            # build, then compile tests/consumer against dist/
+npm run check:docs            # every ```ts block in README and docs/ type-checks against src/
 npm run api:check             # build + public API report comparison
-npm run examples              # the handler-signature example asserts its own outcome
+npm run examples              # the runnable examples assert their own outcomes
 ```
 
 CI runs all of it on Node 22, 24 and 26; the integration job runs on Node 22
@@ -90,6 +91,13 @@ only their siblings; the linter enforces it. Subpath entry points import the
 core through `'../index'`, never deep paths, so the build externalizes the
 core bundle and `instanceof` holds across entry points.
 
+**Documentation compiles.** Every ```ts block in `README.md` and `docs/` is
+extracted and type-checked against `src/` by `npm run check:docs`, and every
+in-page link must point at a real heading. Identifiers the prose leaves
+undefined on purpose (`Order`, `fulfill`, `harbor`) are declared once in
+`scripts/doc-snippets.globals.d.ts`; add to that file rather than weakening a
+snippet. Nothing may be described as planned once it is delivered.
+
 **The public API is frozen by the report in `etc/`.** `npm run api:check`
 fails when exports drift; if the change is deliberate, run `npm run
 api:update` and commit the report. The diff is part of the review.
@@ -98,8 +106,8 @@ api:update` and commit the report. The diff is part of the review.
 
 Every change needs a test that fails without it. Beyond that:
 
-- **New adapter?** Run `runAdapterContract` from
-  `tests/contract/adapter-contract.ts` against the real backend via
+- **New adapter?** Run `runAdapterContract` from `kafka-harbor/testing`
+  (source in `src/testing/contract.ts`) against the real backend via
   Testcontainers. The invariants are numbered in the file header; add to the
   list rather than around it.
 - **Fixed a bug?** Name the test after the behavior and mark it with a

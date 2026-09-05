@@ -18,5 +18,5 @@
   "include": ["src", "tests", "examples", "scripts"],
   // The consumer check compiles against dist/ with its own resolution; see
   // tests/consumer/tsconfig.json.
-  "exclude": ["tests/consumer"]
+  "exclude": ["tests/consumer", "scripts/doc-snippets.globals.d.ts"]
 }
