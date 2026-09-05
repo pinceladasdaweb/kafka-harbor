@@ -67,9 +67,8 @@ At-least-once means these can happen and your handler should tolerate them:
   twice (once per topic) and both copies walk the ladder.
 
 For exactly-once *effects* on top of at-least-once *delivery*, deduplicate
-in the handler by a business key: the planned `kafka-harbor` idempotency
-integration is [quayside](https://github.com/pinceladasdaweb/quayside) keyed
-by `topic:partition:offset` or by a message id of your own.
+in the handler by a business key, or by `topic:partition:offset` when the
+message has no natural one.
 
 ## Retry delays
 
@@ -87,9 +86,8 @@ Two consequences:
 - Retention on each retry topic must exceed that level's delay, or the
   message expires before it is due.
 
-A more precise mechanism (pause the partition, resume on a timer, no
-sleeping consumer) is planned for a later version; the semantics above will
-not change.
+The wait is the mechanism; it is observed on the retry topic, not on the
+original one, so the original partition keeps flowing meanwhile.
 
 ## Ordering
 

@@ -56,7 +56,7 @@ harbor.enableSignalHandlers()        // SIGTERM -> finish in-flight handlers, co
 
 ## Why another Kafka library?
 
-It is not a client. kafka-harbor runs **on top of** a client through a small `ClientAdapter` interface (connect, produce, consume, commit, pause, resume, admin). The default adapter wraps [`@confluentinc/kafka-javascript`](https://github.com/confluentinc/confluent-kafka-javascript), Confluent's supported client with librdkafka underneath; a second adapter for `@platformatic/kafka` is planned, and the interface is designed so that the core never sees a client type.
+It is not a client. kafka-harbor runs **on top of** a client through a small `ClientAdapter` interface (connect, produce, consume, commit, pause, resume, admin). The default adapter wraps [`@confluentinc/kafka-javascript`](https://github.com/confluentinc/confluent-kafka-javascript), Confluent's supported client with librdkafka underneath, and the interface is designed so that the core never sees a client type.
 
 Every Node.js team using Kafka ends up writing the same application layer on top of whichever client they picked, because the clients stop at the protocol. The comparison below is against the clients themselves, which is the honest one: kafka-harbor is not a replacement for them, it runs on top of one.
 
@@ -82,12 +82,12 @@ The design principle behind every decision: **losing a message is never the defa
 
 ### What it does not do
 
-- **At-least-once only.** Duplicates are possible after a crash between handler and commit, a rebalance mid-handler, or an abandoned shutdown; [docs/delivery-semantics.md](docs/delivery-semantics.md) lists every case. Exactly-once effects come from deduplicating in the handler (the planned integration is [quayside](https://github.com/pinceladasdaweb/quayside)).
+- **At-least-once only.** Duplicates are possible after a crash between handler and commit, a rebalance mid-handler, or an abandoned shutdown; [docs/delivery-semantics.md](docs/delivery-semantics.md) lists every case. Exactly-once effects come from deduplicating in the handler by a business key.
 - **One retry ladder per topic.** Three levels times twenty topics is sixty topics. A shared retry topic per service is not in 1.0.
-- **A retry delay must fit under the poll interval** (`maxProcessingTime`, default 5 minutes), because the retry consumer waits the delay before the handler runs. Longer ladders need a longer `max.poll.interval.ms` on the client. Pausing the partition on a timer instead is planned.
+- **A retry delay must fit under the poll interval** (`maxProcessingTime`, default 5 minutes), because the retry consumer waits the delay before the handler runs. Longer ladders need a longer `max.poll.interval.ms` on the client.
 - **Retry breaks ordering.** A message that goes through a retry topic is processed after later messages on the original topic. The alternative, blocking the partition until it succeeds, is what `harbor.abort()` gives you.
-- **The default adapter has a native dependency.** `@confluentinc/kafka-javascript` ships prebuilt binaries for Node 22 and 24 on Linux (glibc and musl) and macOS; Node 26 compiles librdkafka at install. A pure-TypeScript adapter over `@platformatic/kafka` is planned.
-- **No transactions, no batch handlers, no metrics exporters yet.** Batch consumption, Prometheus/OpenTelemetry entry points and NestJS decorators are on the roadmap.
+- **The default adapter has a native dependency.** `@confluentinc/kafka-javascript` ships prebuilt binaries for Node 22 and 24 on Linux (glibc and musl) and macOS; Node 26 compiles librdkafka at install. Any other client can be plugged in through `ClientAdapter`.
+- **No transactions, no batch handlers, no metrics exporters.** Observability is the typed event stream; wire it to the collector you use.
 
 ## Install
 
@@ -385,8 +385,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for the invariants worth knowing before c
 
 ## Related
 
-- [breakwater](https://github.com/pinceladasdaweb/breakwater): resilience policies (retry, circuit breaker, bulkhead). kafka-harbor's producer retry runs on it.
-- [quayside](https://github.com/pinceladasdaweb/quayside): generic idempotency. The planned consumer deduplication is quayside with a Kafka message id.
+- [breakwater](https://github.com/pinceladasdaweb/breakwater): resilience policies (retry, circuit breaker, bulkhead). kafka-harbor's produce retry runs on it.
 
 ## License
 
