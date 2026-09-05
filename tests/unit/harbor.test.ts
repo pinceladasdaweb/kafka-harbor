@@ -284,6 +284,18 @@ describe('health', () => {
     assert.equal(running.stoppedBecause, 'shutdown')
     await h.harbor.shutdown()
   })
+
+  test('a consumer stopped by harbor.abort() makes the harbor unhealthy too', async () => {
+    const h = harness()
+    const aborting = h.harbor.consumer({ groupId: 'aborting', fromBeginning: true, autoCreateTopics: true })
+    aborting.subscribe('a', () => { throw h.harbor.abort(new Error('schema missing')) })
+    await h.harbor.producer().send('a', { value: 1 })
+    await aborting.start()
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    assert.equal(aborting.stoppedBecause, 'abort')
+    assert.equal(h.harbor.isHealthy(), false)
+    await h.harbor.shutdown()
+  })
 })
 
 describe('error helpers', () => {

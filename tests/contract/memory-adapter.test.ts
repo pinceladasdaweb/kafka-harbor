@@ -24,6 +24,16 @@ runAdapterContract('memory', async () => {
 })
 
 describe('memoryAdapter specifics', () => {
+  test('an invalid topic name is refused, as a broker would', async () => {
+    const adapter = memoryAdapter()
+    await adapter.connect({ clientId: 'c', brokers: ['memory'] })
+    for (const topic of ['', undefined, 7]) {
+      await assert.rejects(adapter.produce([{ topic: topic as never, key: null, value: Buffer.from('x'), headers: {} }]), { code: 'ADAPTER', retryable: false })
+    }
+    assert.deepEqual(adapter.topics(), [])
+    await adapter.disconnect()
+  })
+
   test('a batch with an invalid partition writes nothing at all', async () => {
     const adapter = memoryAdapter({ partitions: 2 })
     await adapter.connect({ clientId: 'c', brokers: ['memory'] })
