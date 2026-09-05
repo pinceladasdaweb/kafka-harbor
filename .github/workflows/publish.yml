@@ -16,6 +16,11 @@ concurrency:
 jobs:
   publish-npm:
     name: Publish package on npm
+    # Releases are switched on by the NPM_PUBLISH_ENABLED repository variable
+    # (Settings > Secrets and variables > Actions > Variables, value "true").
+    # Until the trusted publisher exists on npmjs.com the job is skipped, so a
+    # push to main never attempts a publish by accident.
+    if: vars.NPM_PUBLISH_ENABLED == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7

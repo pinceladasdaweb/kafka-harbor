@@ -135,7 +135,9 @@ Open pull requests against `development`, not `main`.
 
 ## How a release happens
 
-Merging to `main` publishes. The workflow reads the version already on the
+Merging to `main` publishes, once the `NPM_PUBLISH_ENABLED` repository
+variable is set to `true`; without it the publish job is skipped, so `main`
+can move before the npm side (trusted publisher) is configured. The workflow reads the version already on the
 registry, bumps it from the merge commit message, publishes to npm through
 OIDC trusted publishing (no token secret, provenance attached), then writes
 `CHANGELOG.md`, tags `vX.Y.Z` and opens the GitHub release.
