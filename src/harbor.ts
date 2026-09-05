@@ -7,7 +7,7 @@ import { createEmitter, type Observable } from './events'
 import { headerNames, type HeaderNames } from './headers'
 import { jsonSerializer, type Serializer } from './serializer'
 import type { BrokerConfig, ClientAdapter, SaslConfig } from './adapter'
-import { Consumer, type ConsumerEvents, type ConsumerOptions } from './consumer'
+import { Consumer, type ConsumerEvents, type ConsumerOptions, type ConsumerState, type StopReason } from './consumer'
 import { AbortProcessingError, ClosedError, ConfigError, describeError } from './errors'
 import { Producer, buildProducerRetry, type ProducerOptions, type ProducerRetryOptions } from './producer'
 
@@ -44,6 +44,25 @@ export interface HarborConfig {
 }
 
 export type HarborState = 'idle' | 'connecting' | 'connected' | 'closing' | 'closed'
+
+export interface ConsumerHealth {
+  readonly groupId: string
+  readonly status: ConsumerState
+  /** Set once the consumer stopped; 'abort' and 'crash' make the harbor unhealthy. */
+  readonly stoppedBecause: StopReason | undefined
+}
+
+export interface HarborHealth {
+  /**
+   * True while the harbor can do work: it is not shutting down and no
+   * consumer stopped on its own (abort or crash). A harbor that has not
+   * connected yet is healthy: connection is lazy by design.
+   */
+  readonly healthy: boolean
+  readonly state: HarborState
+  readonly adapter: string
+  readonly consumers: readonly ConsumerHealth[]
+}
 
 export interface HarborEvents extends ConsumerEvents {
   connected: { adapter: string }
@@ -108,6 +127,29 @@ export class Harbor implements Observable<HarborEvents> {
   /** The header names in effect, for applications that read them directly. */
   get headerNames (): HeaderNames {
     return this.names
+  }
+
+  /**
+   * A snapshot for readiness and liveness probes. Cheap and synchronous: it
+   * reads the state the harbor already tracks and never calls the broker.
+   */
+  health (): HarborHealth {
+    const consumers = [...this.consumers].map((consumer) => ({
+      groupId: consumer.groupId,
+      status: consumer.status,
+      stoppedBecause: consumer.stoppedBecause
+    }))
+    const failed = consumers.some((entry) => entry.stoppedBecause === 'abort' || entry.stoppedBecause === 'crash')
+    return {
+      healthy: !this.isClosed() && !failed,
+      state: this.state,
+      adapter: this.adapter.name,
+      consumers
+    }
+  }
+
+  isHealthy (): boolean {
+    return this.health().healthy
   }
 
   on<K extends keyof HarborEvents> (event: K, listener: (payload: HarborEvents[K]) => void): this {

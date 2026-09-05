@@ -44,6 +44,7 @@ harbor.enableSignalHandlers()        // SIGTERM -> finish in-flight handlers, co
 - [Consumer](#consumer)
 - [Retry topics and the DLQ](#retry-topics-and-the-dlq)
 - [Graceful shutdown](#graceful-shutdown)
+- [Health](#health)
 - [Serialization](#serialization)
 - [Headers](#headers)
 - [Events](#events)
@@ -105,6 +106,7 @@ const events = harbor.producer<Event>({
 ```
 
 - Every message gets `x-correlation-id` (kept if you set one), `x-produced-at` and `x-producer` (your `clientId`).
+- Keyed messages land on the partition Kafka's default partitioner picks (murmur2). `partitionForKey(key, partitions)` computes the same number, for code that needs to know where a key goes: sharding a cache by partition, asserting co-location of related keys, or routing an unkeyed message next to a keyed one.
 - A batch is serialized before any byte leaves the process: one unencodable value means nothing is produced.
 - `send()` resolves after the broker acknowledged. Transient failures are retried (default: 5 attempts, exponential backoff with full jitter); a failure marked `retryable: false` is not. When the attempts run out you get breakwater's `RETRY_EXHAUSTED` with the last failure as `cause`.
 
@@ -204,6 +206,15 @@ await harbor.shutdown('30s')   // or harbor.enableSignalHandlers() for SIGTERM/S
 2. Handlers already running get up to the timeout to finish. The ones that finish commit their offsets on the way out.
 3. Handlers still running when the timeout elapses are abandoned: their `ctx.signal` aborts, their offsets are **not** committed (the messages will be redelivered), and `shutdown()` rejects with `ShutdownTimeoutError` after everything else is done. At-least-once, said out loud.
 4. Consumers leave their groups, then the client disconnects.
+
+## Health
+
+```ts
+harbor.isHealthy()   // boolean, for a liveness probe
+harbor.health()      // { healthy, state, adapter, consumers: [{ groupId, status, stoppedBecause }] }
+```
+
+Synchronous and cheap: it reads the state the harbor already tracks and never calls the broker. A harbor is healthy until it shuts down or until a consumer stops on its own (`stoppedBecause` is `'abort'` or `'crash'`); a consumer stopped by `shutdown()` does not count against it. Connection is lazy by design, so a harbor that has not connected yet is healthy.
 
 ## Serialization
 

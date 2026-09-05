@@ -244,6 +244,48 @@ describe('createHarbor', () => {
   })
 })
 
+describe('health', () => {
+  test('a fresh harbor is healthy without connecting; shutdown makes it unhealthy', async () => {
+    const { harbor } = harness()
+    assert.deepEqual(harbor.health(), { healthy: true, state: 'idle', adapter: 'memory', consumers: [] })
+    assert.equal(harbor.isHealthy(), true)
+    await harbor.connect()
+    assert.equal(harbor.health().state, 'connected')
+    await harbor.shutdown()
+    assert.equal(harbor.isHealthy(), false)
+    assert.equal(harbor.health().state, 'closed')
+  })
+
+  test('reports every consumer, and a consumer that crashed or aborted makes the harbor unhealthy', async () => {
+    const h = harness()
+    const idle = h.harbor.consumer({ groupId: 'idle' })
+    idle.subscribe('a', () => {})
+    const running = h.harbor.consumer({ groupId: 'running', autoCreateTopics: true })
+    running.subscribe('b', () => {})
+    await running.start()
+    assert.deepEqual(h.harbor.health().consumers, [
+      { groupId: 'idle', status: 'idle', stoppedBecause: undefined },
+      { groupId: 'running', status: 'running', stoppedBecause: undefined }
+    ])
+    assert.equal(h.harbor.isHealthy(), true)
+
+    const crashing = h.harbor.consumer({ groupId: 'crashing', fromBeginning: true, autoCreateTopics: true, dlq: { enabled: false } })
+    crashing.subscribe('c', () => { throw new Error('x') })
+    await h.harbor.producer().send('c', { value: 1 })
+    await crashing.start()
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    assert.equal(crashing.status, 'stopped')
+    assert.equal(crashing.stoppedBecause, 'crash')
+    assert.equal(h.harbor.isHealthy(), false)
+    assert.equal(h.harbor.health().consumers.find((c) => c.groupId === 'crashing')?.stoppedBecause, 'crash')
+
+    // A consumer stopped on purpose does not count against health.
+    await running.stop()
+    assert.equal(running.stoppedBecause, 'shutdown')
+    await h.harbor.shutdown()
+  })
+})
+
 describe('error helpers', () => {
   test('isRetryable honors retryable: false on any object and treats everything else as retryable', () => {
     assert.equal(isRetryable(new Error('x')), true)

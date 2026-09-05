@@ -13,7 +13,7 @@
  */
 
 export { Harbor, abortProcessing, createHarbor } from './harbor'
-export type { HarborConfig, HarborEvents, HarborState, HeaderOptions } from './harbor'
+export type { ConsumerHealth, HarborConfig, HarborEvents, HarborHealth, HarborState, HeaderOptions } from './harbor'
 
 export { Producer } from './producer'
 export type { ProducerContext, ProducerOptions, ProducerRetryOptions } from './producer'
@@ -60,6 +60,8 @@ export { jsonSerializer, rawSerializer, stringSerializer } from './serializer'
 export type { Serializer } from './serializer'
 
 export { parseDuration } from './duration'
+
+export { murmur2, partitionForKey } from './partitioner'
 
 export { defaultDlqTopicNaming, defaultRetryTopicNaming } from './retry-topics'
 export type { DlqTopicNaming, RetryLevel, RetryTopicNaming } from './retry-topics'

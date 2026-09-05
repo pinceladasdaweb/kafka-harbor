@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
 import { describe, test } from 'node:test'
 
+import { partitionForKey } from '../../src/index'
 import { memoryAdapter } from '../../src/testing/index'
 import { runAdapterContract } from './adapter-contract'
 
@@ -121,6 +122,7 @@ describe('memoryAdapter inspection helpers', () => {
     ])
     const byValue = new Map(adapter.messages('t').map((m) => [m.value?.toString(), m.partition]))
     assert.equal(byValue.get('1'), byValue.get('2'))
+    assert.equal(byValue.get('1'), partitionForKey('same', 3), 'keyed records follow Kafka\'s default partitioner')
     assert.deepEqual([byValue.get('3'), byValue.get('4'), byValue.get('5')], [0, 1, 2])
   })
 })

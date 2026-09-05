@@ -165,6 +165,7 @@ export class Consumer {
 
   private handle: ConsumerHandle | undefined
   private state: ConsumerState = 'idle'
+  private stopReason: StopReason | undefined
   private stopping: Promise<void> | undefined
   private readonly ready: Promise<void>
   private markReady!: () => void
@@ -193,6 +194,11 @@ export class Consumer {
 
   get status (): ConsumerState {
     return this.state
+  }
+
+  /** Why the consumer stopped, once it did. */
+  get stoppedBecause (): StopReason | undefined {
+    return this.stopReason
   }
 
   /** Registers a handler for a topic. Its retry ladder is consumed as well. */
@@ -309,6 +315,7 @@ export class Consumer {
     } finally {
       this.handle = undefined
       this.state = 'stopped'
+      this.stopReason = reason
       this.context.emit('consumerStopped', { groupId: this.groupId, reason })
     }
     if (abandoned > 0 && reason === 'shutdown') {

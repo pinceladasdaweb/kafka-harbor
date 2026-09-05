@@ -117,6 +117,7 @@ export class Consumer {
     // (undocumented)
     get status(): ConsumerState;
     stop(timeoutMs?: number): Promise<void>;
+    get stoppedBecause(): StopReason | undefined;
     subscribe<T = unknown>(topic: string, handler: Handler<T>, options?: SubscribeOptions<T>): this;
 }
 
@@ -225,6 +226,17 @@ export interface ConsumerHandle {
     // (undocumented)
     resume?: (partitions: readonly TopicPartition[]) => void;
     stop: () => Promise<void>;
+}
+
+// Warning: (ae-missing-release-tag) "ConsumerHealth" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
+//
+// @public (undocumented)
+export interface ConsumerHealth {
+    // (undocumented)
+    readonly groupId: string;
+    // (undocumented)
+    readonly status: ConsumerState;
+    readonly stoppedBecause: StopReason | undefined;
 }
 
 // Warning: (ae-missing-release-tag) "ConsumerOptions" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
@@ -348,6 +360,9 @@ export class Harbor implements Observable<HarborEvents> {
     consumer(options: ConsumerOptions): Consumer;
     enableSignalHandlers(signals?: readonly NodeJS.Signals[], timeout?: Duration): () => void;
     get headerNames(): HeaderNames;
+    health(): HarborHealth;
+    // (undocumented)
+    isHealthy(): boolean;
     // (undocumented)
     off<K extends keyof HarborEvents>(event: K, listener: (payload: HarborEvents[K]) => void): this;
     // (undocumented)
@@ -410,6 +425,19 @@ export interface HarborEvents extends ConsumerEvents {
     disconnected: {
         adapter: string;
     };
+}
+
+// Warning: (ae-missing-release-tag) "HarborHealth" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
+//
+// @public (undocumented)
+export interface HarborHealth {
+    // (undocumented)
+    readonly adapter: string;
+    // (undocumented)
+    readonly consumers: readonly ConsumerHealth[];
+    readonly healthy: boolean;
+    // (undocumented)
+    readonly state: HarborState;
 }
 
 // Warning: (ae-missing-release-tag) "HarborState" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
@@ -523,6 +551,11 @@ export interface Message<T = unknown> {
 // @public
 export type MessageHeaders = Record<string, string>;
 
+// Warning: (ae-missing-release-tag) "murmur2" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
+//
+// @public
+export function murmur2(data: Buffer): number;
+
 // Warning: (ae-missing-release-tag) "Observable" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
 //
 // @public (undocumented)
@@ -550,6 +583,11 @@ export interface OutgoingMessage<T = unknown> {
 //
 // @public
 export function parseDuration(value: Duration, name: string): number;
+
+// Warning: (ae-missing-release-tag) "partitionForKey" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
+//
+// @public
+export function partitionForKey(key: string | Buffer, partitions: number): number;
 
 // Warning: (ae-missing-release-tag) "Producer" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
 //
