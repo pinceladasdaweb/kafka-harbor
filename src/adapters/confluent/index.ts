@@ -327,16 +327,36 @@ export function confluentAdapter (options: ConfluentAdapterOptions = {}): Client
             configEntries: Object.entries(spec.config).map(([name, value]) => ({ name, value }))
           })
         }))
+        const deadline = Date.now() + adminTimeout
         try {
           await current.createTopics({ topics, timeout: adminTimeout })
         } catch (error) {
           // The client reports the whole call as failed when one topic
           // already exists; that is the outcome this method promises, not
           // an error. Anything else is.
-          if (errorCode(error) === ERR_TOPIC_ALREADY_EXISTS) return
           const nested = (error as { errors?: unknown[] } | null)?.errors
-          if (Array.isArray(nested) && nested.length > 0 && nested.every((entry) => errorCode(entry) === ERR_TOPIC_ALREADY_EXISTS)) return
-          throw wrap(error, 'createTopics failed')
+          const alreadyExists = errorCode(error) === ERR_TOPIC_ALREADY_EXISTS ||
+            (Array.isArray(nested) && nested.length > 0 && nested.every((entry) => errorCode(entry) === ERR_TOPIC_ALREADY_EXISTS))
+          if (!alreadyExists) throw wrap(error, 'createTopics failed')
+        }
+        // The controller accepts the creation before the metadata every
+        // broker (and this client) serves reflects it. The promise here is
+        // "the topics exist", so wait until they are visible, bounded by the
+        // admin timeout: a consumer subscribing right after must find them.
+        const wanted = new Set(specs.map((spec) => spec.topic))
+        for (;;) {
+          let visible: string[]
+          try {
+            visible = await current.listTopics({ timeout: adminTimeout })
+          } catch (error) {
+            throw wrap(error, 'listTopics failed')
+          }
+          if ([...wanted].every((topic) => visible.includes(topic))) return
+          if (Date.now() >= deadline) {
+            const missing = [...wanted].filter((topic) => !visible.includes(topic))
+            throw new AdapterError(`createTopics: ${missing.join(', ')} not visible in metadata after ${adminTimeout}ms`)
+          }
+          await new Promise((resolve) => setTimeout(resolve, 50))
         }
       },
       async topicExists (topic: string) {

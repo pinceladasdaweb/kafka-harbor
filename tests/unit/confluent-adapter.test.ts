@@ -28,7 +28,7 @@ const fakeClient = (behavior: {
   sendResult?: KafkaJS.RecordMetadata[]
   sendError?: unknown
   createTopicsError?: unknown
-  topics?: string[]
+  topics?: string[] | (() => string[])
 } = {}): { module: ConfluentClientModule, calls: FakeCalls } => {
   const calls: FakeCalls = { kafkaConfig: undefined, producerConfig: undefined, consumerConfigs: [], sent: [], committed: [], created: [], runConfig: undefined, paused: [], resumed: [], disconnected: [] }
   class Kafka {
@@ -71,7 +71,7 @@ const fakeClient = (behavior: {
           if (behavior.createTopicsError !== undefined) throw behavior.createTopicsError
           return true
         },
-        listTopics: async () => behavior.topics ?? []
+        listTopics: async () => (typeof behavior.topics === 'function' ? behavior.topics() : behavior.topics) ?? []
       } as unknown as KafkaJS.Admin
     }
   }
@@ -214,12 +214,12 @@ describe('confluentAdapter', () => {
     assert.equal(await adapter.admin.topicExists('t'), true)
     assert.equal(await adapter.admin.topicExists('u'), false)
 
-    const exists = fakeClient({ createTopicsError: Object.assign(new Error('exists'), { code: 36 }) })
+    const exists = fakeClient({ createTopicsError: Object.assign(new Error('exists'), { code: 36 }), topics: ['t'] })
     const adapter2 = confluentAdapter({ client: exists.module })
     await adapter2.connect(broker)
     await adapter2.admin.createTopics([{ topic: 't' }])
 
-    const aggregate = fakeClient({ createTopicsError: Object.assign(new Error('agg'), { errors: [{ code: 36 }, { code: 36 }] }) })
+    const aggregate = fakeClient({ createTopicsError: Object.assign(new Error('agg'), { errors: [{ code: 36 }, { code: 36 }] }), topics: ['t', 'u'] })
     const adapter3 = confluentAdapter({ client: aggregate.module })
     await adapter3.connect(broker)
     await adapter3.admin.createTopics([{ topic: 't' }, { topic: 'u' }])
@@ -228,6 +228,31 @@ describe('confluentAdapter', () => {
     const adapter4 = confluentAdapter({ client: other.module })
     await adapter4.connect(broker)
     await assert.rejects(adapter4.admin.createTopics([{ topic: 't' }]), { code: ERROR_CODES.ADAPTER, retryable: false })
+  })
+
+  test('createTopics resolves only once the topics are visible in metadata, and gives up at the admin timeout', async () => {
+    // The controller acknowledges before the metadata reflects the topic;
+    // the fake becomes aware of it on the third listing.
+    let listings = 0
+    const lagging = fakeClient({ topics: () => (++listings >= 3 ? ['t'] : []) })
+    const adapter = confluentAdapter({ client: lagging.module, adminTimeoutMs: 2_000 })
+    await adapter.connect(broker)
+    await adapter.admin.createTopics([{ topic: 't' }])
+    assert.equal(listings, 3)
+
+    const never = fakeClient({ topics: [] })
+    const adapter2 = confluentAdapter({ client: never.module, adminTimeoutMs: 120 })
+    await adapter2.connect(broker)
+    await assert.rejects(adapter2.admin.createTopics([{ topic: 'ghost' }]), (error: unknown) => {
+      assert.equal((error as { code: string }).code, ERROR_CODES.ADAPTER)
+      assert.match((error as Error).message, /ghost not visible/)
+      return true
+    })
+
+    const failingList = fakeClient({ topics: () => { throw new Error('metadata timeout') } })
+    const adapter3 = confluentAdapter({ client: failingList.module })
+    await adapter3.connect(broker)
+    await assert.rejects(adapter3.admin.createTopics([{ topic: 't' }]), /metadata timeout/)
   })
 })
 
