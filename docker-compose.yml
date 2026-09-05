@@ -1,0 +1,36 @@
+# Local Kafka for manual experiments and the examples. The test suites do
+# NOT depend on this file: integration tests start their own broker through
+# Testcontainers, so `npm run test:integration` only needs a running Docker.
+#
+#   docker compose up -d
+#   docker compose exec kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list
+services:
+  kafka:
+    image: apache/kafka:4.3.0
+    container_name: kafka-harbor-dev
+    ports:
+      - "9092:9092"
+    environment:
+      # Single-node KRaft: the same process acts as broker and controller.
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:9093
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      # The retry and DLQ topics are created by the library (Admin API) when
+      # `autoCreateTopics` is on; broker-side auto-creation stays off so a
+      # typo in a topic name fails loudly instead of creating a stray topic.
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_LOG_DIRS: /tmp/kraft-combined-logs
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1 || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 20

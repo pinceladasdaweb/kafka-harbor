@@ -1,0 +1,131 @@
+{
+  "name": "kafka-harbor",
+  "version": "0.0.1",
+  "description": "The application layer that Kafka clients don't give you: retry topics, DLQ, graceful shutdown, serialization and observability for Node.js. Client-agnostic by design.",
+  "keywords": [
+    "kafka",
+    "consumer",
+    "producer",
+    "retry",
+    "dead-letter",
+    "dlq",
+    "graceful-shutdown",
+    "confluent",
+    "librdkafka",
+    "typescript"
+  ],
+  "homepage": "https://github.com/pinceladasdaweb/kafka-harbor#readme",
+  "bugs": {
+    "url": "https://github.com/pinceladasdaweb/kafka-harbor/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/pinceladasdaweb/kafka-harbor.git"
+  },
+  "license": "MIT",
+  "author": "Pedro Rogério",
+  "type": "module",
+  "sideEffects": false,
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.mjs",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.mjs"
+      },
+      "require": {
+        "types": "./dist/index.d.cts",
+        "default": "./dist/index.cjs"
+      }
+    },
+    "./adapters/confluent": {
+      "import": {
+        "types": "./dist/adapters/confluent.d.ts",
+        "default": "./dist/adapters/confluent.mjs"
+      },
+      "require": {
+        "types": "./dist/adapters/confluent.d.cts",
+        "default": "./dist/adapters/confluent.cjs"
+      }
+    },
+    "./testing": {
+      "import": {
+        "types": "./dist/testing.d.ts",
+        "default": "./dist/testing.mjs"
+      },
+      "require": {
+        "types": "./dist/testing.d.cts",
+        "default": "./dist/testing.cjs"
+      }
+    }
+  },
+  "files": [
+    "dist",
+    "LICENSE",
+    "README.md",
+    "CHANGELOG.md"
+  ],
+  "scripts": {
+    "build": "rollup -c rollup.config.mjs",
+    "hooks": "git config core.hooksPath .hooks",
+    "lint": "eslint .",
+    "lint:fix": "eslint . --fix",
+    "prepack": "npm run build",
+    "test": "node --import tsx --test --test-timeout=10000 'tests/unit/**/*.test.ts' 'tests/contract/**/*.test.ts'",
+    "test:coverage": "c8 --all --src src --include 'src/**/*.ts' --exclude 'src/adapter.ts' --exclude 'src/types.ts' --reporter text --reporter lcov --report-dir coverage node --import tsx --test --test-timeout=10000 'tests/unit/**/*.test.ts' 'tests/contract/**/*.test.ts'",
+    "test:integration": "node --import tsx --test --test-timeout=180000 --test-concurrency=1 'tests/integration/**/*.test.ts'",
+    "test:mutation": "stryker run",
+    "test:mutation:changed": "node scripts/mutation-changed.mjs",
+    "examples": "node --import tsx examples/handler-signatures.ts",
+    "check:types": "tsc --noEmit",
+    "check:types:next": "node node_modules/typescript7/bin/tsc --noEmit",
+    "check:dist": "npm run build && tsc -p tests/consumer/tsconfig.json",
+    "api:update": "npm run build && api-extractor run --local",
+    "api:check": "npm run build && api-extractor run"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "lint-staged": {
+    "src/**/*.ts": "eslint",
+    "tests/**/*.ts": "eslint"
+  },
+  "dependencies": {
+    "breakwater": "^1.1.3"
+  },
+  "peerDependencies": {
+    "@confluentinc/kafka-javascript": "^1.10.0"
+  },
+  "peerDependenciesMeta": {
+    "@confluentinc/kafka-javascript": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@commitlint/cli": "^21.2.2",
+    "@commitlint/config-conventional": "^21.2.2",
+    "@confluentinc/kafka-javascript": "^1.10.0",
+    "@microsoft/api-extractor": "^7.59.0",
+    "@rollup/plugin-typescript": "^12.3.0",
+    "@stryker-mutator/core": "^10.0.0",
+    "@stryker-mutator/tap-runner": "^10.0.0",
+    "@testcontainers/kafka": "^12.1.0",
+    "@types/node": "^26.4.1",
+    "c8": "^12.0.0",
+    "eslint": "^9.39.5",
+    "lint-staged": "^17.4.1",
+    "neostandard": "^0.13.0",
+    "rollup": "^4.63.1",
+    "rollup-plugin-dts": "^6.4.1",
+    "testcontainers": "^12.1.0",
+    "tslib": "^2.8.1",
+    "tsx": "^4.23.13",
+    "typescript": "^6.0.3",
+    "typescript7": "npm:typescript@^7.0.2"
+  }
+}

@@ -1,0 +1,16 @@
+{
+  "compilerOptions": {
+    "strict": true,
+    "noEmit": true,
+    "module": "nodenext",
+    "moduleResolution": "nodenext",
+    "target": "es2022",
+    "skipLibCheck": true,
+    "types": [],
+    "paths": {
+      "kafka-harbor": ["../../dist/index.d.ts"],
+      "kafka-harbor/*": ["../../dist/*.d.ts"]
+    }
+  },
+  "files": ["consumer.ts"]
+}

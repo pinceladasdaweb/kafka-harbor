@@ -1,0 +1,12 @@
+node_modules/
+dist/
+reports/
+.stryker-tmp/
+stryker-output-*.json
+coverage/
+temp/
+*.log
+.env
+.DS_Store
+.vscode/
+report.*.json

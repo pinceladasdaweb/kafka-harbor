@@ -1,0 +1,22 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "lib": ["ES2024"],
+    "types": ["node"],
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "noImplicitOverride": true,
+    "noFallthroughCasesInSwitch": true,
+    "isolatedModules": true,
+    "forceConsistentCasingInFileNames": true,
+    "skipLibCheck": true,
+    "declaration": false,
+    "sourceMap": false
+  },
+  "include": ["src", "tests", "examples", "scripts"],
+  // The consumer check compiles against dist/ with its own resolution; see
+  // tests/consumer/tsconfig.json.
+  "exclude": ["tests/consumer"]
+}

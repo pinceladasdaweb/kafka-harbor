@@ -1,0 +1,45 @@
+{
+  "$schema": "./node_modules/@stryker-mutator/core/schema/stryker-schema.json",
+  "packageManager": "npm",
+  "testRunner": "tap",
+  "tap": {
+    "testFiles": [
+      "tests/unit/**/*.test.ts",
+      "tests/contract/**/*.test.ts"
+    ],
+    "nodeArgs": [
+      "--import",
+      "tsx",
+      "--test",
+      "--test-reporter=tap",
+      "--test-isolation=none"
+    ]
+  },
+  "mutate": [
+    "src/**/*.ts",
+    "!src/index.ts",
+    "!src/adapters/confluent/**"
+  ],
+  "mutator": {
+    "excludedMutations": ["StringLiteral"]
+  },
+  "coverageAnalysis": "perTest",
+  "reporters": [
+    "json",
+    "html",
+    "progress"
+  ],
+  "htmlReporter": {
+    "fileName": "reports/mutation/index.html"
+  },
+  "jsonReporter": {
+    "fileName": "reports/mutation/mutation.json"
+  },
+  "concurrency": 6,
+  "timeoutMS": 20000,
+  "thresholds": {
+    "high": 90,
+    "low": 80,
+    "break": null
+  }
+}

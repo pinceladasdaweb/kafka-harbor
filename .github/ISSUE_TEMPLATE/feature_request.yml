@@ -1,0 +1,33 @@
+name: Feature request
+description: Propose an option, a client adapter or a behavior
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        kafka-harbor stays small on purpose: the core owns retry topics, DLQ,
+        serialization and shutdown; client adapters translate a Kafka client
+        into the `ClientAdapter` contract and nothing more. A feature earns
+        its place when it cannot be built on top of the current API.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What you are trying to do and why the current API does not cover it.
+    validations:
+      required: true
+  - type: textarea
+    id: workaround
+    attributes:
+      label: Current workaround
+      description: Show how you solve it with the current API (custom serializer, events, your own adapter), and what is awkward about that.
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposal
+      description: |
+        The API you would like to see. Keep Kafka terms (topic, partition,
+        offset, consumer group); the metaphor lives in the docs, never in
+        the API.
+    validations:
+      required: true

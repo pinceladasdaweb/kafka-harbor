@@ -1,0 +1,255 @@
+import { systemClock } from './clock'
+import { randomUUID } from 'node:crypto'
+import { parseDuration } from './duration'
+import type { RetryPolicy } from 'breakwater'
+import type { Clock, Duration, Logger } from './types'
+import { createEmitter, type Observable } from './events'
+import { headerNames, type HeaderNames } from './headers'
+import { jsonSerializer, type Serializer } from './serializer'
+import type { BrokerConfig, ClientAdapter, SaslConfig } from './adapter'
+import { Consumer, type ConsumerEvents, type ConsumerOptions } from './consumer'
+import { AbortProcessingError, ClosedError, ConfigError, describeError } from './errors'
+import { Producer, buildProducerRetry, type ProducerOptions, type ProducerRetryOptions } from './producer'
+
+export interface HeaderOptions {
+  /** Prefix of every header the library writes. Default: 'x-'. */
+  prefix?: string
+  /** Generates a correlation id when the outgoing message has none. Default: UUID v4. */
+  correlationId?: () => string
+}
+
+export interface HarborConfig {
+  clientId: string
+  brokers: readonly string[]
+  /**
+   * The Kafka client behind the harbor, e.g. `confluentAdapter()` from
+   * 'kafka-harbor/adapters/confluent'. Explicit on purpose: the core has no
+   * dependency on any client, so the install that never touches the native
+   * Confluent binding is the one that never imports that entry point.
+   */
+  adapter: ClientAdapter
+  ssl?: boolean
+  sasl?: SaslConfig
+  /** Harbor-wide serializer, overridable per producer, consumer and topic. Default: strict JSON. */
+  serializer?: Serializer
+  headers?: HeaderOptions
+  logger?: Logger
+  /**
+   * Retry of the produce calls the library makes on its own behalf (retry
+   * topics, DLQ). Producers created with `harbor.producer()` take their own.
+   */
+  produceRetry?: ProducerRetryOptions
+  /** Time source. Tests inject a manual clock; production leaves the default. */
+  clock?: Clock
+}
+
+export type HarborState = 'idle' | 'connecting' | 'connected' | 'closing' | 'closed'
+
+export interface HarborEvents extends ConsumerEvents {
+  connected: { adapter: string }
+  disconnected: { adapter: string }
+}
+
+const defaultLogger: Logger = {
+  debug: undefined,
+  info: (message, ...args) => console.info(message, ...args),
+  warn: (message, ...args) => console.warn(message, ...args),
+  error: (message, ...args) => console.error(message, ...args)
+}
+
+/**
+ * The application-level Kafka client. `createHarbor()` does not connect:
+ * the connection is opened lazily by the first `send()` or `start()`, or
+ * explicitly by `connect()`.
+ */
+export class Harbor implements Observable<HarborEvents> {
+  readonly config: Readonly<HarborConfig>
+  private readonly adapter: ClientAdapter
+  private readonly serializer: Serializer
+  private readonly names: HeaderNames
+  private readonly correlationId: () => string
+  private readonly logger: Logger
+  private readonly clock: Clock
+  private readonly emitter = createEmitter<HarborEvents>((error) => {
+    this.logger.error(`[kafka-harbor] event listener threw: ${describeError(error)}`)
+  })
+
+  private readonly producePolicy: RetryPolicy
+  private readonly consumers = new Set<Consumer>()
+  private state: HarborState = 'idle'
+  private connecting: Promise<void> | undefined
+  private closing: Promise<void> | undefined
+  private signalHandlers: Array<{ signal: NodeJS.Signals, handler: () => void }> = []
+
+  constructor (config: HarborConfig) {
+    if (typeof config?.clientId !== 'string' || config.clientId === '') {
+      throw new ConfigError('clientId must be a non-empty string')
+    }
+    if (!Array.isArray(config.brokers) || config.brokers.length === 0 || config.brokers.some((b) => typeof b !== 'string' || b === '')) {
+      throw new ConfigError('brokers must be a non-empty array of "host:port" strings')
+    }
+    if (typeof config.adapter?.connect !== 'function' || typeof config.adapter.consume !== 'function' || typeof config.adapter.produce !== 'function') {
+      throw new ConfigError('adapter must implement ClientAdapter (connect, disconnect, produce, consume, admin)')
+    }
+    this.config = config
+    this.adapter = config.adapter
+    this.serializer = config.serializer ?? jsonSerializer()
+    this.names = headerNames(config.headers?.prefix)
+    this.correlationId = config.headers?.correlationId ?? randomUUID
+    this.logger = config.logger ?? defaultLogger
+    this.clock = config.clock ?? systemClock
+    this.producePolicy = buildProducerRetry(config.produceRetry)
+  }
+
+  get status (): HarborState {
+    return this.state
+  }
+
+  /** The header names in effect, for applications that read them directly. */
+  get headerNames (): HeaderNames {
+    return this.names
+  }
+
+  on<K extends keyof HarborEvents> (event: K, listener: (payload: HarborEvents[K]) => void): this {
+    this.emitter.on(event, listener)
+    return this
+  }
+
+  off<K extends keyof HarborEvents> (event: K, listener: (payload: HarborEvents[K]) => void): this {
+    this.emitter.off(event, listener)
+    return this
+  }
+
+  producer<T = unknown> (options: ProducerOptions<T> = {}): Producer<T> {
+    return new Producer<T>({
+      adapter: this.adapter,
+      clientId: this.config.clientId,
+      serializer: this.serializer,
+      headerNames: this.names,
+      correlationId: this.correlationId,
+      clock: this.clock,
+      ensureConnected: () => this.connect()
+    }, options)
+  }
+
+  consumer (options: ConsumerOptions): Consumer {
+    const consumer = new Consumer({
+      adapter: this.adapter,
+      clientId: this.config.clientId,
+      serializer: this.serializer,
+      headerNames: this.names,
+      logger: this.logger,
+      clock: this.clock,
+      emit: (event, payload) => this.emitter.emit(event, payload),
+      producePolicy: this.producePolicy,
+      isClosed: () => this.isClosed(),
+      ensureConnected: () => this.connect()
+    }, options)
+    this.consumers.add(consumer)
+    return consumer
+  }
+
+  /** Opens the client connection. Idempotent and single-flight. */
+  async connect (): Promise<void> {
+    if (this.isClosed()) throw new ClosedError('harbor')
+    if (this.connecting === undefined) {
+      this.state = 'connecting'
+      const broker: BrokerConfig = {
+        clientId: this.config.clientId,
+        brokers: this.config.brokers,
+        ...(this.config.ssl !== undefined && { ssl: this.config.ssl }),
+        ...(this.config.sasl !== undefined && { sasl: this.config.sasl })
+      }
+      this.connecting = this.adapter.connect(broker).then(() => {
+        this.state = 'connected'
+        this.emitter.emit('connected', { adapter: this.adapter.name })
+      }, (error: unknown) => {
+        this.state = 'idle'
+        this.connecting = undefined
+        throw error
+      })
+    }
+    await this.connecting
+  }
+
+  /**
+   * Graceful shutdown: stop fetching on every consumer, wait for in-flight
+   * handlers up to `timeout`, let them commit, leave the groups, then
+   * disconnect. Rejects with `ShutdownTimeoutError` when handlers had to be
+   * abandoned; the disconnect still happens first.
+   */
+  async shutdown (timeout: Duration = 30_000): Promise<void> {
+    const timeoutMs = parseDuration(timeout, 'shutdown timeout')
+    if (this.closing === undefined) this.closing = this.doShutdown(timeoutMs)
+    return await this.closing
+  }
+
+  private async doShutdown (timeoutMs: number): Promise<void> {
+    const wasIdle = this.state === 'idle'
+    this.state = 'closing'
+    this.disableSignalHandlers()
+    const results = await Promise.allSettled([...this.consumers].map((consumer) => consumer.stop(timeoutMs)))
+    try {
+      await this.connecting?.catch(() => undefined)
+      if (!wasIdle) {
+        await this.adapter.disconnect()
+        this.emitter.emit('disconnected', { adapter: this.adapter.name })
+      }
+    } finally {
+      this.state = 'closed'
+    }
+    const failed = results.find((result): result is PromiseRejectedResult => result.status === 'rejected')
+    if (failed !== undefined) throw failed.reason
+  }
+
+  /**
+   * Builds the error a handler throws to stop the consumer WITHOUT
+   * committing: `throw harbor.abort(cause)`. For infrastructure bugs where
+   * reprocessing after a restart is the right outcome and neither a retry
+   * topic nor the DLQ is.
+   */
+  abort (cause: unknown): AbortProcessingError {
+    return new AbortProcessingError(cause)
+  }
+
+  /**
+   * Opt-in: a SIGTERM or SIGINT triggers `shutdown()`. Returns a function
+   * that removes the handlers again. Errors from the shutdown are logged;
+   * the process exit itself is left to the application.
+   */
+  enableSignalHandlers (signals: readonly NodeJS.Signals[] = ['SIGTERM', 'SIGINT'], timeout: Duration = 30_000): () => void {
+    // Validated now, not when the signal arrives: a bad value discovered at
+    // SIGTERM time would leave the process without a shutdown at all.
+    parseDuration(timeout, 'enableSignalHandlers timeout')
+    this.disableSignalHandlers()
+    for (const signal of signals) {
+      const handler = (): void => {
+        this.logger.info(`[kafka-harbor] ${signal} received, shutting down`)
+        this.shutdown(timeout).catch((error: unknown) => {
+          this.logger.error(`[kafka-harbor] shutdown after ${signal} failed: ${describeError(error)}`)
+        })
+      }
+      process.on(signal, handler)
+      this.signalHandlers.push({ signal, handler })
+    }
+    return () => this.disableSignalHandlers()
+  }
+
+  private disableSignalHandlers (): void {
+    for (const { signal, handler } of this.signalHandlers) process.off(signal, handler)
+    this.signalHandlers = []
+  }
+
+  private isClosed (): boolean {
+    return this.state === 'closing' || this.state === 'closed'
+  }
+}
+
+export function createHarbor (config: HarborConfig): Harbor {
+  return new Harbor(config)
+}
+
+/** Standalone form of `harbor.abort()`, for handlers without a harbor in scope. */
+export function abortProcessing (cause: unknown): AbortProcessingError {
+  return new AbortProcessingError(cause)
+}

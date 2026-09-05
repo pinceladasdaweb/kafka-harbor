@@ -1,0 +1,54 @@
+name: Bug report
+description: Something behaves differently from what the docs promise
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. The more precisely the failure is described,
+        the faster it gets a test and a fix.
+  - type: input
+    id: version
+    attributes:
+      label: kafka-harbor version
+      placeholder: "1.0.0"
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Node.js version, client adapter and Kafka version
+      placeholder: "Node 22.12, @confluentinc/kafka-javascript 1.10.0, Kafka 4.1 (KRaft)"
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: What the documentation or the types led you to expect.
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: What happened instead. Paste the error `code` (not only the message) when there is one.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+      description: |
+        A minimal script or test. A failing test in the style of tests/unit
+        or tests/integration is ideal.
+      render: ts
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: Failure conditions
+      description: |
+        For example: process killed mid-handler, broker connection dropped,
+        rebalance during processing, retry topic missing.
