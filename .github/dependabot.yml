@@ -6,6 +6,16 @@ updates:
       interval: "weekly"
     target-branch: "development"
     open-pull-requests-limit: 10
+    ignore:
+      # neostandard declares peer eslint ^9; a major eslint bump cannot
+      # install until neostandard moves. Lift when it does.
+      - dependency-name: "eslint"
+        update-types: ["version-update:semver-major"]
+      # TypeScript 7 is already checked in parallel through the typescript7
+      # alias; the tooling that consumes the compiler API (typescript-eslint,
+      # the rollup plugins) needs 6 as the primary compiler.
+      - dependency-name: "typescript"
+        update-types: ["version-update:semver-major"]
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
