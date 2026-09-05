@@ -172,6 +172,93 @@ describe('harbor.redrive', () => {
     await h.harbor.shutdown()
   })
 
+  test('the filter sees tombstones as null values, keys as strings, and no retry block when the headers carry none', async () => {
+    const h = harness()
+    await h.harbor.connect()
+    h.adapter.createTopic('orders')
+    await h.adapter.produce([{ topic: 'orders-dlq', key: Buffer.from('k1'), value: null, headers: { 'x-original-topic': 'orders' } }])
+    const seen: unknown[] = []
+    const result = await drive(h, {
+      from: 'orders-dlq',
+      filter: (message) => {
+        seen.push({ key: message.key, value: message.value, hasRetry: 'retry' in message })
+        return true
+      }
+    })
+    assert.deepEqual(result, { from: 'orders-dlq', reprocessed: 1, skipped: 0 })
+    assert.deepEqual(seen, [{ key: 'k1', value: null, hasRetry: false }])
+    assert.equal(h.adapter.messages('orders')[0]?.value, null)
+    await h.harbor.shutdown()
+  })
+
+  test('a delivery that lands after the run finished is ignored: nothing produced, nothing committed', async () => {
+    const h = harness()
+    await deadLetter(h, [{ value: 1, original: 'orders' }, { value: 2, original: 'orders' }])
+    let eachMessage: ((raw: unknown) => Promise<void>) | undefined
+    const original = h.adapter.consume
+    h.adapter.consume = async (options) => {
+      eachMessage = options.eachMessage as (raw: unknown) => Promise<void>
+      return await original(options)
+    }
+    const result = await drive(h, { from: 'orders-dlq' })
+    assert.deepEqual(result, { from: 'orders-dlq', reprocessed: 2, skipped: 0 })
+    const before = h.adapter.calls.length
+    await eachMessage!({ topic: 'orders-dlq', partition: 0, offset: '2', key: null, value: Buffer.from('3'), headers: { 'x-original-topic': 'orders' }, timestamp: h.clock.now() })
+    assert.equal(h.adapter.calls.length, before)
+    assert.deepEqual(h.adapter.messages('orders').map((m) => json(m.value)), [1, 2])
+    assert.equal(h.adapter.committed('orders-dlq-redrive', 'orders-dlq', 0), '2')
+    await h.harbor.shutdown()
+  })
+
+  test('activity inside the idle window keeps the run alive; the run ends only after a full quiet window', async () => {
+    const h = harness()
+    await deadLetter(h, [{ value: 1, original: 'orders' }])
+    const result = h.harbor.redrive({ from: 'orders-dlq', idleTimeout: '4s' })
+    await settle(20)
+    await until(() => h.clock.waiting === 1)
+    // Halfway through the window a new dead letter lands.
+    h.clock.advance(2_000)
+    await h.adapter.produce([{ topic: 'orders-dlq', key: null, value: Buffer.from('2'), headers: { 'x-original-topic': 'orders' } }])
+    await settle(20)
+    // The first wake-up sees recent activity and keeps going.
+    h.clock.advance(2_000)
+    await settle(20)
+    await until(() => h.clock.waiting === 1)
+    // Another one, then a full quiet window ends the run.
+    h.clock.advance(1_000)
+    await h.adapter.produce([{ topic: 'orders-dlq', key: null, value: Buffer.from('3'), headers: { 'x-original-topic': 'orders' } }])
+    await settle(20)
+    h.clock.advance(3_000)
+    await settle(20)
+    await until(() => h.clock.waiting === 1)
+    h.clock.advance(4_000)
+    assert.deepEqual(await result, { from: 'orders-dlq', reprocessed: 3, skipped: 0 })
+    assert.deepEqual(h.clock.sleeps, [4_000, 4_000, 4_000])
+    await h.harbor.shutdown()
+  })
+
+  test('fetch-loop errors reported by the adapter surface as error events with the redrive group', async () => {
+    const h = harness()
+    await deadLetter(h, [{ value: 1, original: 'orders' }])
+    const errors: Array<HarborEvents['error']> = []
+    h.harbor.on('error', (payload) => { errors.push(payload) })
+    let onError: ((error: unknown) => void) | undefined
+    const original = h.adapter.consume
+    h.adapter.consume = async (options) => {
+      onError = options.onError
+      return await original(options)
+    }
+    await drive(h, { from: 'orders-dlq' }, async () => {
+      await until(() => onError !== undefined)
+      onError!(new Error('fetch loop'))
+    })
+    assert.equal(errors.length, 1)
+    assert.equal(errors[0]?.scope, 'adapter')
+    assert.equal(errors[0]?.groupId, 'orders-dlq-redrive')
+    assert.equal(errors[0]?.topic, 'orders-dlq')
+    await h.harbor.shutdown()
+  })
+
   test('validates its options and refuses to run on a closed harbor', async () => {
     const h = harness()
     await assert.rejects(h.harbor.redrive({ from: '' }), { code: ERROR_CODES.CONFIG_INVALID })

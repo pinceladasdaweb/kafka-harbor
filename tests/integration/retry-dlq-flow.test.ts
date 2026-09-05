@@ -1,5 +1,5 @@
 /**
- * The Phase 0 acceptance flow on a real broker: produce, consume, fail,
+ * The acceptance flow on a real broker: produce, consume, fail,
  * walk the retry ladder, dead-letter, and shut down cleanly, all through the
  * public API with the Confluent adapter.
  */

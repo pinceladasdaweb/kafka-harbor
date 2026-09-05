@@ -1,6 +1,6 @@
 /**
- * The Phase 0 handler-signature exercise: five real handlers written against
- * the chosen signature, `(message, context)`, and the same five against the
+ * The handler-signature exercise: five real handlers written against the
+ * chosen signature, `(message, context)`, and the same five against the
  * alternative that was considered, a single destructurable object. Runs on
  * the in-memory adapter and asserts its own outcomes, so it doubles as
  * executable documentation.
