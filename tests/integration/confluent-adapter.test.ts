@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto'
 import { after, before, describe, test } from 'node:test'
 
 import { confluentAdapter } from '../../src/adapters/confluent/index'
-import { runAdapterContract } from '../contract/adapter-contract'
+import { runAdapterContract } from '../../src/testing/index'
 import { startKafka, type KafkaFixture } from '../helpers/kafka'
 
 // The broker is shared by the contract suite and the flow suite in this

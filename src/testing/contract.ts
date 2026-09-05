@@ -1,6 +1,8 @@
 /**
- * The ClientAdapter contract, as a suite every adapter must pass unmodified
- * against its real backend. Named invariants:
+ * The ClientAdapter contract, as a `node:test` suite every adapter must pass
+ * unmodified against its real backend. Exported from `kafka-harbor/testing`
+ * so an adapter written outside this repository can prove itself the same
+ * way the in-tree ones do. Named invariants:
  *
  *  1. Bytes are faithful: key, value and headers arrive as produced.
  *  2. Order holds within a partition.
@@ -16,14 +18,15 @@
  *     pause does not outlive the consumption that set it.
  *  9. A tombstone (null value) arrives as null, not as empty bytes.
  *
- * The suite runs against the in-memory adapter in the unit run and against
- * the Confluent adapter on a Testcontainers broker in the integration run.
- * The second adapter is what proves the contract did not leak the client.
+ * In this repository the suite runs against the in-memory adapter in the
+ * unit run and against the Confluent adapter on a Testcontainers broker in
+ * the integration run. The second adapter is what proves the contract did
+ * not leak the client.
  */
 import assert from 'node:assert/strict'
 import { after, before, describe, test } from 'node:test'
 
-import { decodeHeaders, type ClientAdapter, type RawMessage } from '../../src/index'
+import { decodeHeaders, type ClientAdapter, type RawMessage } from '../index'
 
 export interface AdapterContractSetup {
   /** A connected adapter, fresh for the whole suite. */

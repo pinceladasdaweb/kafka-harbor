@@ -18,7 +18,8 @@
   "mutate": [
     "src/**/*.ts",
     "!src/index.ts",
-    "!src/adapters/confluent/**"
+    "!src/adapters/confluent/**",
+    "!src/testing/contract.ts"
   ],
   "mutator": {
     "excludedMutations": ["StringLiteral"]

@@ -3,8 +3,7 @@ import { randomUUID } from 'node:crypto'
 import { describe, test } from 'node:test'
 
 import { partitionForKey } from '../../src/index'
-import { memoryAdapter } from '../../src/testing/index'
-import { runAdapterContract } from './adapter-contract'
+import { memoryAdapter, runAdapterContract } from '../../src/testing/index'
 
 runAdapterContract('memory', async () => {
   const adapter = memoryAdapter()
