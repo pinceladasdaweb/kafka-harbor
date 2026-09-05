@@ -8,7 +8,7 @@
 
 Messages cross the sea; the harbor is where they dock safely. Every Kafka client for Node.js stops at the protocol: you get a producer, a consumer, and good luck. Retry with backoff, a dead-letter queue, offsets committed only after your code ran, a shutdown that does not lose or duplicate work: all of it gets rebuilt by hand in every project. kafka-harbor is that layer, done once, on top of the client you already use.
 
-> **Status: pre-release.** The API below is the frozen design for 1.0 and is exercised end to end against a real broker, but the package is not published yet. Nothing here is a promise until `1.0.0` is on npm.
+> **Status: 0.x.** The API below is the intended 1.0 surface and is exercised end to end against a real broker. Until `1.0.0`, a minor release may still adjust it; every change is listed in [CHANGELOG.md](CHANGELOG.md).
 
 ```ts
 import { createHarbor } from 'kafka-harbor'
