@@ -369,6 +369,7 @@ export class Harbor implements Observable<HarborEvents> {
     on<K extends keyof HarborEvents>(event: K, listener: (payload: HarborEvents[K]) => void): this;
     // (undocumented)
     producer<T = unknown>(options?: ProducerOptions<T>): Producer<T>;
+    redrive(options: RedriveOptions): Promise<RedriveResult>;
     shutdown(timeout?: Duration): Promise<void>;
     // (undocumented)
     get status(): HarborState;
@@ -416,7 +417,7 @@ export type HarborErrorCode = (typeof ERROR_CODES)[keyof typeof ERROR_CODES];
 // Warning: (ae-missing-release-tag) "HarborEvents" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
 //
 // @public (undocumented)
-export interface HarborEvents extends ConsumerEvents {
+export interface HarborEvents extends ConsumerEvents, RedriveEvents {
     // (undocumented)
     connected: {
         adapter: string;
@@ -454,8 +455,11 @@ export interface HeaderNames {
     readonly firstFailureAt: string;
     readonly lastError: string;
     readonly originalTopic: string;
+    readonly prefix: string;
     readonly producedAt: string;
     readonly producer: string;
+    readonly redrivenAt: string;
+    readonly redrivenFrom: string;
     readonly retryCount: string;
 }
 
@@ -679,6 +683,54 @@ export interface RawRecord {
 //
 // @public
 export function rawSerializer(): Serializer<Buffer>;
+
+// Warning: (ae-missing-release-tag) "RedriveEvents" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
+//
+// @public (undocumented)
+export interface RedriveEvents extends Record<string, unknown> {
+    // (undocumented)
+    error: {
+        error: unknown;
+        scope: 'consumer' | 'producer' | 'adapter' | 'listener';
+        groupId?: string;
+        topic?: string;
+    };
+    // (undocumented)
+    messageRedriven: {
+        from: string;
+        to: string;
+        partition: number;
+        offset: string;
+        groupId: string;
+        correlationId: string | undefined;
+    };
+}
+
+// Warning: (ae-missing-release-tag) "RedriveOptions" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
+//
+// @public (undocumented)
+export interface RedriveOptions {
+    filter?: (message: Message) => boolean | Promise<boolean>;
+    from: string;
+    groupId?: string;
+    idleTimeout?: Duration;
+    max?: number;
+    // (undocumented)
+    serializer?: Serializer;
+    to?: string;
+}
+
+// Warning: (ae-missing-release-tag) "RedriveResult" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
+//
+// @public (undocumented)
+export interface RedriveResult {
+    // (undocumented)
+    readonly from: string;
+    // (undocumented)
+    readonly reprocessed: number;
+    // (undocumented)
+    readonly skipped: number;
+}
 
 // Warning: (ae-missing-release-tag) "RetryInfo" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
 //

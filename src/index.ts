@@ -15,6 +15,8 @@
 export { Harbor, abortProcessing, createHarbor } from './harbor'
 export type { ConsumerHealth, HarborConfig, HarborEvents, HarborHealth, HarborState, HeaderOptions } from './harbor'
 
+export type { RedriveEvents, RedriveOptions, RedriveResult } from './redrive'
+
 export { Producer } from './producer'
 export type { ProducerContext, ProducerOptions, ProducerRetryOptions } from './producer'
 

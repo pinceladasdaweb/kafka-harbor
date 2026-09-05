@@ -16,7 +16,8 @@ const capture = (h: Harness): Events => {
     messageRetried: [],
     messageDeadLettered: [],
     messageFailed: [],
-    consumerStopped: []
+    consumerStopped: [],
+    messageRedriven: []
   }
   for (const name of Object.keys(events) as Array<keyof HarborEvents>) {
     h.harbor.on(name, (payload) => { (events[name] as unknown[]).push(payload) })

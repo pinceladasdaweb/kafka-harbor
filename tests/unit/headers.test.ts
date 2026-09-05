@@ -14,6 +14,9 @@ describe('headerNames', () => {
     assert.equal(names.firstFailureAt, 'x-first-failure-at')
     assert.equal(names.lastError, 'x-last-error')
     assert.equal(names.deadLetteredAt, 'x-dead-lettered-at')
+    assert.equal(names.redrivenFrom, 'x-redriven-from')
+    assert.equal(names.redrivenAt, 'x-redriven-at')
+    assert.equal(names.prefix, 'x-')
   })
 
   test('the prefix is configurable, including empty', () => {

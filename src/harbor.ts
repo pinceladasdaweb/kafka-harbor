@@ -10,6 +10,7 @@ import type { BrokerConfig, ClientAdapter, SaslConfig } from './adapter'
 import { Consumer, type ConsumerEvents, type ConsumerOptions, type ConsumerState, type StopReason } from './consumer'
 import { AbortProcessingError, ClosedError, ConfigError, describeError } from './errors'
 import { Producer, buildProducerRetry, type ProducerOptions, type ProducerRetryOptions } from './producer'
+import { redrive, type RedriveEvents, type RedriveOptions, type RedriveResult } from './redrive'
 
 export interface HeaderOptions {
   /** Prefix of every header the library writes. Default: 'x-'. */
@@ -64,7 +65,7 @@ export interface HarborHealth {
   readonly consumers: readonly ConsumerHealth[]
 }
 
-export interface HarborEvents extends ConsumerEvents {
+export interface HarborEvents extends ConsumerEvents, RedriveEvents {
   connected: { adapter: string }
   disconnected: { adapter: string }
 }
@@ -189,6 +190,28 @@ export class Harbor implements Observable<HarborEvents> {
     }, options)
     this.consumers.add(consumer)
     return consumer
+  }
+
+  /**
+   * Drains a dead-letter topic back into service: every message is
+   * re-produced with its original key and value to its original topic (or to
+   * `to`), the failed run's tracking headers removed, and the DLQ offset
+   * committed only after the broker acknowledged. Stops after `max`
+   * messages or once the DLQ has been idle for `idleTimeout`.
+   */
+  async redrive (options: RedriveOptions): Promise<RedriveResult> {
+    return await redrive({
+      adapter: this.adapter,
+      clientId: this.config.clientId,
+      serializer: this.serializer,
+      headerNames: this.names,
+      logger: this.logger,
+      clock: this.clock,
+      producePolicy: this.producePolicy,
+      emit: (event, payload) => this.emitter.emit(event, payload),
+      isClosed: () => this.isClosed(),
+      ensureConnected: () => this.connect()
+    }, options)
   }
 
   /** Opens the client connection. Idempotent and single-flight. */

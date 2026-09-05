@@ -185,6 +185,7 @@ Each hop rewrites the tracking headers:
 | `x-first-failure-at` | ISO-8601 instant of the first failure |
 | `x-last-error` | description of the latest failure, bounded to 1 KiB |
 | `x-dead-lettered-at` | set on the DLQ hop only |
+| `x-redriven-from`, `x-redriven-at` | set by `harbor.redrive()` when a message comes back from the DLQ |
 
 These headers come from the network and are validated before use: a blank or corrupt count never turns into `0` or `NaN`; the whole block is discarded and the message counts as a first delivery on that level. A message that fails to deserialize goes straight to the DLQ; retrying would not decode it either.
 
@@ -195,6 +196,22 @@ Things to know:
 - **Naming uses hyphens** (`orders-retry-1`, `orders-dlq`), the same as Spring Kafka's defaults, because Kafka warns that `.` and `_` collide in metric names. Both naming functions are configurable.
 - **One ladder per topic.** Three levels times twenty topics is sixty retry topics. A shared retry topic per service is a possible future mode; it is not in 1.0.
 - With no levels configured (the default), a failure goes straight to the DLQ.
+
+### Draining the DLQ back into service
+
+```ts
+const result = await harbor.redrive({
+  from: 'orders-dlq',
+  to: 'orders',               // default: each message's own x-original-topic header
+  groupId: 'orders-dlq-redrive', // default: `${from}-redrive`; the offset persists between runs
+  max: 500,                    // stop after this many; default: no limit
+  idleTimeout: '5s',           // stop once nothing arrived for this long; default
+  filter: (message) => message.retry?.lastError !== 'ValidationError: bad sku'  // false skips (committed, not re-injected)
+})
+result // { from: 'orders-dlq', reprocessed: 498, skipped: 2 }
+```
+
+Each message is re-produced with its original key and value; the failed run's tracking headers are removed so it starts a fresh retry ladder, and `x-redriven-from` / `x-redriven-at` record the operation. The DLQ offset is committed only after the broker acknowledged the re-produce, so an interrupted redrive resumes where it stopped. A `messageRedriven` event fires per message. A message without `x-original-topic` fails the run unless `to` is given; a filter that throws, or a re-produce that is not acknowledged, stops the run with that error and leaves the message uncommitted.
 
 ## Graceful shutdown
 
@@ -259,6 +276,7 @@ harbor
   .on('messageFailed', ({ topic, offset, error, outcome }) => {})   // outcome: 'retry' | 'dead-letter' | 'abort' | 'crash'
   .on('messageRetried', ({ topic, retryTopic, level, attempt, error }) => {})
   .on('messageDeadLettered', ({ topic, dlqTopic, attempts, error }) => alert(...))
+  .on('messageRedriven', ({ from, to, offset }) => {})
   .on('consumerStopped', ({ groupId, reason }) => {})               // reason: 'shutdown' | 'abort' | 'crash'
   .on('error', ({ error, scope, groupId, topic }) => {})
 ```

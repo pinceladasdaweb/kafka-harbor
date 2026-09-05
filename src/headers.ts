@@ -8,6 +8,8 @@ import type { MessageHeaders, RetryInfo } from './types'
  * configurable per harbor for shops with their own naming rules.
  */
 export interface HeaderNames {
+  /** The prefix every name below starts with. */
+  readonly prefix: string
   /** Propagated end to end; generated when the producer has none. */
   readonly correlationId: string
   /** ISO-8601 instant the producer sent the message. */
@@ -24,10 +26,15 @@ export interface HeaderNames {
   readonly lastError: string
   /** ISO-8601 instant the message was sent to the dead-letter topic. */
   readonly deadLetteredAt: string
+  /** The dead-letter topic a redriven message came back from. */
+  readonly redrivenFrom: string
+  /** ISO-8601 instant a message was redriven from the DLQ. */
+  readonly redrivenAt: string
 }
 
 export function headerNames (prefix = 'x-'): HeaderNames {
   return {
+    prefix,
     correlationId: `${prefix}correlation-id`,
     producedAt: `${prefix}produced-at`,
     producer: `${prefix}producer`,
@@ -35,7 +42,9 @@ export function headerNames (prefix = 'x-'): HeaderNames {
     originalTopic: `${prefix}original-topic`,
     firstFailureAt: `${prefix}first-failure-at`,
     lastError: `${prefix}last-error`,
-    deadLetteredAt: `${prefix}dead-lettered-at`
+    deadLetteredAt: `${prefix}dead-lettered-at`,
+    redrivenFrom: `${prefix}redriven-from`,
+    redrivenAt: `${prefix}redriven-at`
   }
 }
 

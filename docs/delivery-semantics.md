@@ -41,6 +41,16 @@ moment are abandoned the same way a shutdown timeout abandons them: their
 are redelivered. Nothing is lost; effects they had already produced may run
 twice.
 
+## Coming back from the DLQ
+
+`harbor.redrive()` reads a dead-letter topic with its own consumer group and
+re-produces each message, bytes untouched, to its original topic. It commits
+the DLQ offset only after the re-produce was acknowledged: the same rule as
+everywhere else, so a redrive killed halfway resumes from the last committed
+message and never drops one. The redriven message starts a fresh ladder (the
+old tracking headers are removed); if it fails again it walks the retry
+topics again and lands in the DLQ again, with `x-redriven-from` still on it.
+
 ## Duplicates you can expect
 
 At-least-once means these can happen and your handler should tolerate them:
