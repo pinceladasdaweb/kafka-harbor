@@ -76,6 +76,14 @@ export interface ConsumeOptions {
   /** Maximum partitions processed concurrently. Default: 1. */
   readonly concurrency?: number
   /**
+   * The longest one `eachMessage` call may take, retry delay included, in
+   * milliseconds. An adapter maps it to the client setting that decides how
+   * long a member may go without polling (`max.poll.interval.ms`), so the
+   * core's `maxProcessingTime` and the client agree on the same number. An
+   * adapter that ignores it leaves the client's default in place.
+   */
+  readonly maxProcessingTimeMs?: number
+  /**
    * Called before partitions are taken away by a rebalance, once in-flight
    * `eachMessage` calls for them have settled. The core commits what
    * finished here.

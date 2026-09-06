@@ -151,6 +151,27 @@ describe('harbor.redrive', () => {
     await h.harbor.shutdown()
   })
 
+  test('a destination equal to the source is refused, whether explicit or read from the header', async () => {
+    const h = harness()
+    await deadLetter(h, [{ value: 1, original: 'orders-dlq' }])
+    await assert.rejects(h.harbor.redrive({ from: 'orders-dlq', to: 'orders-dlq' }), (error: unknown) => {
+      assert.equal((error as { code: string }).code, ERROR_CODES.CONFIG_INVALID)
+      assert.match((error as Error).message, /differ from redrive.from/)
+      return true
+    })
+    assert.equal(h.adapter.calls.filter((call) => call.method === 'consume').length, 0)
+
+    await assert.rejects(h.harbor.redrive({ from: 'orders-dlq' }), (error: unknown) => {
+      assert.equal((error as { code: string }).code, ERROR_CODES.CONFIG_INVALID)
+      assert.match((error as Error).message, /names the topic being drained/)
+      return true
+    })
+    // Nothing went round: the DLQ still holds the one message, uncommitted.
+    assert.equal(h.adapter.messages('orders-dlq').length, 1)
+    assert.equal(h.adapter.committed('orders-dlq-redrive', 'orders-dlq', 0), undefined)
+    await h.harbor.shutdown()
+  })
+
   test('a re-produce that is not acknowledged stops the redrive with the offset uncommitted', async () => {
     const h = harness()
     await deadLetter(h, [{ value: 1, original: 'orders' }])

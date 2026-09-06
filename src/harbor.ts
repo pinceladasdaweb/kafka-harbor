@@ -97,6 +97,8 @@ export class Harbor implements Observable<HarborEvents> {
   private readonly producePolicy: RetryPolicy
   private readonly consumers = new Set<Consumer>()
   private state: HarborState = 'idle'
+  /** Whether the adapter holds an open connection that shutdown must release. */
+  private adapterConnected = false
   private connecting: Promise<void> | undefined
   private closing: Promise<void> | undefined
   private signalHandlers: Array<{ signal: NodeJS.Signals, handler: () => void }> = []
@@ -225,11 +227,22 @@ export class Harbor implements Observable<HarborEvents> {
         ...(this.config.ssl !== undefined && { ssl: this.config.ssl }),
         ...(this.config.sasl !== undefined && { sasl: this.config.sasl })
       }
+      // The transitions are guarded: a shutdown that began while the connect
+      // was in flight owns the state from then on, and a connect that lands
+      // after the shutdown stopped waiting for it releases the client itself.
       this.connecting = this.adapter.connect(broker).then(() => {
-        this.state = 'connected'
-        this.emitter.emit('connected', { adapter: this.adapter.name })
+        if (this.state === 'closed') {
+          return this.adapter.disconnect().catch((error: unknown) => {
+            this.logger.error(`[kafka-harbor] disconnect after a late connect failed: ${describeError(error)}`)
+          })
+        }
+        this.adapterConnected = true
+        if (this.state === 'connecting') {
+          this.state = 'connected'
+          this.emitter.emit('connected', { adapter: this.adapter.name })
+        }
       }, (error: unknown) => {
-        this.state = 'idle'
+        if (this.state === 'connecting') this.state = 'idle'
         this.connecting = undefined
         throw error
       })
@@ -250,13 +263,18 @@ export class Harbor implements Observable<HarborEvents> {
   }
 
   private async doShutdown (timeoutMs: number): Promise<void> {
-    const wasIdle = this.state === 'idle'
+    const deadline = this.clock.now() + timeoutMs
     this.state = 'closing'
     this.disableSignalHandlers()
     const results = await Promise.allSettled([...this.consumers].map((consumer) => consumer.stop(timeoutMs)))
     try {
-      await this.connecting?.catch(() => undefined)
-      if (!wasIdle) {
+      // A connect still in flight gets what is left of the timeout; one that
+      // never settles must not hold the shutdown, so it is left to release
+      // the client on its own when (if) it lands.
+      if (this.connecting !== undefined && !await this.settledInTime(this.connecting, Math.max(0, deadline - this.clock.now()))) {
+        this.logger.warn(`[kafka-harbor] connect still pending after ${timeoutMs}ms; the client is released when it settles`)
+      }
+      if (this.adapterConnected) {
         await this.adapter.disconnect()
         this.emitter.emit('disconnected', { adapter: this.adapter.name })
       }
@@ -265,6 +283,18 @@ export class Harbor implements Observable<HarborEvents> {
     }
     const failed = results.find((result): result is PromiseRejectedResult => result.status === 'rejected')
     if (failed !== undefined) throw failed.reason
+  }
+
+  /** Whether `promise` settles within `timeoutMs`; the timer is cancelled either way. */
+  private async settledInTime (promise: Promise<unknown>, timeoutMs: number): Promise<boolean> {
+    const deadlineController = new AbortController()
+    // The sleep resolves to nothing, so only the promise settling yields true.
+    const settled = await Promise.race([
+      Promise.allSettled([promise]).then(() => true),
+      this.clock.sleep(timeoutMs, deadlineController.signal)
+    ])
+    deadlineController.abort()
+    return settled === true
   }
 
   /**

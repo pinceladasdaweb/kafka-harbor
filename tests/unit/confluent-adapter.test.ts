@@ -100,8 +100,23 @@ describe('confluentAdapter', () => {
     assert.equal(consumerConfig.kafkaJS.autoCommit, false)
     assert.equal(consumerConfig.kafkaJS.fromBeginning, true)
     assert.equal(calls.runConfig?.partitionsConsumedConcurrently, 1)
+    assert.equal('max.poll.interval.ms' in consumerConfig, false)
     await adapter.disconnect()
     assert.deepEqual(calls.disconnected.sort(), ['admin', 'consumer', 'producer'])
+  })
+
+  test('maps the core\'s maxProcessingTime to max.poll.interval.ms unless the passthrough sets it', async () => {
+    const { module, calls } = fakeClient()
+    const adapter = confluentAdapter({ client: module })
+    await adapter.connect(broker)
+    await adapter.consume({ groupId: 'g', topics: ['t'], maxProcessingTimeMs: 120_000, eachMessage: async () => {} })
+    assert.equal((calls.consumerConfigs[0] as Record<string, unknown>)['max.poll.interval.ms'], 120_000)
+
+    const pinned = fakeClient()
+    const pinnedAdapter = confluentAdapter({ client: pinned.module, consumer: { 'max.poll.interval.ms': 60_000 } })
+    await pinnedAdapter.connect(broker)
+    await pinnedAdapter.consume({ groupId: 'g', topics: ['t'], maxProcessingTimeMs: 120_000, eachMessage: async () => {} })
+    assert.equal((pinned.calls.consumerConfigs[0] as Record<string, unknown>)['max.poll.interval.ms'], 60_000)
   })
 
   test('loads the client lazily and reports a missing module as a non-retryable adapter error', async () => {

@@ -196,6 +196,41 @@ describe('Consumer: retry topics and DLQ', () => {
     await h.harbor.shutdown()
   })
 
+  test('the retry wait follows the producer timestamp but never exceeds the level delay', async () => {
+    // The adapter stamps records with the "broker" clock, offset from ours.
+    let skew = 0
+    const ref: { clock?: { now: () => number } } = {}
+    const h = harness({}, { now: () => (ref.clock as { now: () => number }).now() + skew })
+    ref.clock = h.clock
+    const attempts: string[] = []
+    const consumer = h.harbor.consumer({ groupId: 'g', fromBeginning: true, autoCreateTopics: true, retry: { levels: [{ delay: 5_000 }] } })
+    consumer.subscribe('orders', (message) => {
+      attempts.push(message.topic)
+      if (message.topic === 'orders') throw new Error('first attempt fails')
+    })
+    await consumer.start()
+
+    // The retry record is stamped 10 minutes ahead of us: the wait is the delay, not delay plus skew.
+    skew = 600_000
+    await produced(h, 'orders', [1])
+    await until(() => attempts.length === 1)
+    await until(() => h.clock.waiting === 1)
+    assert.equal(h.clock.sleeps.at(-1), 5_000)
+    h.clock.advance(5_000)
+    await until(() => attempts.length === 2)
+
+    // The retry record is stamped 2 seconds behind us: only the rest of the delay is waited.
+    skew = -2_000
+    await produced(h, 'orders', [2])
+    await until(() => attempts.length === 3)
+    await until(() => h.clock.waiting === 1)
+    assert.equal(h.clock.sleeps.at(-1), 3_000)
+    h.clock.advance(3_000)
+    await until(() => attempts.length === 4)
+    assert.deepEqual(attempts, ['orders', 'orders-retry-1', 'orders', 'orders-retry-1'])
+    await h.harbor.shutdown()
+  })
+
   test('a message that succeeds on a retry topic is committed and goes no further', async () => {
     const h = harness()
     const { events, attempts, consumer } = failing(h, { levels: [1_000], failUntil: 1 })
@@ -504,17 +539,62 @@ describe('Consumer: configuration and topics', () => {
     await h.harbor.shutdown()
   })
 
-  test('the consumer subscribes to the original topic and its whole ladder, never the DLQ', async () => {
+  test('the consumer opens one consumption per ladder level, in the same group, and never the DLQ', async () => {
     const h = harness()
-    const consumer = h.harbor.consumer({ groupId: 'g', autoCreateTopics: true, retry: { levels: [{ delay: 0 }, { delay: 0 }] } })
+    const consumer = h.harbor.consumer({ groupId: 'g', autoCreateTopics: true, maxProcessingTime: '2m', retry: { levels: [{ delay: 0 }, { delay: 0 }] } })
     consumer.subscribe('orders', () => {}).subscribe('payments', () => {})
     await consumer.start()
-    const call = h.adapter.calls.find((entry) => entry.method === 'consume')
-    const options = call?.args[0] as { topics: string[], groupId: string, concurrency: number, fromBeginning: boolean }
-    assert.deepEqual(options.topics, ['orders', 'orders-retry-1', 'orders-retry-2', 'payments', 'payments-retry-1', 'payments-retry-2'])
-    assert.equal(options.groupId, 'g')
-    assert.equal(options.concurrency, 1)
-    assert.equal(options.fromBeginning, false)
+    const calls = h.adapter.calls.filter((entry) => entry.method === 'consume')
+    const options = calls.map((call) => call.args[0] as { topics: string[], groupId: string, concurrency: number, fromBeginning: boolean, maxProcessingTimeMs: number })
+    assert.deepEqual(options.map((entry) => entry.topics), [
+      ['orders', 'payments'],
+      ['orders-retry-1', 'payments-retry-1'],
+      ['orders-retry-2', 'payments-retry-2']
+    ])
+    for (const entry of options) {
+      assert.equal(entry.groupId, 'g')
+      assert.equal(entry.concurrency, 1)
+      assert.equal(entry.fromBeginning, false)
+      assert.equal(entry.maxProcessingTimeMs, 120_000)
+    }
+    await h.harbor.shutdown()
+    assert.equal(h.adapter.calls.filter((entry) => entry.method === 'stop').length, 3)
+  })
+
+  test('a message sleeping on a retry topic does not hold the original topic', async () => {
+    // Each level is its own consumption: at concurrency 1 the retry sleep
+    // used to occupy the only worker, and the original topic starved.
+    const h = harness()
+    const handled: unknown[] = []
+    const consumer = h.harbor.consumer({ groupId: 'g', fromBeginning: true, autoCreateTopics: true, retry: { levels: [{ delay: 60_000 }] } })
+    consumer.subscribe('orders', (message) => {
+      handled.push(message.value)
+      if (message.value === 1 && message.topic === 'orders') throw new Error('first attempt fails')
+    })
+    await produced(h, 'orders', [1])
+    await consumer.start()
+    await h.adapter.whenDrained('g', 'orders')
+    await until(() => h.clock.waiting === 1)
+    await produced(h, 'orders', [2])
+    await h.adapter.whenDrained('g', 'orders')
+    assert.deepEqual(handled, [1, 2])
+    assert.equal(h.adapter.committed('g', 'orders', 0), '2')
+    assert.equal(h.clock.waiting, 1, 'the retry is still sleeping')
+    await h.harbor.shutdown(0)
+  })
+
+  test('a producer clock ahead of ours does not delay a message on the original topic', async () => {
+    const h = harness()
+    const handled: unknown[] = []
+    const consumer = h.harbor.consumer({ groupId: 'g', fromBeginning: true, autoCreateTopics: true, retry: { levels: [{ delay: 5_000 }] } })
+    consumer.subscribe('orders', (message) => { handled.push(message.value) })
+    await produced(h, 'orders', [1])
+    // The broker stamped the message 3 minutes ahead of the consumer's clock.
+    h.clock.time -= 180_000
+    await consumer.start()
+    await h.adapter.whenDrained('g', 'orders')
+    assert.deepEqual(handled, [1])
+    assert.deepEqual(h.clock.sleeps, [])
     await h.harbor.shutdown()
   })
 
@@ -598,6 +678,114 @@ describe('Consumer: review regressions', () => {
     assert.deepEqual(h.adapter.calls.filter((call) => call.method === 'stop').length, 1)
     assert.equal(h.adapter.committed('g', 'orders', 0), undefined)
     assert.equal(events.consumerStopped.length, 1)
+    assert.deepEqual(h.logs.filter((log) => log.level === 'warn'), [], 'the join landed in time: nothing was given up on')
+  })
+
+  test('a stop that begins while start() waits for the connection makes start() give up before touching the broker', async () => {
+    const h = harness()
+    let releaseConnect!: () => void
+    const gate = new Promise<void>((resolve) => { releaseConnect = resolve })
+    const original = h.adapter.connect
+    h.adapter.connect = async (config) => { await gate; await original(config) }
+    const consumer = h.harbor.consumer({ groupId: 'g', autoCreateTopics: true })
+    consumer.subscribe('orders', () => {})
+    const starting = consumer.start()
+    await settle()
+    const stopping = consumer.stop()
+    releaseConnect()
+    await assert.rejects(starting, { code: ERROR_CODES.CLOSED })
+    await stopping
+    assert.deepEqual(h.adapter.calls.map((call) => call.method), ['connect'])
+    await h.harbor.shutdown()
+  })
+
+  test('when one level fails to join, the levels that did join leave again and start() reports the failure', async () => {
+    const h = harness()
+    const original = h.adapter.consume
+    let joins = 0
+    h.adapter.consume = async (options) => {
+      if (++joins === 2) throw new Error('broker refused the second member')
+      return await original(options)
+    }
+    const consumer = h.harbor.consumer({ groupId: 'g', autoCreateTopics: true, retry: { levels: [{ delay: '1s' }, { delay: '2s' }] } })
+    consumer.subscribe('orders', () => {})
+    await assert.rejects(consumer.start(), /broker refused the second member/)
+    assert.equal(consumer.status, 'stopped')
+    assert.equal(joins, 3)
+    assert.equal(h.adapter.calls.filter((call) => call.method === 'stop').length, 2, 'the two memberships that opened were closed')
+    await h.harbor.shutdown()
+  })
+
+  test('a stop that begins while start() is stuck joining gives up at its timeout, and start() closes the membership it opens late', async () => {
+    const h = harness()
+    const events = capture(h)
+    let releaseConsume!: () => void
+    const gate = new Promise<void>((resolve) => { releaseConsume = resolve })
+    const original = h.adapter.consume
+    h.adapter.consume = async (options) => {
+      await gate
+      return await original(options)
+    }
+    const consumer = h.harbor.consumer({ groupId: 'g', autoCreateTopics: true })
+    consumer.subscribe('orders', () => {})
+    const starting = consumer.start()
+    await settle()
+    const stopping = consumer.stop(1_000)
+    await until(() => h.clock.waiting >= 1)
+    h.clock.advance(1_000)
+    await stopping
+    assert.equal(consumer.status, 'stopped')
+    assert.equal(consumer.stoppedBecause, 'shutdown')
+    assert.deepEqual(events.consumerStopped, [{ groupId: 'g', reason: 'shutdown' }])
+    assert.ok(h.logs.some((log) => log.level === 'warn' && /start\(\) did not finish within 1000ms/.test(log.message)))
+    // The join lands after the stop gave up: the membership is closed at once.
+    releaseConsume()
+    await assert.rejects(starting, { code: ERROR_CODES.CLOSED })
+    assert.equal(h.adapter.calls.filter((call) => call.method === 'stop').length, 1)
+    await h.harbor.shutdown()
+  })
+
+  test('a shutdown that gives up on a stuck start() completes within its timeout; the late start() reports the consumer closed', async () => {
+    const h = harness()
+    let releaseConsume!: () => void
+    const gate = new Promise<void>((resolve) => { releaseConsume = resolve })
+    const original = h.adapter.consume
+    h.adapter.consume = async (options) => {
+      await gate
+      return await original(options)
+    }
+    const consumer = h.harbor.consumer({ groupId: 'g', autoCreateTopics: true })
+    consumer.subscribe('orders', () => {})
+    const starting = consumer.start()
+    await settle()
+    const closing = h.harbor.shutdown('1s')
+    await until(() => h.clock.waiting >= 1)
+    h.clock.advance(1_000)
+    await closing
+    assert.equal(h.harbor.status, 'closed')
+    assert.equal(consumer.status, 'stopped')
+    // The client is gone by the time the join lands; start() says closed, not "adapter error".
+    releaseConsume()
+    await assert.rejects(starting, { code: ERROR_CODES.CLOSED })
+  })
+
+  test('a stop that begins while start() is stuck before joining makes start() give up without joining', async () => {
+    const h = harness()
+    let releaseAdmin!: () => void
+    const gate = new Promise<void>((resolve) => { releaseAdmin = resolve })
+    h.adapter.admin.topicExists = async () => { await gate; return true }
+    const consumer = h.harbor.consumer({ groupId: 'g', retry: { levels: [{ delay: '1s' }] } })
+    consumer.subscribe('orders', () => {})
+    const starting = consumer.start()
+    await settle()
+    const closing = h.harbor.shutdown('200ms')
+    await until(() => h.clock.waiting >= 1)
+    h.clock.advance(200)
+    await closing
+    releaseAdmin()
+    await assert.rejects(starting, { code: ERROR_CODES.CLOSED })
+    assert.equal(h.adapter.calls.filter((call) => call.method === 'consume').length, 0)
+    assert.equal(consumer.status, 'stopped')
   })
 
   test('a tombstone that fails keeps its null value through the retry topic and the DLQ', async () => {
@@ -916,14 +1104,18 @@ describe('Consumer: mutation follow-ups', () => {
     let release!: () => void
     const gate = new Promise<void>((resolve) => { release = resolve })
     const consumer = h.harbor.consumer({ groupId: 'g', fromBeginning: true, autoCreateTopics: true })
-    consumer.subscribe('orders', async () => { await gate })
+    let handlerSignal: AbortSignal | undefined
+    consumer.subscribe('orders', async (_message, ctx) => {
+      handlerSignal = ctx.signal
+      await gate
+    })
     await produced(h, 'orders', [1])
     await consumer.start()
     await settle()
     const closing = h.harbor.shutdown(1_000)
     await until(() => h.clock.waiting === 1)
     h.clock.advance(1_000)
-    await until(() => consumer.status === 'stopping')
+    await until(() => handlerSignal?.aborted === true)
     // The handler completes after abandonment while the handle is still open.
     release()
     await settle()

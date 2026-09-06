@@ -84,7 +84,7 @@ The design principle behind every decision: **losing a message is never the defa
 
 - **At-least-once only.** Duplicates are possible after a crash between handler and commit, a rebalance mid-handler, or an abandoned shutdown; [docs/delivery-semantics.md](docs/delivery-semantics.md) lists every case. Exactly-once effects come from deduplicating in the handler by a business key.
 - **One retry ladder per topic.** Three levels times twenty topics is sixty topics. A shared retry topic per service is not in 1.0.
-- **A retry delay must fit under the poll interval** (`maxProcessingTime`, default 5 minutes), because the retry consumer waits the delay before the handler runs. Longer ladders need a longer `max.poll.interval.ms` on the client.
+- **A retry delay must fit under the poll interval** (`maxProcessingTime`, default 5 minutes), because the retry consumer waits the delay before the handler runs. The Confluent adapter sets the client's `max.poll.interval.ms` from it; a longer ladder needs a longer `maxProcessingTime`.
 - **Retry breaks ordering.** A message that goes through a retry topic is processed after later messages on the original topic. The alternative, blocking the partition until it succeeds, is what `harbor.abort()` gives you.
 - **The default adapter has a native dependency.** `@confluentinc/kafka-javascript` ships prebuilt binaries for Node 22 and 24 on Linux (glibc and musl) and macOS; Node 26 compiles librdkafka at install. Any other client can be plugged in through `ClientAdapter`.
 - **No transactions, no batch handlers, no metrics exporters.** Observability is the typed event stream; wire it to the collector you use.
@@ -212,7 +212,8 @@ These headers come from the network and are validated before use: a blank or cor
 
 Things to know:
 
-- **Delays are bounded by `maxProcessingTime`** (default 5 minutes, Kafka's `max.poll.interval.ms`). A retry consumer waits the delay before the handler runs; a wait longer than the poll interval would get it kicked out of the group. A level above the bound is a `ConfigError` at construction naming `retry.levels[i].delay`.
+- **Delays are bounded by `maxProcessingTime`** (default 5 minutes). A retry consumer waits the delay before the handler runs; a wait longer than the client's poll interval would get it kicked out of the group, so the adapter receives the same number (the Confluent adapter sets `max.poll.interval.ms` from it unless your passthrough pins another value). A level above the bound is a `ConfigError` at construction naming `retry.levels[i].delay`.
+- **Each retry level is a group member of its own.** A consumer with two levels joins its group three times: once for the original topics, once per level. A message sleeping out its delay on `orders-retry-2` never holds a worker that `orders` or `orders-retry-1` is waiting for, whatever `concurrency` is. Kafka assigns each topic among the members subscribed to it, so the members of one group may consume different topics.
 - **Retention must exceed the delay.** A message with a 1h delay on a topic with 30 minutes of retention is a lost message. `topicDefaults` and your own topic configs are yours to set accordingly.
 - **Naming uses hyphens** (`orders-retry-1`, `orders-dlq`), the same as Spring Kafka's defaults, because Kafka warns that `.` and `_` collide in metric names. Both naming functions are configurable.
 - **One ladder per topic.** Three levels times twenty topics is sixty retry topics. A shared retry topic per service is a possible future mode; it is not in 1.0.

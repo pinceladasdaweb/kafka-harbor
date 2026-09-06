@@ -100,6 +100,7 @@ export interface ConsumeOptions {
     readonly fromBeginning?: boolean;
     // (undocumented)
     readonly groupId: string;
+    readonly maxProcessingTimeMs?: number;
     readonly onError?: (error: unknown) => void;
     readonly onPartitionsRevoked?: (partitions: readonly TopicPartition[]) => Promise<void>;
     // (undocumented)

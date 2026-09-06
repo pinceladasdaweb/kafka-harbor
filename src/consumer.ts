@@ -163,10 +163,18 @@ export class Consumer {
   /** Aborts when shutdown gives up on running handlers (the handler's `signal`). */
   private readonly shutdownController = new AbortController()
 
-  private handle: ConsumerHandle | undefined
+  /**
+   * The running consumptions, one per ladder level, keyed by every topic
+   * they consume. Each level is a group member of its own: a message
+   * sleeping out its retry delay occupies a worker of that level's client,
+   * never one the original topic (or another level) is waiting for.
+   */
+  private readonly handles = new Map<string, ConsumerHandle>()
   private state: ConsumerState = 'idle'
   private stopReason: StopReason | undefined
   private stopping: Promise<void> | undefined
+  /** Set when a stop gave up waiting for start(): whatever start() reports from then on is the closure. */
+  private startAbandoned = false
   private readonly ready: Promise<void>
   private markReady!: () => void
 
@@ -234,29 +242,85 @@ export class Consumer {
     this.state = 'starting'
     try {
       await this.context.ensureConnected()
+      this.assertNotStopping()
       await this.prepareTopics()
-      this.handle = await this.context.adapter.consume({
-        groupId: this.groupId,
-        topics: [...this.routes.keys()],
-        concurrency: this.concurrency,
-        fromBeginning: this.options.fromBeginning ?? false,
-        eachMessage: (raw) => this.receive(raw),
-        onError: (error) => this.context.emit('error', { error, scope: 'adapter', groupId: this.groupId })
-      })
-      // A stop that began while the client was joining the group has been
-      // waiting for this handle; the consumer never becomes 'running', so no
-      // delivery is processed, and start() reports it as closed.
-      if (this.stopping === undefined) this.state = 'running'
-      this.markReady()
+      this.assertNotStopping()
+      await this.join()
     } catch (error) {
       this.state = 'stopped'
       this.markReady()
+      // A start that fails after the stop gave up on it failed because the
+      // client is gone (or about to be); the caller asked for a closed
+      // consumer and gets told so.
+      if (this.startAbandoned) throw new ClosedError('consumer')
       throw error
     }
     if (this.stopping !== undefined) {
+      // A stop began while the client was joining the group. Either it is
+      // waiting for these handles, or it gave up at its deadline; in both
+      // cases the memberships are closed and no delivery is processed.
+      this.markReady()
       await this.stopping.catch(() => undefined)
+      await this.leave()
       throw new ClosedError('consumer')
     }
+    this.state = 'running'
+    this.markReady()
+  }
+
+  /** A stop that began during start() wins: the start does not go further. */
+  private assertNotStopping (): void {
+    if (this.stopping !== undefined) throw new ClosedError('consumer')
+  }
+
+  /**
+   * The topics of one ladder level, for every subscription, form one
+   * consumption. Level 0 is the original topics; level N the N-th retry
+   * topics. Kafka assigns each topic among the members subscribed to it, so
+   * the members of one group may subscribe to different topics.
+   */
+  private consumptions (): string[][] {
+    const byLevel = new Map<number, string[]>()
+    for (const [topic, route] of this.routes) {
+      const topics = byLevel.get(route.level) ?? []
+      topics.push(topic)
+      byLevel.set(route.level, topics)
+    }
+    return [...byLevel.values()]
+  }
+
+  /** Opens every consumption; if one fails, the ones that opened are closed again. */
+  private async join (): Promise<void> {
+    const results = await Promise.allSettled(this.consumptions().map(async (topics) => {
+      const handle = await this.context.adapter.consume({
+        groupId: this.groupId,
+        topics,
+        concurrency: this.concurrency,
+        fromBeginning: this.options.fromBeginning ?? false,
+        maxProcessingTimeMs: this.maxProcessingTimeMs,
+        eachMessage: (raw) => this.receive(raw),
+        onError: (error) => this.context.emit('error', { error, scope: 'adapter', groupId: this.groupId })
+      })
+      return { topics, handle }
+    }))
+    const failed = results.find((result): result is PromiseRejectedResult => result.status === 'rejected')
+    const opened = results.filter((result): result is PromiseFulfilledResult<{ topics: string[], handle: ConsumerHandle }> => result.status === 'fulfilled')
+    if (failed !== undefined) {
+      await Promise.allSettled(opened.map((result) => result.value.handle.stop()))
+      throw failed.reason
+    }
+    for (const { value } of opened) {
+      for (const topic of value.topics) this.handles.set(topic, value.handle)
+    }
+  }
+
+  /** Leaves the group on every consumption; the first failure is rethrown once all were tried. */
+  private async leave (): Promise<void> {
+    const handles = [...new Set(this.handles.values())]
+    this.handles.clear()
+    const results = await Promise.allSettled(handles.map((handle) => handle.stop()))
+    const failed = results.find((result): result is PromiseRejectedResult => result.status === 'rejected')
+    if (failed !== undefined) throw failed.reason
   }
 
   /**
@@ -286,10 +350,21 @@ export class Consumer {
   }
 
   private async doStop (reason: StopReason, timeoutMs: number): Promise<void> {
+    const deadline = this.context.clock.now() + timeoutMs
     if (this.state === 'starting') {
-      // Wait for start() to obtain the handle (or to fail), so the group
-      // membership it is creating is the one closed below.
-      await this.ready
+      // Wait for start() to obtain its handles (or to fail), so the group
+      // memberships it is creating are the ones closed below. The wait is
+      // bounded by the same timeout: a start stuck on an unreachable broker
+      // must not hold a shutdown hostage. Nothing runs and nothing is lost
+      // when it is given up on; start() closes whatever it still opens.
+      if (!await this.settledInTime(this.ready, timeoutMs)) {
+        this.context.logger.warn(`[kafka-harbor] group "${this.groupId}": start() did not finish within ${timeoutMs}ms; stopping without waiting for it`)
+        this.startAbandoned = true
+        this.state = 'stopped'
+        this.stopReason = reason
+        this.context.emit('consumerStopped', { groupId: this.groupId, reason })
+        return
+      }
     }
     if (this.state === 'idle' || this.state === 'stopped') {
       this.state = 'stopped'
@@ -298,22 +373,17 @@ export class Consumer {
     this.state = 'stopping'
     // Deliveries that never reached their handler (waiting on a retry delay,
     // or queued behind readiness) unwind at once and are left uncommitted;
-    // running handlers get the timeout.
+    // running handlers get what is left of the timeout.
     this.drainController.abort()
-    const deadlineController = new AbortController()
-    await Promise.race([
+    await this.settledInTime(
       Promise.all([...this.deliveries].filter(([, entry]) => entry.active).map(([work]) => work)),
-      this.context.clock.sleep(timeoutMs, deadlineController.signal)
-    ])
-    // A timer nobody waits for anymore must not keep the process alive.
-    deadlineController.abort()
+      Math.max(0, deadline - this.context.clock.now())
+    )
     const abandoned = [...this.deliveries.values()].filter((entry) => entry.active).length
     if (abandoned > 0) this.shutdownController.abort()
     try {
-      // The handle exists whenever the state got past 'starting'.
-      await (this.handle as ConsumerHandle).stop()
+      await this.leave()
     } finally {
-      this.handle = undefined
       this.state = 'stopped'
       this.stopReason = reason
       this.context.emit('consumerStopped', { groupId: this.groupId, reason })
@@ -323,6 +393,22 @@ export class Consumer {
       this.context.logger.warn(`[kafka-harbor] group "${this.groupId}": ${error.message}`)
       throw error
     }
+  }
+
+  /**
+   * Whether `promise` settles within `timeoutMs`. The timer is cancelled as
+   * soon as the race is decided: a timer nobody waits for anymore must not
+   * keep the process alive.
+   */
+  private async settledInTime (promise: Promise<unknown>, timeoutMs: number): Promise<boolean> {
+    const deadlineController = new AbortController()
+    // The sleep resolves to nothing, so only the promise settling yields true.
+    const settled = await Promise.race([
+      Promise.allSettled([promise]).then(() => true),
+      this.context.clock.sleep(timeoutMs, deadlineController.signal)
+    ])
+    deadlineController.abort()
+    return settled === true
   }
 
   private async prepareTopics (): Promise<void> {
@@ -467,10 +553,13 @@ export class Consumer {
    * A retry topic message becomes due `delay` after it was produced. The
    * wait is bounded by construction (every delay fits under
    * maxProcessingTime) and ends early on shutdown, in which case the message
-   * is left uncommitted for the next member.
+   * is left uncommitted for the next member. The wait is capped at the
+   * level's delay: the timestamp comes from another process's clock, and one
+   * ahead of ours would otherwise stretch the wait by the skew. With a delay
+   * of zero, which is what the original topic has, this never sleeps.
    */
   private async waitUntilDue (raw: RawMessage, delayMs: number): Promise<boolean> {
-    const wait = raw.timestamp + delayMs - this.context.clock.now()
+    const wait = Math.min(delayMs, raw.timestamp + delayMs - this.context.clock.now())
     if (wait > 0) await this.context.clock.sleep(wait, this.drainController.signal)
     // A stop aborts the drain signal and leaves 'running' in the same breath.
     return this.state === 'running'
@@ -520,9 +609,11 @@ export class Consumer {
    * whether the offset was committed.
    */
   private async commit (raw: RawMessage): Promise<boolean> {
-    if (this.handle === undefined) return false
     try {
-      await this.handle.commit([{ topic: raw.topic, partition: raw.partition, offset: (BigInt(raw.offset) + 1n).toString() }])
+      // Every consumed topic has its handle while a handler can reach this
+      // point: the handles are released only after running handlers were
+      // waited for or abandoned, and an abandoned handler never commits.
+      await (this.handles.get(raw.topic) as ConsumerHandle).commit([{ topic: raw.topic, partition: raw.partition, offset: (BigInt(raw.offset) + 1n).toString() }])
       return true
     } catch (error) {
       this.context.logger.warn(`[kafka-harbor] commit failed for ${raw.topic}[${raw.partition}]@${raw.offset}; the message will be redelivered: ${describeError(error)}`)

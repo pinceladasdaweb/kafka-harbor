@@ -67,6 +67,7 @@ export interface RedriveContext {
 export async function redrive (context: RedriveContext, options: RedriveOptions): Promise<RedriveResult> {
   if (typeof options?.from !== 'string' || options.from === '') throw new ConfigError('redrive.from must be a non-empty string')
   if (options.to !== undefined && (typeof options.to !== 'string' || options.to === '')) throw new ConfigError('redrive.to must be a non-empty string')
+  if (options.to === options.from) throw new ConfigError('redrive.to must differ from redrive.from: re-injecting a topic into itself never ends')
   if (options.max !== undefined && (!Number.isInteger(options.max) || options.max < 1)) {
     throw new ConfigError(`redrive.max must be an integer >= 1; got ${String(options.max)}`)
   }
@@ -100,6 +101,12 @@ export async function redrive (context: RedriveContext, options: RedriveOptions)
     const target = options.to ?? headers[names.originalTopic]
     if (target === undefined || target.trim() === '') {
       throw new ConfigError(`message ${raw.topic}[${raw.partition}]@${raw.offset} carries no "${names.originalTopic}" header; pass redrive.to to choose the destination`)
+    }
+    // The header comes from the network: one that names the topic being
+    // drained would send the message round in circles, growing the topic
+    // until the process runs out of memory.
+    if (target === options.from) {
+      throw new ConfigError(`message ${raw.topic}[${raw.partition}]@${raw.offset} names the topic being drained as its "${names.originalTopic}"; pass redrive.to to choose another destination`)
     }
     if (options.filter !== undefined) {
       let keep: boolean

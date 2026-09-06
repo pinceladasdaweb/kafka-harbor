@@ -75,19 +75,26 @@ message has no natural one.
 A message on `orders-retry-N` becomes due `levels[N-1].delay` after its
 broker timestamp. The retry consumer sleeps until then, so the delay is
 observed even when the retry topic is otherwise idle, and it is bounded:
-every delay must fit under `maxProcessingTime` (default 5 minutes,
-`max.poll.interval.ms`), or the construction fails naming the level.
+every delay must fit under `maxProcessingTime` (default 5 minutes), or the
+construction fails naming the level. The wait is never longer than the
+level's delay: a broker or producer clock ahead of the consumer's does not
+stretch it, and a message on the original topic never waits at all.
 
-Two consequences:
+Three consequences:
 
-- A long ladder (`10m`, `1h`) needs a longer `maxProcessingTime` **and** a
-  client configured with a matching `max.poll.interval.ms`. Otherwise the
-  group evicts the sleeping consumer.
+- A long ladder (`10m`, `1h`) needs a longer `maxProcessingTime`. The
+  adapter receives that number as `maxProcessingTimeMs` and the Confluent
+  adapter sets the client's `max.poll.interval.ms` from it, so the client
+  tolerates every delay the core accepted. A `consumer` passthrough that
+  pins `max.poll.interval.ms` wins; keep it above the longest delay plus the
+  handler's own time, or the group evicts the sleeping consumer.
 - Retention on each retry topic must exceed that level's delay, or the
   message expires before it is due.
-
-The wait is the mechanism; it is observed on the retry topic, not on the
-original one, so the original partition keeps flowing meanwhile.
+- Each level is a group member of its own. A consumer with N levels joins
+  its group N+1 times: once for the original topics, once per level. A
+  message sleeping on `orders-retry-2` therefore holds no worker that
+  `orders` or `orders-retry-1` is waiting for, whatever `concurrency` is;
+  the original partition keeps flowing while retries wait.
 
 ## Ordering
 

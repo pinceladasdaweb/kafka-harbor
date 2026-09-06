@@ -273,6 +273,9 @@ export function confluentAdapter (options: ConfluentAdapterOptions = {}): Client
           ...(consumeOptions.onError !== undefined && { logger: errorForwardingLogger(consumeOptions.onError, options.logLevel ?? 1) })
         },
         rebalance_cb: rebalanceCb,
+        // The core's maxProcessingTime, so a retry delay it accepted is one
+        // the client tolerates too. The passthrough below may still override.
+        ...(consumeOptions.maxProcessingTimeMs !== undefined && { 'max.poll.interval.ms': consumeOptions.maxProcessingTimeMs }),
         ...options.consumer
       })
       try {
