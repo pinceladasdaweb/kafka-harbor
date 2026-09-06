@@ -4,7 +4,12 @@
  * snapshotted per emit so subscribing during an emit does not affect the
  * event in flight.
  */
-export type EventMap = Record<string, unknown>
+/**
+ * Any object type whose keys are the event names. Deliberately not a record
+ * keyed by string: an interface extending one gains a string index
+ * signature, and a misspelled event name would then type-check.
+ */
+export type EventMap = object
 export type Listener<T> = (payload: T) => void
 
 export interface Observable<E extends EventMap> {

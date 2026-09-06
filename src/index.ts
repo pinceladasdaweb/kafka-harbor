@@ -13,7 +13,9 @@
  */
 
 export { Harbor, abortProcessing, createHarbor } from './harbor'
-export type { ConsumerHealth, HarborConfig, HarborEvents, HarborHealth, HarborState, HeaderOptions } from './harbor'
+export type { ConsumerHealth, ExposedHarborConfig, HarborConfig, HarborEvents, HarborHealth, HarborState, HeaderOptions } from './harbor'
+
+export type { CoreContext, HarborErrorEvent } from './context'
 
 export type { RedriveEvents, RedriveOptions, RedriveResult } from './redrive'
 
@@ -61,7 +63,7 @@ export type { HarborErrorCode } from './errors'
 export { jsonSerializer, rawSerializer, stringSerializer } from './serializer'
 export type { Serializer } from './serializer'
 
-export { parseDuration } from './duration'
+export { MAX_DURATION_MS, parseDuration } from './duration'
 
 export { murmur2, partitionForKey } from './partitioner'
 
@@ -71,7 +73,7 @@ export type { DlqTopicNaming, RetryLevel, RetryTopicNaming } from './retry-topic
 // Adapter authoring surface. Everything an adapter (in-tree or external)
 // needs is exported here: the contract and the header helpers, with the
 // error identity the core expects.
-export { decodeHeaders, headerNames } from './headers'
+export { decodeHeaders, headerNames, stampProducer } from './headers'
 export type { HeaderNames } from './headers'
 export type {
   AdminApi,

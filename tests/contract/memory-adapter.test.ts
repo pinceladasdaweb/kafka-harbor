@@ -87,6 +87,55 @@ describe('memoryAdapter specifics', () => {
   })
 })
 
+describe('memoryAdapter diagnostics', () => {
+  test('whenDrained rejects once the last member of the group stopped with messages still undelivered', async () => {
+    const adapter = memoryAdapter()
+    await adapter.connect({ clientId: 'c', brokers: ['memory'] })
+    await adapter.produce(['a', 'b'].map((value) => ({ topic: 't', key: null, value: Buffer.from(value), headers: {} })))
+    let stopping: Promise<void> | undefined
+    const handle = await adapter.consume({
+      groupId: 'g',
+      topics: ['t'],
+      fromBeginning: true,
+      eachMessage: async () => { stopping ??= handle.stop() }
+    })
+    const drained = adapter.whenDrained('g', 't')
+    await assert.rejects(drained, /whenDrained\("g", "t"\): the group has no member left/)
+    await stopping
+    // A group that never had a member still waits: the consumer may be about to start.
+    const waiting = adapter.whenDrained('other', 't')
+    const outcome = await Promise.race([waiting.then(() => 'settled', () => 'settled'), new Promise((resolve) => setTimeout(() => resolve('pending'), 50))])
+    assert.equal(outcome, 'pending')
+    await adapter.disconnect()
+  })
+
+  test('messages() lists a topic in append order across partitions, even with a frozen clock', async () => {
+    const adapter = memoryAdapter({ partitions: 2, now: () => 1_000 })
+    await adapter.connect({ clientId: 'c', brokers: ['memory'] })
+    await adapter.produce([
+      { topic: 't', key: null, value: Buffer.from('first'), headers: {}, partition: 0 },
+      { topic: 't', key: null, value: Buffer.from('second'), headers: {}, partition: 0 },
+      { topic: 't', key: null, value: Buffer.from('third'), headers: {}, partition: 1 }
+    ])
+    // Sorted by offset this would read first, third, second.
+    assert.deepEqual(adapter.messages('t').map((m) => m.value?.toString()), ['first', 'second', 'third'])
+    assert.deepEqual(adapter.messages('t').map((m) => `${m.partition}@${m.offset}`), ['0@0', '0@1', '1@0'])
+    await adapter.disconnect()
+  })
+
+  test('clearCalls forgets the recorded calls without touching the broker state', async () => {
+    const adapter = memoryAdapter()
+    await adapter.connect({ clientId: 'c', brokers: ['memory'] })
+    await adapter.produce([{ topic: 't', key: null, value: Buffer.from('x'), headers: {} }])
+    assert.equal(adapter.calls.length, 2)
+    adapter.clearCalls()
+    assert.equal(adapter.calls.length, 0)
+    assert.equal(adapter.messages('t').length, 1)
+    await adapter.disconnect()
+    assert.deepEqual(adapter.calls.map((call) => call.method), ['disconnect'])
+  })
+})
+
 describe('memoryAdapter inspection helpers', () => {
   test('topics(), createTopic(), paused() and whenDrained() on a topic created later', async () => {
     const adapter = memoryAdapter()

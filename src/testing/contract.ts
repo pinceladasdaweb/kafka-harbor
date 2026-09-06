@@ -217,8 +217,28 @@ export function runAdapterContract (name: string, setup: () => Promise<AdapterCo
       assert.equal(received.length, 1, 'nothing may arrive while paused')
       handle.resume([{ topic, partition: 0 }])
       await waitFor(() => received.length === 2, timeoutMs, 'message after resume')
+      // A pause left in place must not outlive the consumption that set it.
+      handle.pause([{ topic, partition: 0 }])
       await handle.stop()
       assert.equal(valueOf(received[1] as RawMessage), 'b')
+      await ctx.adapter.produce([{ topic, key: null, value: bytes('c'), headers: {} }])
+      const next = await consumeAll(topic, groupId, 3)
+      await next.handle.stop()
+      assert.equal(valueOf(next.received[2] as RawMessage), 'c', 'the next consumption of the group is not paused')
+    })
+
+    test('9. a tombstone arrives as a null value, not as empty bytes', async () => {
+      const topic = await ctx.topic('tombstone')
+      await ctx.adapter.produce([
+        { topic, key: bytes('k'), value: bytes('{"n":1}'), headers: {} },
+        { topic, key: bytes('k'), value: null, headers: {} },
+        { topic, key: bytes('k'), value: bytes(''), headers: {} }
+      ])
+      const { received, handle } = await consumeAll(topic, ctx.group('tombstone'), 3)
+      await handle.stop()
+      assert.deepEqual(received[0]?.value, bytes('{"n":1}'))
+      assert.equal(received[1]?.value, null, 'a tombstone is null')
+      assert.deepEqual(received[2]?.value, bytes(''), 'an empty value is empty bytes, not null')
     })
   })
 }

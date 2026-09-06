@@ -101,6 +101,21 @@ export function readRetryInfo (headers: MessageHeaders, names: HeaderNames): Ret
   return { count, originalTopic, firstFailureAt, lastError: headers[names.lastError] ?? '' }
 }
 
+/**
+ * The headers every record leaving this process carries: a correlation id
+ * (kept when the message has a non-blank one, minted otherwise), the
+ * instant it was produced and the producing application. The one writer for
+ * the producer, the retry/DLQ hop and the redrive, so the three agree.
+ */
+export function stampProducer (headers: MessageHeaders, names: HeaderNames, stamp: { clientId: string, at: Date, correlationId: () => string }): MessageHeaders {
+  return {
+    ...headers,
+    [names.correlationId]: nonBlank(headers[names.correlationId]) ?? stamp.correlationId(),
+    [names.producedAt]: stamp.at.toISOString(),
+    [names.producer]: stamp.clientId
+  }
+}
+
 export interface TrackingInput {
   readonly previous: RetryInfo | undefined
   readonly originalTopic: string

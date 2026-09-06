@@ -63,8 +63,12 @@ describe('jsonSerializer', () => {
     })
   })
 
-  test('names the path of the offending field', () => {
-    assert.throws(() => codec.serialize({ order: { items: [1, { price: Number.NaN }] } }, 't'), /value\.order\.items\[1\]\.price/)
+  test('names the path of the offending field, and nothing else', () => {
+    assert.throws(() => codec.serialize({ order: { items: [1, { price: Number.NaN }] } }, 't'), (error: unknown) => {
+      assert.equal((error as Error).message, 'value.order.items[1].price is NaN; JSON turns it into null')
+      return true
+    })
+    assert.throws(() => codec.serialize(new Map(), 't'), { message: 'value is a Map; JSON would not preserve it' })
   })
 
   test('deserialization failure is a SerializationError carrying the topic', () => {

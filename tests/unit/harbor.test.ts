@@ -3,6 +3,7 @@ import { describe, test } from 'node:test'
 
 import { ERROR_CODES, abortProcessing, createHarbor, isAbortProcessingError, isHarborError, isRetryable } from '../../src/index'
 import { memoryAdapter } from '../../src/testing/index'
+import { until } from '../helpers/manual-clock'
 import { harness } from '../helpers/harness'
 
 describe('createHarbor', () => {
@@ -18,9 +19,24 @@ describe('createHarbor', () => {
     assert.throws(() => createHarbor({ clientId: 'a', brokers: ['b:1'], adapter: {} as never }), { code: ERROR_CODES.CONFIG_INVALID })
     assert.throws(() => createHarbor({ clientId: 'a', brokers: ['b:1'], adapter: { connect: adapter.connect } as never }), { code: ERROR_CODES.CONFIG_INVALID })
     assert.throws(() => createHarbor({ clientId: 'a', brokers: ['b:1'], adapter: { connect: adapter.connect, consume: adapter.consume } as never }), { code: ERROR_CODES.CONFIG_INVALID })
+    // The message promises five methods; every one of them is checked.
+    const { disconnect: _disconnect, ...withoutDisconnect } = adapter
+    assert.throws(() => createHarbor({ clientId: 'a', brokers: ['b:1'], adapter: withoutDisconnect as never }), /disconnect/)
+    const { admin: _admin, ...withoutAdmin } = adapter
+    assert.throws(() => createHarbor({ clientId: 'a', brokers: ['b:1'], adapter: withoutAdmin as never }), /admin/)
+    assert.throws(() => createHarbor({ clientId: 'a', brokers: ['b:1'], adapter: { ...adapter, admin: { createTopics: adapter.admin.createTopics } } as never }), { code: ERROR_CODES.CONFIG_INVALID })
     assert.throws(() => createHarbor({ clientId: 'a', brokers: ['b:1'], adapter: undefined as never }), { code: ERROR_CODES.CONFIG_INVALID })
     assert.throws(() => createHarbor(undefined as never), { code: ERROR_CODES.CONFIG_INVALID })
     assert.doesNotThrow(() => createHarbor({ clientId: 'a', brokers: ['b:1'], adapter }))
+  })
+
+  test('the exposed configuration carries everything but the SASL password', () => {
+    const adapter = memoryAdapter()
+    const harbor = createHarbor({ clientId: 'a', brokers: ['b:1'], adapter, ssl: true, sasl: { mechanism: 'plain', username: 'u', password: 'secret' } })
+    assert.deepEqual(harbor.config, { clientId: 'a', brokers: ['b:1'], adapter, ssl: true, sasl: { mechanism: 'plain', username: 'u' } })
+    assert.equal(JSON.stringify(harbor.config).includes('secret'), false)
+    assert.equal(Object.isFrozen(harbor.config), true)
+    assert.equal(createHarbor({ clientId: 'a', brokers: ['b:1'], adapter }).config.sasl, undefined)
   })
 
   test('without header options, correlation ids are UUIDs and the prefix is x-', async () => {
@@ -107,7 +123,7 @@ describe('createHarbor', () => {
   })
 
   test('shutdown while a connect is in flight waits for it, then disconnects', async () => {
-    const { adapter, harbor } = harness()
+    const { adapter, harbor, logs } = harness()
     let release!: () => void
     const gate = new Promise<void>((resolve) => { release = resolve })
     const original = adapter.connect
@@ -119,6 +135,81 @@ describe('createHarbor', () => {
     await closing
     assert.deepEqual(adapter.calls.map((call) => call.method), ['connect', 'disconnect'])
     assert.equal(harbor.status, 'closed')
+    assert.deepEqual(logs.filter((log) => log.level === 'warn'), [], 'the connect settled in time')
+  })
+
+  test('a connect that settles during shutdown does not reopen the harbor nor report it healthy', async () => {
+    const { adapter, harbor } = harness()
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => { release = resolve })
+    const original = adapter.connect
+    adapter.connect = async (config) => { await gate; await original(config) }
+    const seen: string[] = []
+    harbor.on('connected', () => { seen.push(`connected while ${harbor.status}`) })
+    const connecting = harbor.connect()
+    const closing = harbor.shutdown()
+    release()
+    await connecting
+    assert.equal(harbor.status, 'closing')
+    assert.equal(harbor.isHealthy(), false)
+    await closing
+    assert.deepEqual(seen, [])
+    assert.deepEqual(adapter.calls.map((call) => call.method), ['connect', 'disconnect'])
+    assert.equal(harbor.status, 'closed')
+  })
+
+  test('a connect that fails during shutdown leaves the harbor closed and touches nothing', async () => {
+    const { adapter, harbor, logs } = harness()
+    let fail!: () => void
+    const gate = new Promise<void>((_resolve, reject) => { fail = () => reject(new Error('no broker')) })
+    adapter.connect = async () => { await gate }
+    const connecting = harbor.connect()
+    const closing = harbor.shutdown()
+    fail()
+    await assert.rejects(connecting, /no broker/)
+    assert.equal(harbor.status, 'closing')
+    await closing
+    assert.equal(harbor.status, 'closed')
+    assert.deepEqual(adapter.calls.map((call) => call.method), [])
+    assert.deepEqual(logs.filter((log) => log.level === 'warn'), [], 'a connect that failed has settled; nothing was given up on')
+    await assert.rejects(harbor.connect(), { code: ERROR_CODES.CLOSED })
+  })
+
+  test('shutdown does not wait forever for a connect that never settles; a late connect releases the client itself', async () => {
+    const { adapter, harbor, clock, logs } = harness()
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => { release = resolve })
+    const original = adapter.connect
+    adapter.connect = async (config) => { await gate; await original(config) }
+    const connecting = harbor.connect()
+    const closing = harbor.shutdown('1s')
+    await until(() => clock.waiting === 1)
+    clock.advance(1_000)
+    await closing
+    assert.equal(harbor.status, 'closed')
+    assert.ok(logs.some((log) => log.level === 'warn' && /connect still pending after 1000ms/.test(log.message)))
+    assert.deepEqual(adapter.calls.map((call) => call.method), [])
+    release()
+    await connecting
+    await until(() => adapter.calls.some((call) => call.method === 'disconnect'))
+    assert.equal(adapter.connected, false)
+  })
+
+  test('a late connect whose release fails is logged, not thrown at whoever awaited the connect', async () => {
+    const { adapter, harbor, clock, logs } = harness()
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => { release = resolve })
+    const original = adapter.connect
+    adapter.connect = async (config) => { await gate; await original(config) }
+    adapter.disconnect = async () => { throw new Error('socket already gone') }
+    const connecting = harbor.connect()
+    const closing = harbor.shutdown('1s')
+    await until(() => clock.waiting === 1)
+    clock.advance(1_000)
+    await closing
+    release()
+    await connecting
+    await until(() => logs.some((log) => log.level === 'error' && /disconnect after a late connect failed: socket already gone/.test(log.message)))
   })
 
   test('does not connect on creation; connect() is idempotent and single-flight', async () => {

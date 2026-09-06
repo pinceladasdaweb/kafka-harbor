@@ -84,8 +84,9 @@ The design principle behind every decision: **losing a message is never the defa
 
 - **At-least-once only.** Duplicates are possible after a crash between handler and commit, a rebalance mid-handler, or an abandoned shutdown; [docs/delivery-semantics.md](docs/delivery-semantics.md) lists every case. Exactly-once effects come from deduplicating in the handler by a business key.
 - **One retry ladder per topic.** Three levels times twenty topics is sixty topics. A shared retry topic per service is not in 1.0.
-- **A retry delay must fit under the poll interval** (`maxProcessingTime`, default 5 minutes), because the retry consumer waits the delay before the handler runs. Longer ladders need a longer `max.poll.interval.ms` on the client.
+- **A retry delay must fit under the poll interval** (`maxProcessingTime`, default 5 minutes), because the retry consumer waits the delay before the handler runs. The Confluent adapter sets the client's `max.poll.interval.ms` from it; a longer ladder needs a longer `maxProcessingTime`.
 - **Retry breaks ordering.** A message that goes through a retry topic is processed after later messages on the original topic. The alternative, blocking the partition until it succeeds, is what `harbor.abort()` gives you.
+- **Durations top out at about 24.8 days** (`2147483647` ms), the longest a timer can hold. A longer shutdown timeout or retry delay is a `ConfigError`, not a wait that ends after a millisecond.
 - **The default adapter has a native dependency.** `@confluentinc/kafka-javascript` ships prebuilt binaries for Node 22 and 24 on Linux (glibc and musl) and macOS; Node 26 compiles librdkafka at install. Any other client can be plugged in through `ClientAdapter`.
 - **No transactions, no batch handlers, no metrics exporters.** Observability is the typed event stream; wire it to the collector you use.
 
@@ -126,7 +127,8 @@ const events = harbor.producer<OrderEvent>({
 })
 ```
 
-- Every message gets `x-correlation-id` (kept if you set one), `x-produced-at` and `x-producer` (your `clientId`).
+- Every message gets `x-correlation-id` (kept if you set a non-blank one; minted otherwise, also when the library forwards a message to a retry topic, the DLQ or back from it), `x-produced-at` and `x-producer` (your `clientId`).
+- `value: null` is a tombstone: the record goes out with no value at all, which a compacted topic reads as "delete this key", and the serializer is never asked. Handlers receive tombstones as `value: null`.
 - Keyed messages land on the partition Kafka's default partitioner picks (murmur2). `partitionForKey(key, partitions)` computes the same number, for code that needs to know where a key goes: sharding a cache by partition, asserting co-location of related keys, or routing an unkeyed message next to a keyed one.
 - A batch is serialized before any byte leaves the process: one unencodable value means nothing is produced.
 - `send()` resolves after the broker acknowledged. Transient failures are retried (default: 5 attempts, exponential backoff with full jitter); a failure marked `retryable: false` is not. When the attempts run out you get breakwater's `RETRY_EXHAUSTED` with the last failure as `cause`.
@@ -188,7 +190,7 @@ What happens next depends on how the handler ends, and nothing else. There is no
 | returns | commits the offset |
 | throws, and `retryIf(error)` is true, and a retry level is left | produces to the next retry topic, then commits |
 | throws otherwise | produces to the DLQ, then commits |
-| throws `harbor.abort(error)` | stops **without** committing (infrastructure bug: reprocess after restart) |
+| throws `harbor.abort(error)` | stops **without** committing (infrastructure bug: reprocess after restart); handlers running on other partitions finish and commit first |
 | throws, with no retry level left and the DLQ disabled | stops **without** committing and emits `error` |
 
 The retry or DLQ produce is acknowledged by the broker **before** the source offset is committed. If it is not acknowledged, the consumer stops and the message stays where it is: it will be redelivered. A commit that fails after the work is safe (a rebalance in progress, for instance) is reported through the `error` event and the consumer carries on; that message is redelivered too.
@@ -212,7 +214,8 @@ These headers come from the network and are validated before use: a blank or cor
 
 Things to know:
 
-- **Delays are bounded by `maxProcessingTime`** (default 5 minutes, Kafka's `max.poll.interval.ms`). A retry consumer waits the delay before the handler runs; a wait longer than the poll interval would get it kicked out of the group. A level above the bound is a `ConfigError` at construction naming `retry.levels[i].delay`.
+- **Delays are bounded by `maxProcessingTime`** (default 5 minutes). A retry consumer waits the delay before the handler runs; a wait longer than the client's poll interval would get it kicked out of the group, so the adapter receives the same number (the Confluent adapter sets `max.poll.interval.ms` from it unless your passthrough pins another value). A level above the bound is a `ConfigError` at construction naming `retry.levels[i].delay`.
+- **Each retry level is a group member of its own.** A consumer with two levels joins its group three times: once for the original topics, once per level. A message sleeping out its delay on `orders-retry-2` never holds a worker that `orders` or `orders-retry-1` is waiting for, whatever `concurrency` is. Kafka assigns each topic among the members subscribed to it, so the members of one group may consume different topics.
 - **Retention must exceed the delay.** A message with a 1h delay on a topic with 30 minutes of retention is a lost message. `topicDefaults` and your own topic configs are yours to set accordingly.
 - **Naming uses hyphens** (`orders-retry-1`, `orders-dlq`), the same as Spring Kafka's defaults, because Kafka warns that `.` and `_` collide in metric names. Both naming functions are configurable.
 - **One ladder per topic.** Three levels times twenty topics is sixty retry topics. A shared retry topic per service is a possible future mode; it is not in 1.0.

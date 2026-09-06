@@ -23,7 +23,9 @@ Nothing else commits. In particular:
   **not** stop the consumer: the work behind it is already safe, so the
   failure is reported through `error` and the message is redelivered. The
   `messageProcessed`, `messageRetried` and `messageDeadLettered` events are
-  only emitted for a committed offset.
+  only emitted for a committed offset. A redrive makes the same call: a DLQ
+  offset whose commit fails after the re-produce is reported and the run
+  goes on; that dead letter is re-injected again on the next redrive.
 - A handler abandoned by shutdown (still running after the timeout) does not
   commit, whatever it returns or throws afterwards.
 - With no retry level left and the DLQ disabled, a failure stops the
@@ -34,12 +36,14 @@ what remains when every safe destination is unavailable.
 
 ## Stopping on purpose
 
-`harbor.abort()` and the no-destination-left case stop the consumer at once.
-With `concurrency > 1`, handlers running on the other partitions at that
-moment are abandoned the same way a shutdown timeout abandons them: their
-`ctx.signal` aborts, their offsets are not committed, and their messages
-are redelivered. Nothing is lost; effects they had already produced may run
-twice.
+`harbor.abort()` and the no-destination-left case stop the consumer. With
+`concurrency > 1`, handlers running on the other partitions at that moment
+are not the reason for the stop, so they get the grace a shutdown gives them
+(30 seconds): they finish, commit, and only then does the consumer leave the
+group. A handler still running after that is abandoned the way a shutdown
+timeout abandons it: its `ctx.signal` aborts, its offset is not committed,
+and its message is redelivered. Nothing is lost; effects it had already
+produced may run twice.
 
 ## Coming back from the DLQ
 
@@ -58,8 +62,12 @@ At-least-once means these can happen and your handler should tolerate them:
 - **Crash between handler and commit.** The handler ran; the process died
   before the commit reached the broker. The next member reprocesses the
   message.
-- **Rebalance during processing.** A partition revoked while its handler
-  runs is reassigned; the new owner starts from the last committed offset.
+- **Rebalance during processing.** When the client announces that a
+  partition is being taken away, the consumer lets the handler running on it
+  finish and commit before the partition is released (bounded by
+  `maxProcessingTime`), so the new owner usually starts after that message.
+  A handler that does not finish in time is the exception: the new owner
+  starts from the last committed offset and repeats it.
 - **Shutdown timeout.** An abandoned handler may have completed its side
   effects; the message is redelivered anyway.
 - **Retry produce acknowledged, commit failed.** The message exists on the
@@ -75,19 +83,26 @@ message has no natural one.
 A message on `orders-retry-N` becomes due `levels[N-1].delay` after its
 broker timestamp. The retry consumer sleeps until then, so the delay is
 observed even when the retry topic is otherwise idle, and it is bounded:
-every delay must fit under `maxProcessingTime` (default 5 minutes,
-`max.poll.interval.ms`), or the construction fails naming the level.
+every delay must fit under `maxProcessingTime` (default 5 minutes), or the
+construction fails naming the level. The wait is never longer than the
+level's delay: a broker or producer clock ahead of the consumer's does not
+stretch it, and a message on the original topic never waits at all.
 
-Two consequences:
+Three consequences:
 
-- A long ladder (`10m`, `1h`) needs a longer `maxProcessingTime` **and** a
-  client configured with a matching `max.poll.interval.ms`. Otherwise the
-  group evicts the sleeping consumer.
+- A long ladder (`10m`, `1h`) needs a longer `maxProcessingTime`. The
+  adapter receives that number as `maxProcessingTimeMs` and the Confluent
+  adapter sets the client's `max.poll.interval.ms` from it, so the client
+  tolerates every delay the core accepted. A `consumer` passthrough that
+  pins `max.poll.interval.ms` wins; keep it above the longest delay plus the
+  handler's own time, or the group evicts the sleeping consumer.
 - Retention on each retry topic must exceed that level's delay, or the
   message expires before it is due.
-
-The wait is the mechanism; it is observed on the retry topic, not on the
-original one, so the original partition keeps flowing meanwhile.
+- Each level is a group member of its own. A consumer with N levels joins
+  its group N+1 times: once for the original topics, once per level. A
+  message sleeping on `orders-retry-2` therefore holds no worker that
+  `orders` or `orders-retry-1` is waiting for, whatever `concurrency` is;
+  the original partition keeps flowing while retries wait.
 
 ## Ordering
 

@@ -46,9 +46,22 @@ rules the core relies on:
 2. Never commit on your own. `enable.auto.commit=false`, or the equivalent.
 
 `concurrency` is the number of partitions processed at once; `fromBeginning`
-is where a brand-new group starts; `onPartitionsRevoked` (optional) is called
-before a rebalance takes partitions away; `onError` reports fetch-loop
-errors that belong to no message.
+is where a brand-new group starts; `maxProcessingTimeMs` is the longest one
+`eachMessage` call may take, retry delay included, for the client setting
+that decides how long a member may go without polling (`max.poll.interval.ms`
+in librdkafka; ignore it if your client has no such knob); `onError` reports
+fetch-loop errors that belong to no message.
+
+`onPartitionsRevoked` (optional) is called when a rebalance is about to take
+partitions away, and the adapter must **await it before releasing them**: the
+core uses that time to let the handlers still running on those partitions
+finish and commit, so the next owner does not repeat their work. The core
+bounds the wait by `maxProcessingTimeMs`; an adapter whose client cannot
+delay a revocation simply does not call it.
+
+The core may call `consume` more than once for the same group with disjoint
+topic sets (one call per retry level), so an adapter must not assume a
+single consumer per group.
 
 The returned `ConsumerHandle` has `commit`, `stop`, and optionally `pause`
 and `resume`. `stop()` leaves the group and releases the client. The core
@@ -58,12 +71,17 @@ that waits for in-flight `eachMessage` calls does not deadlock.
 ### admin
 
 `createTopics` treats an already-existing topic as success (the outcome is
-what was asked for). `topicExists` tells the truth.
+what was asked for) and resolves only once the topics are **visible**: a
+broker acknowledges a creation before every replica serves the new metadata,
+and a `consume` or `topicExists` issued right after must find the topic.
+Poll the metadata until it does, bounded by your admin timeout. `topicExists`
+tells the truth.
 
 ## Errors
 
 Wrap client errors in `AdapterError` from `kafka-harbor`, with the original
-as `cause`. Carry the client's retryability hint as `retryable` when it has
+as `cause` (`describeError` from the package root turns any thrown value into
+the message text). Carry the client's retryability hint as `retryable` when it has
 one; the producer's retry policy reads it. Import from the package root, never
 from a deep path: the build externalizes only the core bundle, and a deep
 import would inline a private copy of the error class.

@@ -31,34 +31,42 @@ const isRejectedShape = (value: object): string | null => {
   return null
 }
 
-const assertEncodable = (value: unknown, path: string, seen: WeakSet<object>): void => {
+/**
+ * Where in the value a rejected node sits, collected while the failure
+ * unwinds: the path is only ever needed in the error message, so the happy
+ * path allocates nothing for it.
+ */
+class Unencodable {
+  readonly segments: string[] = []
+  constructor (readonly reason: string) {}
+
+  message (): string {
+    return `value${this.segments.reverse().join('')} ${this.reason}`
+  }
+}
+
+const walk = (value: unknown, seen: WeakSet<object>): void => {
   switch (typeof value) {
     case 'number':
-      if (!Number.isFinite(value)) {
-        throw new SerializationError(`${path} is ${String(value)}; JSON turns it into null`)
-      }
+      if (!Number.isFinite(value)) throw new Unencodable(`is ${String(value)}; JSON turns it into null`)
       break
     case 'object': {
       if (value === null) return
       if (value instanceof Date) {
-        if (Number.isNaN(value.getTime())) throw new SerializationError(`${path} is an invalid Date`)
+        if (Number.isNaN(value.getTime())) throw new Unencodable('is an invalid Date')
         return
       }
       const rejected = isRejectedShape(value)
-      if (rejected !== null) {
-        throw new SerializationError(`${path} is a ${rejected}; JSON would not preserve it`)
-      }
-      if (seen.has(value)) throw new SerializationError(`${path} closes a cycle`)
+      if (rejected !== null) throw new Unencodable(`is a ${rejected}; JSON would not preserve it`)
+      if (seen.has(value)) throw new Unencodable('closes a cycle')
       seen.add(value)
       if (Array.isArray(value)) {
-        value.forEach((item, index) => assertEncodable(item, `${path}[${index}]`, seen))
+        for (let index = 0; index < value.length; index++) descend(value[index], `[${index}]`, seen)
       } else {
-        for (const [key, item] of Object.entries(value)) {
-          // `undefined` inside an object is dropped by JSON.stringify rather
-          // than encoded; a consumer would see a missing key and never know
-          // whether the producer meant to send it.
-          assertEncodable(item, `${path}.${key}`, seen)
-        }
+        // `undefined` inside an object is dropped by JSON.stringify rather
+        // than encoded; a consumer would see a missing key and never know
+        // whether the producer meant to send it.
+        for (const key in value) descend((value as Record<string, unknown>)[key], `.${key}`, seen)
       }
       seen.delete(value)
       break
@@ -67,7 +75,25 @@ const assertEncodable = (value: unknown, path: string, seen: WeakSet<object>): v
     case 'function':
     case 'symbol':
     case 'bigint':
-      throw new SerializationError(`${path} is a ${typeof value}; JSON has no representation for it`)
+      throw new Unencodable(`is a ${typeof value}; JSON has no representation for it`)
+  }
+}
+
+const descend = (item: unknown, segment: string, seen: WeakSet<object>): void => {
+  try {
+    walk(item, seen)
+  } catch (failure) {
+    if (failure instanceof Unencodable) failure.segments.push(segment)
+    throw failure
+  }
+}
+
+const assertEncodable = (value: unknown): void => {
+  try {
+    walk(value, new WeakSet())
+  } catch (failure) {
+    if (failure instanceof Unencodable) throw new SerializationError(failure.message())
+    throw failure
   }
 }
 
@@ -81,7 +107,7 @@ export function jsonSerializer<T = unknown> (): Serializer<T> {
   return {
     serialize (value, topic) {
       try {
-        assertEncodable(value, 'value', new WeakSet())
+        assertEncodable(value)
         return Buffer.from(JSON.stringify(value), 'utf8')
       } catch (cause) {
         if (isSerializationError(cause)) throw cause

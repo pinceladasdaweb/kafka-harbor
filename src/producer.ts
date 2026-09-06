@@ -1,8 +1,9 @@
-import type { HeaderNames } from './headers'
+import { isRetryable } from './errors'
 import type { Serializer } from './serializer'
+import type { Clock, OutgoingMessage } from './types'
 import type { ClientAdapter, RawRecord } from './adapter'
-import type { Clock, MessageHeaders, OutgoingMessage } from './types'
-import { ConfigError, isRetryable } from './errors'
+import { stampProducer, type HeaderNames } from './headers'
+import { requireNonEmptyString, requirePositiveInteger } from './validate'
 import { exponential, retry, type Backoff, type RetryPolicy } from 'breakwater'
 
 export interface ProducerRetryOptions {
@@ -35,10 +36,7 @@ export interface ProducerContext {
 }
 
 export function buildProducerRetry (options: ProducerRetryOptions | undefined): RetryPolicy {
-  const attempts = options?.attempts ?? 5
-  if (!Number.isInteger(attempts) || attempts < 1) {
-    throw new ConfigError(`producer retry.attempts must be an integer >= 1; got ${String(attempts)}`)
-  }
+  const attempts = requirePositiveInteger(options?.attempts ?? 5, 'producer retry.attempts')
   return retry({
     attempts,
     backoff: options?.backoff ?? exponential({ initial: 100, max: 5_000, jitter: 'full' }),
@@ -64,30 +62,23 @@ export class Producer<T = unknown> {
   /**
    * Produces every message and resolves once the broker acknowledged all of
    * them. Serialization happens before any byte leaves the process, so a
-   * batch with one unencodable value produces nothing.
+   * batch with one unencodable value produces nothing. A `null` value is a
+   * tombstone: no value bytes at all, which is what a compacted topic reads
+   * as "delete this key"; the serializer never sees it.
    */
   async sendBatch (topic: string, messages: readonly OutgoingMessage<T>[]): Promise<void> {
-    if (typeof topic !== 'string' || topic === '') {
-      throw new ConfigError('topic must be a non-empty string')
-    }
-    const records = messages.map((message) => this.toRecord(topic, message))
+    requireNonEmptyString(topic, 'topic')
+    // One instant for the whole batch: the records leave together.
+    const stamp = { clientId: this.context.clientId, at: new Date(this.context.clock.now()), correlationId: this.context.correlationId }
+    const records = messages.map((message): RawRecord => ({
+      topic,
+      key: message.key === undefined || message.key === null ? null : Buffer.from(message.key, 'utf8'),
+      value: message.value === null ? null : this.serializer.serialize(message.value, topic),
+      headers: stampProducer(message.headers ?? {}, this.context.headerNames, stamp),
+      partition: message.partition
+    }))
     if (records.length === 0) return
     await this.context.ensureConnected()
     await this.policy.execute(() => this.context.adapter.produce(records))
-  }
-
-  private toRecord (topic: string, message: OutgoingMessage<T>): RawRecord {
-    const names = this.context.headerNames
-    const headers: MessageHeaders = { ...message.headers }
-    headers[names.correlationId] ??= this.context.correlationId()
-    headers[names.producedAt] = new Date(this.context.clock.now()).toISOString()
-    headers[names.producer] = this.context.clientId
-    return {
-      topic,
-      key: message.key === undefined || message.key === null ? null : Buffer.from(message.key, 'utf8'),
-      value: this.serializer.serialize(message.value, topic),
-      headers,
-      partition: message.partition
-    }
   }
 }

@@ -1,9 +1,10 @@
 /**
- * Message headers as the application sees them: always strings. Decoding
- * the wire bytes (Buffer, or an array of values for a repeated key) is the
- * adapter's job; a value that is not valid UTF-8 still arrives as a string,
- * so a handler that needs binary data puts it in the value with a custom
- * serializer, never in a header.
+ * Message headers as the application sees them: always strings. The adapter
+ * delivers the wire headers as the client exposes them (Buffer, string, or
+ * an array of values for a repeated key) and the core decodes them, keeping
+ * the LAST value of a repeated key. A value that is not valid UTF-8 still
+ * arrives as a string, so a handler that needs binary data puts it in the
+ * value with a custom serializer, never in a header.
  */
 export type MessageHeaders = Record<string, string>
 
@@ -41,7 +42,8 @@ export interface Message<T = unknown> {
 /** A message as the application sends it. */
 export interface OutgoingMessage<T = unknown> {
   key?: string | null
-  value: T
+  /** The payload, or `null` for a tombstone (a record with no value, which compaction reads as a delete). */
+  value: T | null
   headers?: MessageHeaders
   /** Explicit partition. Rarely needed: the key is the normal routing path. */
   partition?: number

@@ -74,7 +74,7 @@
     "lint:fix": "eslint . --fix",
     "prepack": "npm run build",
     "test": "node --import tsx --test --test-timeout=10000 'tests/unit/**/*.test.ts' 'tests/contract/**/*.test.ts'",
-    "test:coverage": "c8 --all --src src --include 'src/**/*.ts' --exclude 'src/adapter.ts' --exclude 'src/types.ts' --exclude 'src/testing/contract.ts' --reporter text --reporter lcov --report-dir coverage node --import tsx --test --test-timeout=10000 'tests/unit/**/*.test.ts' 'tests/contract/**/*.test.ts'",
+    "test:coverage": "c8 --all --src src --include 'src/**/*.ts' --exclude 'src/adapter.ts' --exclude 'src/context.ts' --exclude 'src/types.ts' --exclude 'src/testing/contract.ts' --reporter text --reporter lcov --report-dir coverage node --import tsx --test --test-timeout=10000 'tests/unit/**/*.test.ts' 'tests/contract/**/*.test.ts'",
     "test:integration": "node --import tsx --test --test-timeout=180000 --test-concurrency=1 'tests/integration/**/*.test.ts'",
     "test:mutation": "stryker run",
     "test:mutation:changed": "node scripts/mutation-changed.mjs",
