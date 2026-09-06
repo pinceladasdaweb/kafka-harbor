@@ -64,7 +64,10 @@ describe('order handler', () => {
     assert.equal(calls, 2)
     assert.equal(adapter.messages('orders-retry-1').length, 1)
     assert.equal(adapter.messages('orders-dlq').length, 0)
-    assert.deepEqual(events.map((e) => e.type), ['messageRetried', 'messageProcessed'])
+    // The retry level is consumed by a member of its own, so the second
+    // attempt can be reported before the first one's retry event; the set is
+    // what a test can rely on.
+    assert.deepEqual(events.map((e) => e.type).sort(), ['messageProcessed', 'messageRetried'])
     await harbor.shutdown()
   })
 

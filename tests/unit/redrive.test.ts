@@ -172,6 +172,60 @@ describe('harbor.redrive', () => {
     await h.harbor.shutdown()
   })
 
+  test('a commit that fails after the re-produce is reported and the run goes on, the same as a consumer would', async () => {
+    const h = harness()
+    const errors: unknown[] = []
+    h.harbor.on('error', ({ error }) => { errors.push(error) })
+    await deadLetter(h, [{ value: 1, original: 'orders' }, { value: 2, original: 'orders' }])
+    const original = h.adapter.consume
+    h.adapter.consume = async (options) => {
+      const handle = await original(options)
+      const commit = handle.commit
+      let failed = false
+      handle.commit = async (offsets) => {
+        if (!failed) {
+          failed = true
+          throw new Error('REBALANCE_IN_PROGRESS')
+        }
+        await commit(offsets)
+      }
+      return handle
+    }
+    const result = await drive(h, { from: 'orders-dlq' })
+    assert.deepEqual(result, { from: 'orders-dlq', reprocessed: 2, skipped: 0 })
+    assert.deepEqual(h.adapter.messages('orders').map((m) => json(m.value)), [1, 2])
+    assert.equal(h.adapter.committed('orders-dlq-redrive', 'orders-dlq', 0), '2')
+    assert.equal((errors[0] as Error).message, 'REBALANCE_IN_PROGRESS')
+    assert.ok(h.logs.some((entry) => entry.level === 'warn' && entry.message.includes('commit failed for orders-dlq[0]@0')))
+    await h.harbor.shutdown()
+  })
+
+  test('a dead letter without a correlation id gets one on its way back, and the event carries it', async () => {
+    const h = harness()
+    const redriven: Array<string | undefined> = []
+    h.harbor.on('messageRedriven', ({ correlationId }) => { redriven.push(correlationId) })
+    await h.harbor.connect()
+    h.adapter.createTopic('orders')
+    await h.adapter.produce([{ topic: 'orders-dlq', key: null, value: Buffer.from('1'), headers: { 'x-original-topic': 'orders' } }])
+    await drive(h, { from: 'orders-dlq' })
+    assert.equal(h.adapter.messages('orders')[0]?.headers['x-correlation-id'], 'corr-fixed')
+    assert.deepEqual(redriven, ['corr-fixed'])
+    await h.harbor.shutdown()
+  })
+
+  test('a filter whose serializer throws its own error class skips the message instead of aborting the run', async () => {
+    const h = harness()
+    const errors: unknown[] = []
+    h.harbor.on('error', ({ error }) => { errors.push(error) })
+    await deadLetter(h, [{ value: 1, original: 'orders' }])
+    const codec = { serialize: (value: unknown) => Buffer.from(JSON.stringify(value)), deserialize: () => { throw new TypeError('schema mismatch') } }
+    const result = await drive(h, { from: 'orders-dlq', serializer: codec, filter: () => true })
+    assert.deepEqual(result, { from: 'orders-dlq', reprocessed: 0, skipped: 1 })
+    assert.equal((errors[0] as { code: string }).code, ERROR_CODES.SERIALIZATION)
+    assert.equal(h.adapter.committed('orders-dlq-redrive', 'orders-dlq', 0), '1')
+    await h.harbor.shutdown()
+  })
+
   test('a re-produce that is not acknowledged stops the redrive with the offset uncommitted', async () => {
     const h = harness()
     await deadLetter(h, [{ value: 1, original: 'orders' }])
@@ -280,8 +334,19 @@ describe('harbor.redrive', () => {
     await h.harbor.shutdown()
   })
 
+  test('the filter deserializes with the original topic, not the dead-letter topic', async () => {
+    const h = harness()
+    const asked: string[] = []
+    const codec = { serialize: (value: unknown) => Buffer.from(JSON.stringify(value)), deserialize: (bytes: Buffer, topic: string) => { asked.push(topic); return JSON.parse(bytes.toString()) } }
+    await deadLetter(h, [{ value: 1, original: 'orders' }])
+    await drive(h, { from: 'orders-dlq', serializer: codec, filter: () => true })
+    assert.deepEqual(asked, ['orders'])
+    await h.harbor.shutdown()
+  })
+
   test('validates its options and refuses to run on a closed harbor', async () => {
     const h = harness()
+    await assert.rejects(h.harbor.redrive(undefined as never), { code: ERROR_CODES.CONFIG_INVALID })
     await assert.rejects(h.harbor.redrive({ from: '' }), { code: ERROR_CODES.CONFIG_INVALID })
     await assert.rejects(h.harbor.redrive({ from: 'd', to: '' }), { code: ERROR_CODES.CONFIG_INVALID })
     await assert.rejects(h.harbor.redrive({ from: 'd', max: 0 }), { code: ERROR_CODES.CONFIG_INVALID })

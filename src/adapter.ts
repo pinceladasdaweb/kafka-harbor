@@ -84,9 +84,11 @@ export interface ConsumeOptions {
    */
   readonly maxProcessingTimeMs?: number
   /**
-   * Called before partitions are taken away by a rebalance, once in-flight
-   * `eachMessage` calls for them have settled. The core commits what
-   * finished here.
+   * Called when a rebalance is about to take these partitions away. The
+   * adapter awaits it before releasing them; the core uses that time to let
+   * the handlers still running on those partitions finish and commit, so the
+   * next owner does not repeat their work. Bounded by the core, never longer
+   * than `maxProcessingTimeMs`.
    */
   readonly onPartitionsRevoked?: (partitions: readonly TopicPartition[]) => Promise<void>
   /** Called when a fetch loop error is not attributable to a message. */
@@ -108,10 +110,10 @@ export interface ConsumerHandle {
    */
   stop: () => Promise<void>
   /**
-   * Stops fetching from these partitions without leaving the group. Optional
-   * capability: an adapter without it cannot host the partition-level pause
-   * the circuit breaker integration relies on, and the core reports that
-   * instead of failing.
+   * Stops fetching from these partitions without leaving the group, until
+   * `resume`. Optional: the core does not call either today; an application
+   * holding the handle may. A pause belongs to this consumption and must not
+   * survive its `stop()`.
    */
   pause?: (partitions: readonly TopicPartition[]) => void
   resume?: (partitions: readonly TopicPartition[]) => void
@@ -126,7 +128,12 @@ export interface TopicSpec {
 }
 
 export interface AdminApi {
-  /** Creates the topics that do not exist yet; existing ones are not an error. */
+  /**
+   * Creates the topics that do not exist yet; existing ones are not an error.
+   * Resolves only once the topics are visible: a `consume` or `topicExists`
+   * issued right after must find them, even though a broker acknowledges a
+   * creation before every replica serves the new metadata.
+   */
   createTopics: (topics: readonly TopicSpec[]) => Promise<void>
   topicExists: (topic: string) => Promise<boolean>
 }

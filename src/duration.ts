@@ -12,6 +12,13 @@ const UNITS: Record<string, number> = {
 const PATTERN = /^(\d+(?:\.\d+)?)\s*(ms|s|m|h|d)$/
 
 /**
+ * The longest duration a timer can hold: `setTimeout` takes a signed 32-bit
+ * count of milliseconds and silently fires after 1ms above it, which would
+ * turn "wait 25 days" into "do not wait". About 24.8 days.
+ */
+export const MAX_DURATION_MS = 2_147_483_647
+
+/**
  * Parses a duration into milliseconds. Numbers are taken as milliseconds
  * and must be finite and non-negative; strings need a unit (`'5s'`, `'1m'`).
  * Bare strings of digits are rejected on purpose: `'5'` is more likely a
@@ -25,7 +32,7 @@ export function parseDuration (value: Duration, name: string): number {
     if (!Number.isFinite(value) || value < 0) {
       throw new ConfigError(`${name} must be a finite, non-negative number of milliseconds; got ${String(value)}`)
     }
-    return value
+    return bounded(value, name)
   }
   if (typeof value !== 'string') {
     throw new ConfigError(`${name} must be a number of milliseconds or a duration string such as '5s'; got ${typeof value}`)
@@ -36,5 +43,12 @@ export function parseDuration (value: Duration, name: string): number {
   }
   const amount = Number(match[1])
   const unit = UNITS[match[2] as string] as number
-  return Math.round(amount * unit)
+  return bounded(Math.round(amount * unit), name)
+}
+
+const bounded = (ms: number, name: string): number => {
+  if (ms > MAX_DURATION_MS) {
+    throw new ConfigError(`${name} must not exceed ${MAX_DURATION_MS}ms (about 24.8 days), the longest a timer can wait; got ${ms}ms`)
+  }
+  return ms
 }

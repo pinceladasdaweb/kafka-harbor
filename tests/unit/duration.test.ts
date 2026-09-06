@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { describe, test } from 'node:test'
 
-import { ERROR_CODES, parseDuration } from '../../src/index'
+import { ERROR_CODES, MAX_DURATION_MS, parseDuration } from '../../src/index'
 
 describe('parseDuration', () => {
   test('numbers are milliseconds, zero included', () => {
@@ -34,6 +34,18 @@ describe('parseDuration', () => {
         return true
       }, `value ${String(value)} should be rejected`)
     }
+  })
+
+  test('rejects anything a timer cannot hold, in either form', () => {
+    assert.equal(parseDuration(MAX_DURATION_MS, 'x'), MAX_DURATION_MS)
+    assert.equal(parseDuration('24d', 'x'), 24 * 86_400_000)
+    assert.throws(() => parseDuration(MAX_DURATION_MS + 1, 'shutdown timeout'), (error: unknown) => {
+      assert.equal((error as { code: string }).code, ERROR_CODES.CONFIG_INVALID)
+      assert.match((error as Error).message, /shutdown timeout must not exceed 2147483647ms/)
+      return true
+    })
+    assert.throws(() => parseDuration('25d', 'x'), { code: ERROR_CODES.CONFIG_INVALID })
+    assert.throws(() => parseDuration(Number.MAX_SAFE_INTEGER, 'x'), { code: ERROR_CODES.CONFIG_INVALID })
   })
 
   test('rejects non-string non-number input', () => {

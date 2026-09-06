@@ -23,7 +23,9 @@ Nothing else commits. In particular:
   **not** stop the consumer: the work behind it is already safe, so the
   failure is reported through `error` and the message is redelivered. The
   `messageProcessed`, `messageRetried` and `messageDeadLettered` events are
-  only emitted for a committed offset.
+  only emitted for a committed offset. A redrive makes the same call: a DLQ
+  offset whose commit fails after the re-produce is reported and the run
+  goes on; that dead letter is re-injected again on the next redrive.
 - A handler abandoned by shutdown (still running after the timeout) does not
   commit, whatever it returns or throws afterwards.
 - With no retry level left and the DLQ disabled, a failure stops the
@@ -34,12 +36,14 @@ what remains when every safe destination is unavailable.
 
 ## Stopping on purpose
 
-`harbor.abort()` and the no-destination-left case stop the consumer at once.
-With `concurrency > 1`, handlers running on the other partitions at that
-moment are abandoned the same way a shutdown timeout abandons them: their
-`ctx.signal` aborts, their offsets are not committed, and their messages
-are redelivered. Nothing is lost; effects they had already produced may run
-twice.
+`harbor.abort()` and the no-destination-left case stop the consumer. With
+`concurrency > 1`, handlers running on the other partitions at that moment
+are not the reason for the stop, so they get the grace a shutdown gives them
+(30 seconds): they finish, commit, and only then does the consumer leave the
+group. A handler still running after that is abandoned the way a shutdown
+timeout abandons it: its `ctx.signal` aborts, its offset is not committed,
+and its message is redelivered. Nothing is lost; effects it had already
+produced may run twice.
 
 ## Coming back from the DLQ
 
@@ -58,8 +62,12 @@ At-least-once means these can happen and your handler should tolerate them:
 - **Crash between handler and commit.** The handler ran; the process died
   before the commit reached the broker. The next member reprocesses the
   message.
-- **Rebalance during processing.** A partition revoked while its handler
-  runs is reassigned; the new owner starts from the last committed offset.
+- **Rebalance during processing.** When the client announces that a
+  partition is being taken away, the consumer lets the handler running on it
+  finish and commit before the partition is released (bounded by
+  `maxProcessingTime`), so the new owner usually starts after that message.
+  A handler that does not finish in time is the exception: the new owner
+  starts from the last committed offset and repeats it.
 - **Shutdown timeout.** An abandoned handler may have completed its side
   effects; the message is redelivered anyway.
 - **Retry produce acknowledged, commit failed.** The message exists on the

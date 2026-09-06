@@ -19,9 +19,24 @@ describe('createHarbor', () => {
     assert.throws(() => createHarbor({ clientId: 'a', brokers: ['b:1'], adapter: {} as never }), { code: ERROR_CODES.CONFIG_INVALID })
     assert.throws(() => createHarbor({ clientId: 'a', brokers: ['b:1'], adapter: { connect: adapter.connect } as never }), { code: ERROR_CODES.CONFIG_INVALID })
     assert.throws(() => createHarbor({ clientId: 'a', brokers: ['b:1'], adapter: { connect: adapter.connect, consume: adapter.consume } as never }), { code: ERROR_CODES.CONFIG_INVALID })
+    // The message promises five methods; every one of them is checked.
+    const { disconnect: _disconnect, ...withoutDisconnect } = adapter
+    assert.throws(() => createHarbor({ clientId: 'a', brokers: ['b:1'], adapter: withoutDisconnect as never }), /disconnect/)
+    const { admin: _admin, ...withoutAdmin } = adapter
+    assert.throws(() => createHarbor({ clientId: 'a', brokers: ['b:1'], adapter: withoutAdmin as never }), /admin/)
+    assert.throws(() => createHarbor({ clientId: 'a', brokers: ['b:1'], adapter: { ...adapter, admin: { createTopics: adapter.admin.createTopics } } as never }), { code: ERROR_CODES.CONFIG_INVALID })
     assert.throws(() => createHarbor({ clientId: 'a', brokers: ['b:1'], adapter: undefined as never }), { code: ERROR_CODES.CONFIG_INVALID })
     assert.throws(() => createHarbor(undefined as never), { code: ERROR_CODES.CONFIG_INVALID })
     assert.doesNotThrow(() => createHarbor({ clientId: 'a', brokers: ['b:1'], adapter }))
+  })
+
+  test('the exposed configuration carries everything but the SASL password', () => {
+    const adapter = memoryAdapter()
+    const harbor = createHarbor({ clientId: 'a', brokers: ['b:1'], adapter, ssl: true, sasl: { mechanism: 'plain', username: 'u', password: 'secret' } })
+    assert.deepEqual(harbor.config, { clientId: 'a', brokers: ['b:1'], adapter, ssl: true, sasl: { mechanism: 'plain', username: 'u' } })
+    assert.equal(JSON.stringify(harbor.config).includes('secret'), false)
+    assert.equal(Object.isFrozen(harbor.config), true)
+    assert.equal(createHarbor({ clientId: 'a', brokers: ['b:1'], adapter }).config.sasl, undefined)
   })
 
   test('without header options, correlation ids are UUIDs and the prefix is x-', async () => {

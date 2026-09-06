@@ -28,6 +28,31 @@ describe('Producer', () => {
     assert.equal(adapter.messages('orders')[0]?.headers['x-correlation-id'], 'mine')
   })
 
+  test('a blank correlation id from the caller is replaced, not kept', async () => {
+    const { adapter, harbor } = harness()
+    await harbor.producer().send('orders', { value: 1, headers: { 'x-correlation-id': '  ' } })
+    assert.equal(adapter.messages('orders')[0]?.headers['x-correlation-id'], 'corr-fixed')
+  })
+
+  test('a null value is a tombstone: no bytes, and the serializer is never asked', async () => {
+    const { adapter, harbor } = harness()
+    const codec = { serialize: (): Buffer => { throw new Error('must not be called for a tombstone') }, deserialize: (): { id: number } => ({ id: 0 }) }
+    await harbor.producer<{ id: number }>({ serializer: codec }).send('orders', { key: 'k', value: null })
+    const [message] = adapter.messages('orders')
+    assert.equal(message?.value, null)
+    assert.equal(text(message?.key ?? null), 'k')
+    // The default serializer still encodes a JSON null when asked for one through a batch of real values.
+    await harbor.producer().sendBatch('orders', [{ value: 1 }, { value: null }])
+    assert.deepEqual(adapter.messages('orders').slice(1).map((m) => m.value), [Buffer.from('1'), null])
+  })
+
+  test('every record of a batch carries the same produced-at instant', async () => {
+    const { adapter, clock, harbor } = harness()
+    await harbor.producer().sendBatch('orders', [{ value: 1 }, { value: 2 }])
+    const stamps = new Set(adapter.messages('orders').map((m) => m.headers['x-produced-at']))
+    assert.deepEqual([...stamps], [new Date(clock.now()).toISOString()])
+  })
+
   test('the header prefix follows the harbor configuration', async () => {
     const { adapter, harbor } = harness({ headers: { prefix: '', correlationId: () => 'c' } })
     await harbor.producer().send('orders', { value: 1 })

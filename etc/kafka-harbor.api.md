@@ -125,28 +125,7 @@ export class Consumer {
 // Warning: (ae-missing-release-tag) "ConsumerContext" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
 //
 // @public
-export interface ConsumerContext {
-    // (undocumented)
-    readonly adapter: ClientAdapter;
-    // (undocumented)
-    readonly clientId: string;
-    // (undocumented)
-    readonly clock: Clock;
-    // (undocumented)
-    readonly emit: <K extends keyof ConsumerEvents>(event: K, payload: ConsumerEvents[K]) => void;
-    // (undocumented)
-    readonly ensureConnected: () => Promise<void>;
-    // (undocumented)
-    readonly headerNames: HeaderNames;
-    // (undocumented)
-    readonly isClosed: () => boolean;
-    // (undocumented)
-    readonly logger: Logger;
-    // (undocumented)
-    readonly producePolicy: RetryPolicy;
-    // (undocumented)
-    readonly serializer: Serializer;
-}
+export type ConsumerContext = CoreContext<ConsumerEvents>;
 
 // Warning: (ae-missing-release-tag) "ConsumerDlqOptions" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
 //
@@ -160,19 +139,14 @@ export interface ConsumerDlqOptions {
 // Warning: (ae-missing-release-tag) "ConsumerEvents" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
 //
 // @public (undocumented)
-export interface ConsumerEvents extends Record<string, unknown> {
+export interface ConsumerEvents {
     // (undocumented)
     consumerStopped: {
         groupId: string;
         reason: StopReason;
     };
     // (undocumented)
-    error: {
-        error: unknown;
-        scope: 'consumer' | 'producer' | 'adapter' | 'listener';
-        groupId?: string;
-        topic?: string;
-    };
+    error: HarborErrorEvent;
     // (undocumented)
     messageDeadLettered: {
         topic: string;
@@ -274,6 +248,32 @@ export interface ConsumerRetryOptions {
 // @public (undocumented)
 export type ConsumerState = 'idle' | 'starting' | 'running' | 'stopping' | 'stopped';
 
+// Warning: (ae-missing-release-tag) "CoreContext" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
+//
+// @public
+export interface CoreContext<E extends object> {
+    // (undocumented)
+    readonly adapter: ClientAdapter;
+    // (undocumented)
+    readonly clientId: string;
+    // (undocumented)
+    readonly clock: Clock;
+    readonly correlationId: () => string;
+    // (undocumented)
+    readonly emit: <K extends keyof E>(event: K, payload: E[K]) => void;
+    // (undocumented)
+    readonly ensureConnected: () => Promise<void>;
+    // (undocumented)
+    readonly headerNames: HeaderNames;
+    // (undocumented)
+    readonly isClosed: () => boolean;
+    // (undocumented)
+    readonly logger: Logger;
+    readonly producePolicy: RetryPolicy;
+    // (undocumented)
+    readonly serializer: Serializer;
+}
+
 // Warning: (ae-missing-release-tag) "createHarbor" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
 //
 // @public (undocumented)
@@ -325,7 +325,14 @@ export const ERROR_CODES: {
 // Warning: (ae-missing-release-tag) "EventMap" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
 //
 // @public
-export type EventMap = Record<string, unknown>;
+export type EventMap = object;
+
+// Warning: (ae-missing-release-tag) "ExposedHarborConfig" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
+//
+// @public
+export type ExposedHarborConfig = Readonly<Omit<HarborConfig, 'sasl'> & {
+    sasl?: Readonly<Omit<SaslConfig, 'password'>>;
+}>;
 
 // Warning: (ae-missing-release-tag) "FailureOutcome" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
 //
@@ -355,7 +362,7 @@ export class Harbor implements Observable<HarborEvents> {
     constructor(config: HarborConfig);
     abort(cause: unknown): AbortProcessingError;
     // (undocumented)
-    readonly config: Readonly<HarborConfig>;
+    readonly config: ExposedHarborConfig;
     connect(): Promise<void>;
     // (undocumented)
     consumer(options: ConsumerOptions): Consumer;
@@ -414,6 +421,20 @@ export class HarborError extends Error {
 //
 // @public (undocumented)
 export type HarborErrorCode = (typeof ERROR_CODES)[keyof typeof ERROR_CODES];
+
+// Warning: (ae-missing-release-tag) "HarborErrorEvent" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
+//
+// @public
+export interface HarborErrorEvent {
+    // (undocumented)
+    error: unknown;
+    // (undocumented)
+    groupId?: string;
+    // (undocumented)
+    scope: 'consumer' | 'producer' | 'adapter' | 'listener';
+    // (undocumented)
+    topic?: string;
+}
 
 // Warning: (ae-missing-release-tag) "HarborEvents" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
 //
@@ -531,6 +552,11 @@ export interface Logger {
     warn: (message: string, ...args: unknown[]) => void;
 }
 
+// Warning: (ae-missing-release-tag) "MAX_DURATION_MS" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
+//
+// @public
+export const MAX_DURATION_MS = 2147483647;
+
 // Warning: (ae-missing-release-tag) "Message" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
 //
 // @public
@@ -580,8 +606,7 @@ export interface OutgoingMessage<T = unknown> {
     // (undocumented)
     key?: string | null;
     partition?: number;
-    // (undocumented)
-    value: T;
+    value: T | null;
 }
 
 // Warning: (ae-missing-release-tag) "parseDuration" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
@@ -688,14 +713,9 @@ export function rawSerializer(): Serializer<Buffer>;
 // Warning: (ae-missing-release-tag) "RedriveEvents" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
 //
 // @public (undocumented)
-export interface RedriveEvents extends Record<string, unknown> {
+export interface RedriveEvents {
     // (undocumented)
-    error: {
-        error: unknown;
-        scope: 'consumer' | 'producer' | 'adapter' | 'listener';
-        groupId?: string;
-        topic?: string;
-    };
+    error: HarborErrorEvent;
     // (undocumented)
     messageRedriven: {
         from: string;
@@ -791,6 +811,15 @@ export class ShutdownTimeoutError extends HarborError {
     constructor(inFlight: number, timeoutMs: number);
     readonly inFlight: number;
 }
+
+// Warning: (ae-missing-release-tag) "stampProducer" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
+//
+// @public
+export function stampProducer(headers: MessageHeaders, names: HeaderNames, stamp: {
+    clientId: string;
+    at: Date;
+    correlationId: () => string;
+}): MessageHeaders;
 
 // Warning: (ae-missing-release-tag) "StopReason" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
 //

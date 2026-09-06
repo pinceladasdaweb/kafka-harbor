@@ -5,9 +5,9 @@
 // twice (once in index.d.ts, once inside a subpath's d.ts) would make the
 // adapters unusable for every consumer while every test passed. `npm run
 // check:dist` builds and compiles this file.
-import { createHarbor, type ClientAdapter, type Message } from 'kafka-harbor'
-import { confluentAdapter } from 'kafka-harbor/adapters/confluent'
 import { memoryAdapter } from 'kafka-harbor/testing'
+import { confluentAdapter } from 'kafka-harbor/adapters/confluent'
+import { createHarbor, type ClientAdapter, type Message } from 'kafka-harbor'
 
 interface Order { id: string, total: number }
 
@@ -22,6 +22,13 @@ export const consumer = harbor.consumer({ groupId: 'check', retry: { levels: [{ 
     if (total < 0) throw harbor.abort(new Error('negative total'))
     ctx.logger.info(`order ${message.value.id}`, { attempt: ctx.attempt })
   })
+
+// The event map has no index signature: a misspelled event name is a type error.
+// @ts-expect-error 'messageProcesed' is not an event
+harbor.on('messageProcesed', () => {})
+// The exposed configuration never carries the SASL password.
+// @ts-expect-error password is not exposed
+export const leaked: string | undefined = harbor.config.sasl?.password
 
 export const producer = harbor.producer<Order>()
 export const send = async (): Promise<void> => await producer.send('orders', { key: '1', value: { id: '1', total: 10 } })

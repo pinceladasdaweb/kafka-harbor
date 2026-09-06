@@ -52,17 +52,17 @@ export class TopicPlan {
   readonly original: string
   readonly retryTopics: readonly string[]
   readonly dlqTopic: string | undefined
-  private readonly levelByTopic = new Map<string, number>()
 
   constructor (original: string, levels: number, retryNaming: RetryTopicNaming, dlqNaming: DlqTopicNaming | undefined) {
     this.original = original
     const retryTopics: string[] = []
+    const taken = new Set([original])
     for (let level = 1; level <= levels; level++) {
       const topic = retryNaming(original, level)
-      if (topic === original || this.levelByTopic.has(topic)) {
+      if (taken.has(topic)) {
         throw new ConfigError(`retry.topicNaming produced a duplicate topic name "${topic}" for "${original}" level ${level}`)
       }
-      this.levelByTopic.set(topic, level)
+      taken.add(topic)
       retryTopics.push(topic)
     }
     this.retryTopics = retryTopics
@@ -71,7 +71,7 @@ export class TopicPlan {
       return
     }
     const dlqTopic = dlqNaming(original)
-    if (dlqTopic === original || this.levelByTopic.has(dlqTopic)) {
+    if (taken.has(dlqTopic)) {
       throw new ConfigError(`dlq.topicNaming produced a topic name "${dlqTopic}" that collides with the retry ladder of "${original}"`)
     }
     this.dlqTopic = dlqTopic

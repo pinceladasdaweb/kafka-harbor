@@ -1,16 +1,18 @@
 import { systemClock } from './clock'
 import { randomUUID } from 'node:crypto'
 import { parseDuration } from './duration'
+import type { CoreContext } from './context'
 import type { RetryPolicy } from 'breakwater'
+import { requireNonEmptyString } from './validate'
 import type { Clock, Duration, Logger } from './types'
 import { createEmitter, type Observable } from './events'
 import { headerNames, type HeaderNames } from './headers'
 import { jsonSerializer, type Serializer } from './serializer'
 import type { BrokerConfig, ClientAdapter, SaslConfig } from './adapter'
-import { Consumer, type ConsumerEvents, type ConsumerOptions, type ConsumerState, type StopReason } from './consumer'
 import { AbortProcessingError, ClosedError, ConfigError, describeError } from './errors'
-import { Producer, buildProducerRetry, type ProducerOptions, type ProducerRetryOptions } from './producer'
 import { redrive, type RedriveEvents, type RedriveOptions, type RedriveResult } from './redrive'
+import { Producer, buildProducerRetry, type ProducerOptions, type ProducerRetryOptions } from './producer'
+import { Consumer, type ConsumerEvents, type ConsumerOptions, type ConsumerState, type StopReason } from './consumer'
 
 export interface HeaderOptions {
   /** Prefix of every header the library writes. Default: 'x-'. */
@@ -70,6 +72,15 @@ export interface HarborEvents extends ConsumerEvents, RedriveEvents {
   disconnected: { adapter: string }
 }
 
+/**
+ * The configuration as the harbor exposes it back: everything given, minus
+ * the SASL password, so logging or serializing a harbor never prints a
+ * credential.
+ */
+export type ExposedHarborConfig = Readonly<Omit<HarborConfig, 'sasl'> & { sasl?: Readonly<Omit<SaslConfig, 'password'>> }>
+
+const ADAPTER_METHODS = ['connect', 'disconnect', 'produce', 'consume'] as const
+
 const defaultLogger: Logger = {
   debug: undefined,
   info: (message, ...args) => console.info(message, ...args),
@@ -83,7 +94,8 @@ const defaultLogger: Logger = {
  * explicitly by `connect()`.
  */
 export class Harbor implements Observable<HarborEvents> {
-  readonly config: Readonly<HarborConfig>
+  readonly config: ExposedHarborConfig
+  private readonly fullConfig: Readonly<HarborConfig>
   private readonly adapter: ClientAdapter
   private readonly serializer: Serializer
   private readonly names: HeaderNames
@@ -104,16 +116,17 @@ export class Harbor implements Observable<HarborEvents> {
   private signalHandlers: Array<{ signal: NodeJS.Signals, handler: () => void }> = []
 
   constructor (config: HarborConfig) {
-    if (typeof config?.clientId !== 'string' || config.clientId === '') {
-      throw new ConfigError('clientId must be a non-empty string')
-    }
+    requireNonEmptyString(config?.clientId, 'clientId')
     if (!Array.isArray(config.brokers) || config.brokers.length === 0 || config.brokers.some((b) => typeof b !== 'string' || b === '')) {
       throw new ConfigError('brokers must be a non-empty array of "host:port" strings')
     }
-    if (typeof config.adapter?.connect !== 'function' || typeof config.adapter.consume !== 'function' || typeof config.adapter.produce !== 'function') {
-      throw new ConfigError('adapter must implement ClientAdapter (connect, disconnect, produce, consume, admin)')
+    const adapter = config.adapter as Partial<ClientAdapter> | undefined
+    if (adapter === undefined || ADAPTER_METHODS.some((method) => typeof adapter[method] !== 'function') || typeof adapter.admin?.createTopics !== 'function' || typeof adapter.admin.topicExists !== 'function') {
+      throw new ConfigError('adapter must implement ClientAdapter (connect, disconnect, produce, consume, admin.createTopics, admin.topicExists)')
     }
-    this.config = config
+    this.fullConfig = config
+    const { sasl, ...rest } = config
+    this.config = Object.freeze({ ...rest, ...(sasl !== undefined && { sasl: Object.freeze({ mechanism: sasl.mechanism, username: sasl.username }) }) })
     this.adapter = config.adapter
     this.serializer = config.serializer ?? jsonSerializer()
     this.names = headerNames(config.headers?.prefix)
@@ -166,32 +179,30 @@ export class Harbor implements Observable<HarborEvents> {
   }
 
   producer<T = unknown> (options: ProducerOptions<T> = {}): Producer<T> {
-    return new Producer<T>({
-      adapter: this.adapter,
-      clientId: this.config.clientId,
-      serializer: this.serializer,
-      headerNames: this.names,
-      correlationId: this.correlationId,
-      clock: this.clock,
-      ensureConnected: () => this.connect()
-    }, options)
+    return new Producer<T>(this.pipelineContext(), options)
   }
 
   consumer (options: ConsumerOptions): Consumer {
-    const consumer = new Consumer({
-      adapter: this.adapter,
-      clientId: this.config.clientId,
-      serializer: this.serializer,
-      headerNames: this.names,
-      logger: this.logger,
-      clock: this.clock,
-      emit: (event, payload) => this.emitter.emit(event, payload),
-      producePolicy: this.producePolicy,
-      isClosed: () => this.isClosed(),
-      ensureConnected: () => this.connect()
-    }, options)
+    const consumer = new Consumer(this.pipelineContext(), options)
     this.consumers.add(consumer)
     return consumer
+  }
+
+  /** What every pipeline gets from the harbor. Events narrow to each pipeline's own map. */
+  private pipelineContext<E extends { [K in keyof E]: K extends keyof HarborEvents ? HarborEvents[K] : never }> (): CoreContext<E> {
+    return {
+      adapter: this.adapter,
+      clientId: this.fullConfig.clientId,
+      serializer: this.serializer,
+      headerNames: this.names,
+      correlationId: this.correlationId,
+      logger: this.logger,
+      clock: this.clock,
+      producePolicy: this.producePolicy,
+      emit: (event, payload) => this.emitter.emit(event as keyof HarborEvents, payload as HarborEvents[keyof HarborEvents]),
+      isClosed: () => this.isClosed(),
+      ensureConnected: () => this.connect()
+    }
   }
 
   /**
@@ -202,18 +213,7 @@ export class Harbor implements Observable<HarborEvents> {
    * messages or once the DLQ has been idle for `idleTimeout`.
    */
   async redrive (options: RedriveOptions): Promise<RedriveResult> {
-    return await redrive({
-      adapter: this.adapter,
-      clientId: this.config.clientId,
-      serializer: this.serializer,
-      headerNames: this.names,
-      logger: this.logger,
-      clock: this.clock,
-      producePolicy: this.producePolicy,
-      emit: (event, payload) => this.emitter.emit(event, payload),
-      isClosed: () => this.isClosed(),
-      ensureConnected: () => this.connect()
-    }, options)
+    return await redrive(this.pipelineContext(), options)
   }
 
   /** Opens the client connection. Idempotent and single-flight. */
@@ -222,10 +222,10 @@ export class Harbor implements Observable<HarborEvents> {
     if (this.connecting === undefined) {
       this.state = 'connecting'
       const broker: BrokerConfig = {
-        clientId: this.config.clientId,
-        brokers: this.config.brokers,
-        ...(this.config.ssl !== undefined && { ssl: this.config.ssl }),
-        ...(this.config.sasl !== undefined && { sasl: this.config.sasl })
+        clientId: this.fullConfig.clientId,
+        brokers: this.fullConfig.brokers,
+        ...(this.fullConfig.ssl !== undefined && { ssl: this.fullConfig.ssl }),
+        ...(this.fullConfig.sasl !== undefined && { sasl: this.fullConfig.sasl })
       }
       // The transitions are guarded: a shutdown that began while the connect
       // was in flight owns the state from then on, and a connect that lands

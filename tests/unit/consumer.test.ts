@@ -788,6 +788,120 @@ describe('Consumer: review regressions', () => {
     assert.equal(consumer.status, 'stopped')
   })
 
+  test('a stop that begins one microtask after a delivery neither abandons the handler nor reports a false timeout', async () => {
+    // The state check and the "handler running" flag are one synchronous
+    // step; a stop landing between them used to count the handler as
+    // abandoned while its offset was being committed.
+    const h = harness()
+    const consumer = h.harbor.consumer({ groupId: 'g', fromBeginning: true, autoCreateTopics: true })
+    let handled = 0
+    consumer.subscribe('orders', () => { handled++ })
+    const original = h.adapter.consume
+    let stopping: Promise<string> | undefined
+    h.adapter.consume = async (options) => await original({
+      ...options,
+      eachMessage: (raw) => {
+        const delivery = options.eachMessage(raw)
+        Promise.resolve().then(() => { stopping = consumer.stop(30_000).then(() => 'ok', (error: Error) => error.message) }).catch(() => undefined)
+        return delivery
+      }
+    })
+    await consumer.start()
+    await produced(h, 'orders', [1])
+    await until(() => stopping !== undefined)
+    assert.equal(await stopping, 'ok')
+    assert.equal(handled, 1)
+    assert.equal(h.adapter.committed('g', 'orders', 0), '1')
+    await h.harbor.shutdown()
+  })
+
+  test('a serializer that throws its own error class is a serialization failure: straight to the DLQ, no retry', async () => {
+    const h = harness()
+    const events = capture(h)
+    const codec = { serialize: (value: unknown) => Buffer.from(JSON.stringify(value)), deserialize: () => { throw new TypeError('schema mismatch') } }
+    const consumer = h.harbor.consumer({ groupId: 'g', fromBeginning: true, autoCreateTopics: true, serializer: codec, retry: { levels: [{ delay: 0 }, { delay: 0 }] } })
+    consumer.subscribe('orders', () => {})
+    await produced(h, 'orders', [1])
+    await consumer.start()
+    await h.adapter.whenDrained('g', 'orders')
+    assert.equal(h.adapter.messages('orders-retry-1').length, 0)
+    assert.equal(h.adapter.messages('orders-dlq').length, 1)
+    assert.equal(events.messageDeadLettered.length, 1)
+    assert.equal((events.messageDeadLettered[0]?.error as { code: string }).code, ERROR_CODES.SERIALIZATION)
+    assert.equal(((events.messageDeadLettered[0]?.error as { cause: Error }).cause).message, 'schema mismatch')
+    await h.harbor.shutdown()
+  })
+
+  test('a revocation waits for the handlers running on the revoked partitions, so their commits land first', async () => {
+    const h = harness({}, { partitions: 2 })
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => { release = resolve })
+    let revoke: ((partitions: Array<{ topic: string, partition: number }>) => Promise<void>) | undefined
+    const original = h.adapter.consume
+    h.adapter.consume = async (options) => {
+      revoke = options.onPartitionsRevoked as typeof revoke
+      return await original(options)
+    }
+    const consumer = h.harbor.consumer({ groupId: 'g', fromBeginning: true, autoCreateTopics: true, concurrency: 2, retry: { levels: [{ delay: 60_000 }] } })
+    consumer.subscribe<string>('orders', async (message) => {
+      if (message.value === 'slow') await gate
+      if (message.value === 'fails') throw new Error('to the retry topic, where it sleeps')
+    })
+    const producer = h.harbor.producer<string>()
+    await consumer.start()
+    await producer.send('orders', { value: 'slow', partition: 0 })
+    await producer.send('orders', { value: 'quick', partition: 1 })
+    await producer.send('orders', { value: 'fails', partition: 1 })
+    await until(() => h.adapter.committed('g', 'orders', 1) === '2')
+    // A delivery sleeping out its retry delay is in flight but not running: a revocation does not wait for it.
+    await until(() => h.clock.waiting === 1)
+    // Nothing runs on partition 1 anymore: its revocation is immediate.
+    await (revoke as NonNullable<typeof revoke>)([{ topic: 'orders', partition: 1 }])
+    // Partition 0 has a handler in flight: the revocation resolves after it committed.
+    let revoked = false
+    const revoking = (revoke as NonNullable<typeof revoke>)([{ topic: 'orders', partition: 0 }]).then(() => { revoked = true })
+    await settle()
+    assert.equal(revoked, false)
+    assert.equal(h.adapter.committed('g', 'orders', 0), undefined)
+    release()
+    await revoking
+    assert.equal(h.adapter.committed('g', 'orders', 0), '1')
+    await h.harbor.shutdown()
+  })
+
+  test('the existence checks of the derived topics run at the same time, not one after the other', async () => {
+    const h = harness()
+    let releaseFirst!: () => void
+    const gate = new Promise<void>((resolve) => { releaseFirst = resolve })
+    let calls = 0
+    h.adapter.admin.topicExists = async (topic) => {
+      if (++calls === 1) await gate
+      return topic !== 'orders-dlq' || true
+    }
+    h.adapter.createTopic('orders-retry-1')
+    h.adapter.createTopic('orders-retry-2')
+    h.adapter.createTopic('orders-dlq')
+    const consumer = h.harbor.consumer({ groupId: 'g', retry: { levels: [{ delay: '1s' }, { delay: '2s' }] } })
+    consumer.subscribe('orders', () => {})
+    const starting = consumer.start()
+    await until(() => calls === 3)
+    releaseFirst()
+    await starting
+    await h.harbor.shutdown()
+  })
+
+  test('a message that arrives without a correlation id gets one on its way to the retry topic', async () => {
+    const h = harness()
+    const consumer = h.harbor.consumer({ groupId: 'g', fromBeginning: true, autoCreateTopics: true, retry: { levels: [{ delay: 60_000 }] } })
+    consumer.subscribe('orders', () => { throw new Error('x') })
+    await h.harbor.connect()
+    await h.adapter.produce([{ topic: 'orders', key: null, value: Buffer.from('1'), headers: { 'x-correlation-id': '   ' } }])
+    await consumer.start()
+    await h.adapter.whenDrained('g', 'orders')
+    assert.equal(h.adapter.messages('orders-retry-1')[0]?.headers['x-correlation-id'], 'corr-fixed')
+    await h.harbor.shutdown(0)
+  })
+
   test('a tombstone that fails keeps its null value through the retry topic and the DLQ', async () => {
     // Regression: forward() replaced a null value with an empty buffer, which
     // the JSON serializer then refused, skipping the ladder.
@@ -1046,7 +1160,7 @@ describe('Consumer: mutation follow-ups', () => {
     await h.harbor.shutdown()
   })
 
-  test('an abort on one partition abandons the other partition\'s running handler: no commit even if it later succeeds', async () => {
+  test('an abort on one partition lets the other partition\'s running handler finish and commit before the consumer leaves', async () => {
     const h = harness({}, { partitions: 2 })
     let release!: () => void
     const gate = new Promise<void>((resolve) => { release = resolve })
@@ -1065,12 +1179,16 @@ describe('Consumer: mutation follow-ups', () => {
     await consumer.start()
     await until(() => slowSignal !== undefined)
     await producer.send('orders', { value: 'abort', partition: 1 })
-    await until(() => consumer.status === 'stopped')
-    assert.equal(slowSignal?.aborted, true)
+    await until(() => consumer.status === 'stopping')
+    // The stop waits for the slow handler the way a shutdown would; its
+    // signal is untouched and, once done, its offset is committed.
+    assert.equal(slowSignal?.aborted, false)
+    assert.equal(consumer.stoppedBecause, 'abort', 'known while still stopping, so health reports it')
+    assert.equal(h.harbor.isHealthy(), false)
     release()
-    await settle()
-    assert.equal(h.adapter.committed('g', 'orders', 0), undefined)
-    assert.equal(h.adapter.committed('g', 'orders', 1), undefined)
+    await until(() => consumer.status === 'stopped')
+    assert.equal(h.adapter.committed('g', 'orders', 0), '1')
+    assert.equal(h.adapter.committed('g', 'orders', 1), undefined, 'the aborted message is not committed')
     await h.harbor.shutdown()
   })
 

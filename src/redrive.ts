@@ -1,11 +1,13 @@
-import type { RetryPolicy } from 'breakwater'
-
-import type { ClientAdapter, ConsumerHandle, RawMessage, RawRecord } from './adapter'
+import { toMessage } from './message'
+import { commitAfter } from './commit'
 import { parseDuration } from './duration'
-import { ClosedError, ConfigError, describeError, isSerializationError } from './errors'
-import { decodeHeaders, readRetryInfo, type HeaderNames } from './headers'
 import type { Serializer } from './serializer'
-import type { Clock, Duration, Logger, Message, MessageHeaders } from './types'
+import type { CoreContext, HarborErrorEvent } from './context'
+import type { Duration, Message, MessageHeaders } from './types'
+import type { ConsumerHandle, RawMessage, RawRecord } from './adapter'
+import { decodeHeaders, readRetryInfo, stampProducer } from './headers'
+import { requireNonEmptyString, requirePositiveInteger } from './validate'
+import { ClosedError, ConfigError, describeError, isSerializationError } from './errors'
 
 export interface RedriveOptions {
   /** The dead-letter topic to drain. */
@@ -38,23 +40,12 @@ export interface RedriveResult {
   readonly skipped: number
 }
 
-export interface RedriveEvents extends Record<string, unknown> {
+export interface RedriveEvents {
   messageRedriven: { from: string, to: string, partition: number, offset: string, groupId: string, correlationId: string | undefined }
-  error: { error: unknown, scope: 'consumer' | 'producer' | 'adapter' | 'listener', groupId?: string, topic?: string }
+  error: HarborErrorEvent
 }
 
-export interface RedriveContext {
-  readonly adapter: ClientAdapter
-  readonly clientId: string
-  readonly serializer: Serializer
-  readonly headerNames: HeaderNames
-  readonly logger: Logger
-  readonly clock: Clock
-  readonly producePolicy: RetryPolicy
-  readonly emit: <K extends keyof RedriveEvents>(event: K, payload: RedriveEvents[K]) => void
-  readonly isClosed: () => boolean
-  readonly ensureConnected: () => Promise<void>
-}
+export type RedriveContext = CoreContext<RedriveEvents>
 
 /**
  * Drains a dead-letter topic back into service. Every message is re-produced
@@ -65,12 +56,10 @@ export interface RedriveContext {
  * it stopped, and never loses a message on the way back.
  */
 export async function redrive (context: RedriveContext, options: RedriveOptions): Promise<RedriveResult> {
-  if (typeof options?.from !== 'string' || options.from === '') throw new ConfigError('redrive.from must be a non-empty string')
-  if (options.to !== undefined && (typeof options.to !== 'string' || options.to === '')) throw new ConfigError('redrive.to must be a non-empty string')
+  requireNonEmptyString(options?.from, 'redrive.from')
+  if (options.to !== undefined) requireNonEmptyString(options.to, 'redrive.to')
   if (options.to === options.from) throw new ConfigError('redrive.to must differ from redrive.from: re-injecting a topic into itself never ends')
-  if (options.max !== undefined && (!Number.isInteger(options.max) || options.max < 1)) {
-    throw new ConfigError(`redrive.max must be an integer >= 1; got ${String(options.max)}`)
-  }
+  if (options.max !== undefined) requirePositiveInteger(options.max, 'redrive.max')
   const idleMs = parseDuration(options.idleTimeout ?? '5s', 'redrive.idleTimeout')
   const groupId = options.groupId ?? `${options.from}-redrive`
   const serializer = options.serializer ?? context.serializer
@@ -87,12 +76,18 @@ export async function redrive (context: RedriveContext, options: RedriveOptions)
   const finish = (): void => { stopController.abort() }
   const inFlight = new Set<Promise<void>>()
   // The handle arrives when consume() resolves; an adapter may deliver
-  // before that resolution is observed here, so the closures read it late.
+  // before that resolution is observed here, so every delivery waits for it
+  // and no message is handled without a way to commit it.
   const consumption: { handle?: ConsumerHandle } = {}
+  let markReady!: () => void
+  const ready = new Promise<void>((resolve) => { markReady = resolve })
 
-  const commit = async (raw: RawMessage): Promise<void> => {
-    await (consumption.handle as ConsumerHandle).commit([{ topic: raw.topic, partition: raw.partition, offset: (BigInt(raw.offset) + 1n).toString() }])
-  }
+  // The DLQ offset advances the same way a consumer's does: a commit that
+  // fails after the re-produce was acknowledged is reported and the run goes
+  // on, since the only consequence is a repeat on the next redrive, which
+  // at-least-once already allows.
+  const commit = async (raw: RawMessage): Promise<boolean> =>
+    await commitAfter(consumption.handle as ConsumerHandle, raw, { groupId, logger: context.logger, emit: (event, payload) => context.emit(event, payload) })
 
   const one = async (raw: RawMessage): Promise<void> => {
     if (stopController.signal.aborted) return
@@ -111,7 +106,8 @@ export async function redrive (context: RedriveContext, options: RedriveOptions)
     if (options.filter !== undefined) {
       let keep: boolean
       try {
-        const message = toMessage(raw, headers, serializer, names)
+        const retry = readRetryInfo(headers, names)
+        const message = toMessage(raw, headers, serializer, retry?.originalTopic ?? raw.topic, retry)
         keep = await options.filter(message)
       } catch (error) {
         if (!isSerializationError(error)) throw error
@@ -124,20 +120,21 @@ export async function redrive (context: RedriveContext, options: RedriveOptions)
         return
       }
     }
-    const outgoing: MessageHeaders = {}
+    const kept: MessageHeaders = {}
     for (const [name, value] of Object.entries(headers)) {
-      if (!tracking.has(name)) outgoing[name] = value
+      if (!tracking.has(name)) kept[name] = value
     }
-    const now = new Date(context.clock.now()).toISOString()
-    outgoing[names.redrivenFrom] = raw.topic
-    outgoing[names.redrivenAt] = now
-    outgoing[names.producedAt] = now
-    outgoing[names.producer] = context.clientId
+    const at = new Date(context.clock.now())
+    const outgoing = stampProducer({ ...kept, [names.redrivenFrom]: raw.topic, [names.redrivenAt]: at.toISOString() }, names, {
+      clientId: context.clientId,
+      at,
+      correlationId: context.correlationId
+    })
     const record: RawRecord = { topic: target, key: raw.key, value: raw.value, headers: outgoing }
     await context.producePolicy.execute(() => context.adapter.produce([record]))
     await commit(raw)
     reprocessed++
-    context.emit('messageRedriven', { from: raw.topic, to: target, partition: raw.partition, offset: raw.offset, groupId, correlationId: headers[names.correlationId] })
+    context.emit('messageRedriven', { from: raw.topic, to: target, partition: raw.partition, offset: raw.offset, groupId, correlationId: outgoing[names.correlationId] })
   }
 
   consumption.handle = await context.adapter.consume({
@@ -146,7 +143,8 @@ export async function redrive (context: RedriveContext, options: RedriveOptions)
     fromBeginning: true,
     concurrency: 1,
     eachMessage: (raw) => {
-      const work = one(raw)
+      const work = ready
+        .then(() => one(raw))
         .then(() => {
           if (options.max !== undefined && reprocessed + skipped >= options.max) finish()
         })
@@ -159,6 +157,7 @@ export async function redrive (context: RedriveContext, options: RedriveOptions)
     },
     onError: (error) => context.emit('error', { error, scope: 'adapter', groupId, topic: options.from })
   })
+  markReady()
 
   try {
     // Idle detection: wake up every idleMs and check whether anything landed
@@ -178,18 +177,4 @@ export async function redrive (context: RedriveContext, options: RedriveOptions)
     throw failure
   }
   return { from: options.from, reprocessed, skipped }
-}
-
-const toMessage = (raw: RawMessage, headers: MessageHeaders, serializer: Serializer, names: HeaderNames): Message => {
-  const retry = readRetryInfo(headers, names)
-  return {
-    topic: raw.topic,
-    partition: raw.partition,
-    offset: raw.offset,
-    key: raw.key === null ? null : raw.key.toString('utf8'),
-    value: raw.value === null ? null : serializer.deserialize(raw.value, retry?.originalTopic ?? raw.topic),
-    headers,
-    timestamp: new Date(raw.timestamp),
-    ...(retry !== undefined && { retry })
-  }
 }
