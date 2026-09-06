@@ -1,5 +1,13 @@
 # CHANGELOG
 
+## 0.2.0 (2026-09-06)
+
+* fix: one member per retry level, bounded shutdown waits, no self-redrive by Pedro Rogério [View](https://github.com/pinceladasdaweb/kafka-harbor/commit/cbc35c9201e1da355b9b31692961ceca49f08770)
+* fix(testing): contract covers tombstones and pause scope; memory broker stops hanging by Pedro Rogério [View](https://github.com/pinceladasdaweb/kafka-harbor/commit/af3175a942c72f97f48ad9c75bec49744fff7185)
+* fix(confluent): guard the producer guarantees, classify every refusal, honour logLevel by Pedro Rogério [View](https://github.com/pinceladasdaweb/kafka-harbor/commit/82fbb4040dff383de8f0a6ce1841aa4b6a69e806)
+* fix: close the shutdown race, let revoked and abandoned work finish, share one pipeline core by Pedro Rogério [View](https://github.com/pinceladasdaweb/kafka-harbor/commit/8bb1b7ca9ef681bb98d92b32abbd8862ee50cbde)
+
+
 ## 0.1.0 (2026-09-05)
 
 * feat: foundation with core, confluent adapter and memory broker by Pedro Rogério [View](https://github.com/pinceladasdaweb/kafka-harbor/commit/5cd6e31b1721f8070f561f849e885b8b9d820b3a)
@@ -14,4 +22,3 @@
 * ci: gate the npm publish job behind the NPM_PUBLISH_ENABLED repository variable by Pedro Rogério [View](https://github.com/pinceladasdaweb/kafka-harbor/commit/44cd613efa616d84065a6cbafb4795b18626a819)
 * ci: keep dependabot off the eslint and typescript majors the toolchain cannot take yet by Pedro Rogério [View](https://github.com/pinceladasdaweb/kafka-harbor/commit/d45d9005ff167422616599900851271037668462)
 * fix: createTopics resolves only once the topics are visible in metadata by Pedro Rogério [View](https://github.com/pinceladasdaweb/kafka-harbor/commit/d976ee462e3369c00d6d4fc5817f03ae7517d0a2)
-
