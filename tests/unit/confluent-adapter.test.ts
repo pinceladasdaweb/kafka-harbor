@@ -89,6 +89,18 @@ describe('confluentAdapter', () => {
     assert.doesNotThrow(() => confluentAdapter({ consumer: { 'fetch.min.bytes': 1 } }))
   })
 
+  test('rejects a passthrough of the producer properties the delivery guarantee depends on', () => {
+    for (const key of ['acks', 'request.required.acks', 'enable.idempotence']) {
+      assert.throws(() => confluentAdapter({ producer: { [key]: 1 } }), (error: unknown) => {
+        assert.equal((error as { code: string }).code, ERROR_CODES.CONFIG_INVALID)
+        assert.match((error as Error).message, new RegExp(`"${key.replace(/\./g, '\\.')}" is managed by the adapter`))
+        return true
+      })
+      assert.throws(() => confluentAdapter({ global: { [key]: false } }), { code: ERROR_CODES.CONFIG_INVALID })
+    }
+    assert.doesNotThrow(() => confluentAdapter({ producer: { 'linger.ms': 5 } }))
+  })
+
   test('configures acks=all, idempotence, no auto-commit and the reset policy from fromBeginning', async () => {
     const { module, calls } = fakeClient()
     const adapter = confluentAdapter({ client: module })
@@ -140,8 +152,13 @@ describe('confluentAdapter', () => {
     ]), (error: unknown) => {
       assert.equal((error as { code: string }).code, ERROR_CODES.ADAPTER)
       assert.match((error as Error).message, /b\[1\] code 7/)
+      assert.equal((error as { retryable: boolean }).retryable, true, 'REQUEST_TIMED_OUT per record is worth another attempt')
       return true
     })
+    const definitive = fakeClient({ sendResult: [{ topicName: 'a', partition: 0, errorCode: 0 }, { topicName: 'a', partition: 0, errorCode: 10 }] })
+    const strict = confluentAdapter({ client: definitive.module })
+    await strict.connect(broker)
+    await assert.rejects(strict.produce([{ topic: 'a', key: null, value: Buffer.from('v'), headers: {} }]), { code: ERROR_CODES.ADAPTER, retryable: false })
     const batch = calls.sent[0]?.topicMessages ?? []
     assert.deepEqual(batch.map((entry) => entry.topic), ['a', 'b'])
     assert.equal(batch[0]?.messages.length, 2)
@@ -155,9 +172,14 @@ describe('confluentAdapter', () => {
       [-185, true], // ERR__TIMED_OUT
       [6, true], // NOT_LEADER_FOR_PARTITION
       [undefined, true],
+      [3, true], // UNKNOWN_TOPIC_OR_PART: metadata may still be propagating
       [10, false], // MSG_SIZE_TOO_LARGE
       [29, false], // TOPIC_AUTHORIZATION_FAILED
-      [-186, false] // INVALID_ARG
+      [-186, false], // INVALID_ARG
+      [-190, false], // ERR__UNKNOWN_PARTITION
+      [-188, false], // ERR__UNKNOWN_TOPIC
+      [37, false], // INVALID_PARTITIONS
+      [44, false] // POLICY_VIOLATION
     ]
     for (const [code, retryable] of cases) {
       const failure = Object.assign(new Error(`code ${String(code)}`), { code, retriable: false })
@@ -406,6 +428,30 @@ describe('confluentAdapter: less travelled paths', () => {
     await adapter.consume({ groupId: 'g2', topics: ['t'], eachMessage: async () => {} })
     await assert.rejects(adapter.disconnect(), { code: ERROR_CODES.ADAPTER })
     await assert.rejects(adapter.admin.topicExists('t'), { code: ERROR_CODES.ADAPTER })
+  })
+
+  test('the forwarding logger prints the other levels the way the client would, gated by logLevel', async () => {
+    const printed: string[] = []
+    const originals = { info: console.info, warn: console.warn, debug: console.debug }
+    console.info = (message: string) => { printed.push(`info:${message}`) }
+    console.warn = (message: string) => { printed.push(`warn:${message}`) }
+    console.debug = (message: string) => { printed.push(`debug:${message}`) }
+    try {
+      for (const [level, expected] of [[1, []], [2, ['warn:w']], [3, ['warn:w', 'info:i']], [4, ['warn:w', 'info:i', 'debug:d']]] as Array<[0 | 1 | 2 | 3 | 4, string[]]>) {
+        printed.length = 0
+        const { module, calls } = fakeClient()
+        const adapter = confluentAdapter({ client: module, logLevel: level })
+        await adapter.connect(broker)
+        await adapter.consume({ groupId: 'g', topics: ['t'], eachMessage: async () => {}, onError: () => {} })
+        const logger = (calls.consumerConfigs[0] as { kafkaJS: { logger: KafkaJS.Logger } }).kafkaJS.logger
+        logger.warn('w')
+        logger.info('i')
+        logger.debug('d')
+        assert.deepEqual(printed, expected, `logLevel ${level}`)
+      }
+    } finally {
+      Object.assign(console, originals)
+    }
   })
 
   test('the forwarding logger stays silent when the client log level is off', async () => {

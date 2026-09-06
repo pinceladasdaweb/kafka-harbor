@@ -7,6 +7,7 @@
 import {
   AdapterError,
   ConfigError,
+  describeError,
   type BrokerConfig,
   type ClientAdapter,
   type ConsumeOptions,
@@ -55,13 +56,16 @@ const ERR_TOPIC_ALREADY_EXISTS = 36
 
 /**
  * Failures that will not go away by trying again: bad arguments, oversized
- * records, authorization. Everything else the client reports (transport,
- * timeouts, leadership changes) is transient and worth the producer's retry
- * ladder. The client's own `retriable` flag is NOT consulted: it is only
- * meaningful for the transactional producer and defaults to false, which
- * would silently disable every retry.
+ * records, authorization, a topic or partition that does not exist, a policy
+ * the broker enforces. Everything else the client reports (transport,
+ * timeouts, leadership changes, metadata still propagating) is transient
+ * and worth the producer's retry ladder. The client's own `retriable` flag
+ * is NOT consulted: it is only meaningful for the transactional producer and
+ * defaults to false, which would silently disable every retry.
  */
 const DEFINITIVE_CODES = new Set([
+  -190, // ERR__UNKNOWN_PARTITION
+  -188, // ERR__UNKNOWN_TOPIC
   -186, // ERR__INVALID_ARG
   10, // ERR_MSG_SIZE_TOO_LARGE
   17, // ERR_INVALID_TOPIC_EXCEPTION
@@ -69,17 +73,29 @@ const DEFINITIVE_CODES = new Set([
   29, // ERR_TOPIC_AUTHORIZATION_FAILED
   30, // ERR_GROUP_AUTHORIZATION_FAILED
   31, // ERR_CLUSTER_AUTHORIZATION_FAILED
+  32, // ERR_INVALID_TIMESTAMP
+  33, // ERR_UNSUPPORTED_SASL_MECHANISM
+  35, // ERR_UNSUPPORTED_VERSION
+  37, // ERR_INVALID_PARTITIONS
   40, // ERR_INVALID_CONFIG
+  42, // ERR_INVALID_REQUEST
+  43, // ERR_UNSUPPORTED_FOR_MESSAGE_FORMAT
+  44, // ERR_POLICY_VIOLATION
   58, // ERR_SASL_AUTHENTICATION_FAILED
   87 // ERR_INVALID_RECORD
 ])
 
+/** Whether a failure carrying `code` is worth another attempt. No code at all is transient: it was not the broker refusing. */
+const isTransient = (code: number | undefined): boolean => code === undefined || !DEFINITIVE_CODES.has(code)
+
 /**
- * librdkafka properties the adapter owns because the core's offset policy
- * depends on them; a passthrough that flipped one would turn the consumer
- * into at-most-once without anyone noticing.
+ * librdkafka properties the adapter owns because the core's delivery
+ * guarantees depend on them; a passthrough that flipped one would turn the
+ * consumer into at-most-once, or let a produce resolve before the record is
+ * safe, without anyone noticing.
  */
 const RESERVED_CONSUMER_KEYS = ['enable.auto.commit', 'enable.auto.offset.store', 'auto.offset.reset']
+const RESERVED_PRODUCER_KEYS = ['acks', 'request.required.acks', 'enable.idempotence']
 
 interface RebalanceAssignmentFns {
   assign: (assignment: KafkaJS.TopicPartition[]) => void
@@ -107,23 +123,20 @@ const errorCode = (error: unknown): number | undefined => {
   return typeof code === 'number' ? code : undefined
 }
 
-const wrap = (error: unknown, what: string): AdapterError => {
-  const code = errorCode(error)
-  return new AdapterError(`${what}: ${error instanceof Error ? error.message : String(error)}`, {
-    cause: error,
-    retryable: code === undefined || !DEFINITIVE_CODES.has(code)
-  })
-}
+const wrap = (error: unknown, what: string): AdapterError =>
+  new AdapterError(`${what}: ${describeError(error)}`, { cause: error, retryable: isTransient(errorCode(error)) })
 
 /**
  * The client's logger contract, pointed at the adapter's error callback:
  * fetch-loop failures the client would only print become `error` events.
+ * The other levels keep the client's own behaviour, printing to the console
+ * when `logLevel` lets them through (2 warn, 3 info, 4 debug).
  */
 const errorForwardingLogger = (onError: (error: unknown) => void, level: number): KafkaJS.Logger => {
   const logger: KafkaJS.Logger = {
-    info: () => {},
-    warn: () => {},
-    debug: () => {},
+    info: (message, extra) => { if (level >= 3) console.info(message, extra) },
+    warn: (message, extra) => { if (level >= 2) console.warn(message, extra) },
+    debug: (message, extra) => { if (level >= 4) console.debug(message, extra) },
     error: (message, extra) => {
       if (level >= 1) onError(new AdapterError(`client: ${message}`, { cause: extra }))
     },
@@ -132,6 +145,9 @@ const errorForwardingLogger = (onError: (error: unknown) => void, level: number)
   }
   return logger
 }
+
+/** The wait between two looks at the metadata while a created topic propagates: 50ms, doubling up to 500ms. */
+const nextPollDelay = (previous: number): number => Math.min(previous * 2, 500)
 
 const groupByTopic = (records: readonly RawRecord[]): KafkaJS.TopicMessages[] => {
   const byTopic = new Map<string, KafkaJS.Message[]>()
@@ -156,6 +172,13 @@ export function confluentAdapter (options: ConfluentAdapterOptions = {}): Client
     for (const key of RESERVED_CONSUMER_KEYS) {
       if (source !== undefined && key in source) {
         throw new ConfigError(`confluentAdapter: "${key}" is managed by the adapter (the core commits after the handler; fromBeginning drives the reset policy) and cannot be overridden`)
+      }
+    }
+  }
+  for (const source of [options.global, options.producer]) {
+    for (const key of RESERVED_PRODUCER_KEYS) {
+      if (source !== undefined && key in source) {
+        throw new ConfigError(`confluentAdapter: "${key}" is managed by the adapter (every produce waits for all in-sync replicas and is idempotent; the core commits only after that) and cannot be overridden`)
       }
     }
   }
@@ -243,10 +266,15 @@ export function confluentAdapter (options: ConfluentAdapterOptions = {}): Client
       }
       // The client resolves per record; an errorCode other than 0 is a
       // record the broker did not take, and the batch is not acknowledged.
+      // Retrying the batch is worth it only when every refusal is transient:
+      // a definitive one would come back the same, at the cost of resending
+      // the records that were taken.
       const rejected = metadata.filter((entry) => entry.errorCode !== 0)
       if (rejected.length > 0) {
         const detail = rejected.map((entry) => `${entry.topicName}[${entry.partition}] code ${entry.errorCode}`).join(', ')
-        throw new AdapterError(`produce not acknowledged for ${rejected.length} record(s): ${detail}`)
+        throw new AdapterError(`produce not acknowledged for ${rejected.length} record(s): ${detail}`, {
+          retryable: rejected.every((entry) => isTransient(entry.errorCode))
+        })
       }
     },
 
@@ -346,20 +374,22 @@ export function confluentAdapter (options: ConfluentAdapterOptions = {}): Client
         // broker (and this client) serves reflects it. The promise here is
         // "the topics exist", so wait until they are visible, bounded by the
         // admin timeout: a consumer subscribing right after must find them.
-        const wanted = new Set(specs.map((spec) => spec.topic))
+        const wanted = specs.map((spec) => spec.topic)
+        let delay = 50
         for (;;) {
-          let visible: string[]
+          let visible: Set<string>
           try {
-            visible = await current.listTopics({ timeout: adminTimeout })
+            visible = new Set(await current.listTopics({ timeout: adminTimeout }))
           } catch (error) {
             throw wrap(error, 'listTopics failed')
           }
-          if ([...wanted].every((topic) => visible.includes(topic))) return
-          if (Date.now() >= deadline) {
-            const missing = [...wanted].filter((topic) => !visible.includes(topic))
+          const missing = wanted.filter((topic) => !visible.has(topic))
+          if (missing.length === 0) return
+          if (Date.now() + delay >= deadline) {
             throw new AdapterError(`createTopics: ${missing.join(', ')} not visible in metadata after ${adminTimeout}ms`)
           }
-          await new Promise((resolve) => setTimeout(resolve, 50))
+          await new Promise((resolve) => setTimeout(resolve, delay))
+          delay = nextPollDelay(delay)
         }
       },
       async topicExists (topic: string) {
