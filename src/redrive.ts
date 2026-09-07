@@ -2,10 +2,11 @@ import { toMessage } from './message'
 import { commitAfter } from './commit'
 import { parseDuration } from './duration'
 import type { Serializer } from './serializer'
+import { produceHop, type ProduceEvents } from './produce'
 import type { CoreContext, HarborErrorEvent } from './context'
 import type { Duration, Message, MessageHeaders } from './types'
-import type { ConsumerHandle, RawMessage, RawRecord } from './adapter'
-import { decodeHeaders, readRetryInfo, stampProducer } from './headers'
+import type { ConsumerHandle, RawMessage } from './adapter'
+import { decodeHeaders, readRetryInfo } from './headers'
 import { requireNonEmptyString, requirePositiveInteger } from './validate'
 import { ClosedError, ConfigError, describeError, isSerializationError } from './errors'
 
@@ -40,7 +41,7 @@ export interface RedriveResult {
   readonly skipped: number
 }
 
-export interface RedriveEvents {
+export interface RedriveEvents extends ProduceEvents {
   messageRedriven: { from: string, to: string, partition: number, offset: string, groupId: string, correlationId: string | undefined }
   error: HarborErrorEvent
 }
@@ -125,16 +126,10 @@ export async function redrive (context: RedriveContext, options: RedriveOptions)
       if (!tracking.has(name)) kept[name] = value
     }
     const at = new Date(context.clock.now())
-    const outgoing = stampProducer({ ...kept, [names.redrivenFrom]: raw.topic, [names.redrivenAt]: at.toISOString() }, names, {
-      clientId: context.clientId,
-      at,
-      correlationId: context.correlationId
-    })
-    const record: RawRecord = { topic: target, key: raw.key, value: raw.value, headers: outgoing }
-    await context.producePolicy.execute(() => context.adapter.produce([record]))
+    const record = await produceHop(context, raw, headers, target, 'redrive', { ...kept, [names.redrivenFrom]: raw.topic, [names.redrivenAt]: at.toISOString() }, at)
     await commit(raw)
     reprocessed++
-    context.emit('messageRedriven', { from: raw.topic, to: target, partition: raw.partition, offset: raw.offset, groupId, correlationId: outgoing[names.correlationId] })
+    context.emit('messageRedriven', { from: raw.topic, to: target, partition: raw.partition, offset: raw.offset, groupId, correlationId: record.headers[names.correlationId] })
   }
 
   consumption.handle = await context.adapter.consume({

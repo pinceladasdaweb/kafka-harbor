@@ -4,7 +4,7 @@ import { describe, test } from 'node:test'
 import { fixed } from 'breakwater'
 
 import { AdapterError, ERROR_CODES } from '../../src/index'
-import { harness, json, text } from '../helpers/harness'
+import { captureErrors, harness, json, text } from '../helpers/harness'
 
 describe('Producer', () => {
   test('serializes the value, keeps the key and writes the automatic headers', async () => {
@@ -147,6 +147,50 @@ describe('Producer', () => {
       assert.equal(((error as { cause: { code: string } }).cause).code, ERROR_CODES.ADAPTER)
       return true
     })
+  })
+
+  test('reports an acknowledged batch as messageProduced and a failed one as a producer error, then rejects', async () => {
+    const { adapter, clock, harbor } = harness()
+    const produced: Array<{ topic: string, kind: string, records: number, durationMs: number }> = []
+    const errors: Array<{ scope: string, topic?: string, error: unknown }> = []
+    harbor.on('messageProduced', (event) => { produced.push(event) })
+    harbor.on('error', (event) => { errors.push(event) })
+    const producer = harbor.producer({ retry: { attempts: 2, backoff: fixed(0) } })
+
+    const original = adapter.produce
+    adapter.produce = async (records) => { clock.advance(25); await original(records) }
+    await producer.sendBatch('orders', [{ value: 1 }, { value: 2 }])
+    assert.deepEqual(produced, [{ topic: 'orders', kind: 'send', records: 2, durationMs: 25 }])
+    assert.equal(errors.length, 0)
+
+    adapter.produce = original
+    adapter.failNextProduce(new AdapterError('refused', { retryable: false }))
+    await assert.rejects(producer.send('orders', { value: 3 }), /refused/)
+    assert.equal(produced.length, 1, 'a failed batch is not counted as produced')
+    assert.equal(errors.length, 1)
+    assert.equal(errors[0]?.scope, 'producer')
+    assert.equal(errors[0]?.topic, 'orders')
+    assert.equal((errors[0]?.error as Error).message, 'refused')
+  })
+
+  test('a connection that fails is the harbor\'s error, reported once with the adapter scope however many sends waited', async () => {
+    const { adapter, harbor } = harness()
+    const errors = captureErrors(harbor)
+    adapter.connect = async () => { throw new AdapterError('no broker', { retryable: false }) }
+    const producer = harbor.producer()
+    const results = await Promise.allSettled([1, 2, 3].map(async (n) => await producer.send('orders', { value: n })))
+    assert.deepEqual(results.map((result) => result.status), ['rejected', 'rejected', 'rejected'])
+    assert.equal(errors.length, 1)
+    assert.equal(errors[0]?.scope, 'adapter')
+    assert.equal((errors[0]?.error as Error).message, 'no broker')
+  })
+
+  test('a send after shutdown is refused without an error event', async () => {
+    const { harbor } = harness()
+    const errors = captureErrors(harbor)
+    await harbor.shutdown()
+    await assert.rejects(harbor.producer().send('orders', { value: 1 }), { code: ERROR_CODES.CLOSED })
+    assert.equal(errors.length, 0)
   })
 
   test('validates the topic and the retry attempts', async () => {

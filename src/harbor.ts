@@ -5,14 +5,16 @@ import type { CoreContext } from './context'
 import type { RetryPolicy } from 'breakwater'
 import { requireNonEmptyString } from './validate'
 import type { Clock, Duration, Logger } from './types'
+import type { Instrumentation } from './instrumentation'
 import { createEmitter, type Observable } from './events'
+import { firstRejection } from './validate'
 import { headerNames, type HeaderNames } from './headers'
 import { jsonSerializer, type Serializer } from './serializer'
 import type { BrokerConfig, ClientAdapter, SaslConfig } from './adapter'
 import { AbortProcessingError, ClosedError, ConfigError, describeError } from './errors'
 import { redrive, type RedriveEvents, type RedriveOptions, type RedriveResult } from './redrive'
-import { Producer, buildProducerRetry, type ProducerOptions, type ProducerRetryOptions } from './producer'
-import { Consumer, type ConsumerEvents, type ConsumerOptions, type ConsumerState, type StopReason } from './consumer'
+import { Producer, buildProducerRetry, type ProducerEvents, type ProducerOptions, type ProducerRetryOptions } from './producer'
+import { Consumer, type ConsumerEvents, type ConsumerOptions, type ConsumerState, type PartitionLag, type StopReason } from './consumer'
 
 export interface HeaderOptions {
   /** Prefix of every header the library writes. Default: 'x-'. */
@@ -44,6 +46,11 @@ export interface HarborConfig {
   produceRetry?: ProducerRetryOptions
   /** Time source. Tests inject a manual clock; production leaves the default. */
   clock?: Clock
+  /**
+   * Tracing hooks around produce calls and handlers, e.g. `otelTracing()`
+   * from 'kafka-harbor/otel'. Optional: without them nothing is wrapped.
+   */
+  instrumentation?: Instrumentation
 }
 
 export type HarborState = 'idle' | 'connecting' | 'connected' | 'closing' | 'closed'
@@ -67,7 +74,7 @@ export interface HarborHealth {
   readonly consumers: readonly ConsumerHealth[]
 }
 
-export interface HarborEvents extends ConsumerEvents, RedriveEvents {
+export interface HarborEvents extends ConsumerEvents, RedriveEvents, ProducerEvents {
   connected: { adapter: string }
   disconnected: { adapter: string }
 }
@@ -113,6 +120,8 @@ export class Harbor implements Observable<HarborEvents> {
   private adapterConnected = false
   private connecting: Promise<void> | undefined
   private closing: Promise<void> | undefined
+  /** The lag collection in flight, shared by every caller that arrives while it runs. */
+  private collectingLag: Promise<PartitionLag[]> | undefined
   private signalHandlers: Array<{ signal: NodeJS.Signals, handler: () => void }> = []
 
   constructor (config: HarborConfig) {
@@ -201,8 +210,41 @@ export class Harbor implements Observable<HarborEvents> {
       producePolicy: this.producePolicy,
       emit: (event, payload) => this.emitter.emit(event as keyof HarborEvents, payload as HarborEvents[keyof HarborEvents]),
       isClosed: () => this.isClosed(),
-      ensureConnected: () => this.connect()
+      ensureConnected: () => this.connect(),
+      instrumentation: this.fullConfig.instrumentation
     }
+  }
+
+  /**
+   * The lag of every running consumer, partition by partition. What a
+   * metrics scrape asks for; see `Consumer.lag()` for how it is computed.
+   * A consumer whose offsets could not be fetched (the broker did not
+   * answer) is reported through the `error` event with the adapter scope
+   * and its group, and left out, so one group's trouble does not blind the
+   * others. The call rejects only when no consumer answered, and every
+   * rejection was reported through `error` first, so a caller that only
+   * wants the numbers may treat a rejection as "no data".
+   */
+  async lag (): Promise<PartitionLag[]> {
+    // Single-flight: two scrapers, or a scrape slower than its interval,
+    // share one round of admin calls instead of stacking rounds.
+    this.collectingLag ??= this.collectLag().finally(() => { this.collectingLag = undefined })
+    return await this.collectingLag
+  }
+
+  private async collectLag (): Promise<PartitionLag[]> {
+    const running = [...this.consumers].filter((consumer) => consumer.status === 'running')
+    const results = await Promise.allSettled(running.map(async (consumer) => {
+      try {
+        return await consumer.lag()
+      } catch (error) {
+        this.emitter.emit('error', { error, scope: 'adapter', groupId: consumer.groupId })
+        throw error
+      }
+    }))
+    const failed = firstRejection(results)
+    if (failed !== undefined && results.every((result) => result.status === 'rejected')) throw failed.reason
+    return results.flatMap((result) => result.status === 'fulfilled' ? result.value : [])
   }
 
   /**
@@ -244,6 +286,8 @@ export class Harbor implements Observable<HarborEvents> {
       }, (error: unknown) => {
         if (this.state === 'connecting') this.state = 'idle'
         this.connecting = undefined
+        // Once per attempt, however many callers were waiting on it.
+        this.emitter.emit('error', { error, scope: 'adapter' })
         throw error
       })
     }

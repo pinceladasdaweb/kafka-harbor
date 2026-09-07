@@ -4,11 +4,12 @@ import type { HeaderNames } from './headers'
 import type { Clock, Logger } from './types'
 import type { ClientAdapter } from './adapter'
 import type { Serializer } from './serializer'
+import type { Instrumentation } from './instrumentation'
 
 /** The payload of the `error` event, the same for every pipeline that emits it. */
 export interface HarborErrorEvent {
   error: unknown
-  scope: 'consumer' | 'producer' | 'adapter' | 'listener'
+  scope: 'consumer' | 'producer' | 'adapter'
   groupId?: string
   topic?: string
 }
@@ -32,4 +33,6 @@ export interface CoreContext<E extends object> {
   readonly emit: <K extends keyof E>(event: K, payload: E[K]) => void
   readonly isClosed: () => boolean
   readonly ensureConnected: () => Promise<void>
+  /** The tracing hooks configured on the harbor, if any. */
+  readonly instrumentation?: Instrumentation
 }

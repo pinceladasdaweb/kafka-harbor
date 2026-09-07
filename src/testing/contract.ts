@@ -17,6 +17,11 @@
  *  8. pause/resume, when implemented, stop and restart delivery, and a
  *     pause does not outlive the consumption that set it.
  *  9. A tombstone (null value) arrives as null, not as empty bytes.
+ * 10. Offsets, when implemented: the high watermark is the next offset to
+ *     be produced, the low one the first still held (a partition without a
+ *     leader yet may be left out until it has one), and a committed offset
+ *     reads back as committed, while a partition never committed on reads
+ *     back as null or is left out.
  *
  * In this repository the suite runs against the in-memory adapter in the
  * unit run and against the Confluent adapter on a Testcontainers broker in
@@ -26,7 +31,7 @@
 import assert from 'node:assert/strict'
 import { after, before, describe, test } from 'node:test'
 
-import { decodeHeaders, type ClientAdapter, type RawMessage } from '../index'
+import { decodeHeaders, type ClientAdapter, type CommittedOffset, type RawMessage } from '../index'
 
 export interface AdapterContractSetup {
   /** A connected adapter, fresh for the whole suite. */
@@ -239,6 +244,43 @@ export function runAdapterContract (name: string, setup: () => Promise<AdapterCo
       assert.deepEqual(received[0]?.value, bytes('{"n":1}'))
       assert.equal(received[1]?.value, null, 'a tombstone is null')
       assert.deepEqual(received[2]?.value, bytes(''), 'an empty value is empty bytes, not null')
+    })
+
+    test('10. watermarks and committed offsets read back as produced and committed', async (t) => {
+      const { admin } = ctx.adapter
+      if (admin.fetchTopicOffsets === undefined || admin.fetchCommittedOffsets === undefined) {
+        t.skip('adapter does not report offsets')
+        return
+      }
+      const topic = await ctx.topic('offsets', 2)
+      const groupId = ctx.group('offsets')
+      // Right after creation a partition may have no leader yet and be left
+      // out; both are there once the broker has elected one.
+      const fetchTopicOffsets = admin.fetchTopicOffsets.bind(admin)
+      const watermarks = async (): Promise<Array<[number, string, string]>> => {
+        for (let attempt = 0; ; attempt++) {
+          const entries = await fetchTopicOffsets([topic])
+          if (entries.length === 2 || attempt === 100) return entries.map((entry): [number, string, string] => [entry.partition, entry.low, entry.high]).sort()
+          await new Promise((resolve) => setTimeout(resolve, 50))
+        }
+      }
+      assert.deepEqual(await watermarks(), [[0, '0', '0'], [1, '0', '0']])
+      await ctx.adapter.produce([
+        ...['a', 'b', 'c'].map((value) => ({ topic, key: null, value: bytes(value), headers: {}, partition: 0 })),
+        { topic, key: null, value: bytes('x'), headers: {}, partition: 1 }
+      ])
+      assert.deepEqual(await watermarks(), [[0, '0', '3'], [1, '0', '1']])
+
+      // A partition never committed on comes back as null or not at all.
+      const committedOn = (reported: readonly CommittedOffset[]): Array<[number, string | null]> => {
+        const byPartition = new Map(reported.map((entry) => [entry.partition, entry.offset]))
+        return [0, 1].map((partition) => [partition, byPartition.get(partition) ?? null])
+      }
+      assert.deepEqual(committedOn(await admin.fetchCommittedOffsets(groupId, [topic])), [[0, null], [1, null]], 'nothing committed yet')
+      const { handle } = await consumeAll(topic, groupId, 4)
+      await handle.commit([{ topic, partition: 0, offset: '2' }])
+      await handle.stop()
+      assert.deepEqual(committedOn(await admin.fetchCommittedOffsets(groupId, [topic])), [[0, '2'], [1, null]])
     })
   })
 }

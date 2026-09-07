@@ -123,6 +123,18 @@ describe('memoryAdapter diagnostics', () => {
     await adapter.disconnect()
   })
 
+  test('offsets of an unknown topic are an adapter error; a group that never committed reads all null', async () => {
+    const adapter = memoryAdapter({ partitions: 2 })
+    await adapter.connect({ clientId: 'c', brokers: ['memory'] })
+    await assert.rejects(adapter.admin.fetchTopicOffsets?.(['t', 'nope']) as Promise<unknown>, { code: 'ADAPTER', retryable: false })
+    adapter.createTopic('t')
+    assert.deepEqual(await adapter.admin.fetchCommittedOffsets?.('never-seen', ['t', 'nope']), [
+      { topic: 't', partition: 0, offset: null },
+      { topic: 't', partition: 1, offset: null }
+    ])
+    await adapter.disconnect()
+  })
+
   test('clearCalls forgets the recorded calls without touching the broker state', async () => {
     const adapter = memoryAdapter()
     await adapter.connect({ clientId: 'c', brokers: ['memory'] })

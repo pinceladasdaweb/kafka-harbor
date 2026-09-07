@@ -65,5 +65,7 @@ const entry = (input, name, { core = false } = {}) => [
 export default [
   ...entry('src/index.ts', 'index'),
   ...entry('src/adapters/confluent/index.ts', 'adapters/confluent', { core: true }),
-  ...entry('src/testing/index.ts', 'testing', { core: true })
+  ...entry('src/testing/index.ts', 'testing', { core: true }),
+  ...entry('src/prometheus/index.ts', 'prometheus', { core: true }),
+  ...entry('src/otel/index.ts', 'otel', { core: true })
 ]

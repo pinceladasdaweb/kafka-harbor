@@ -17,10 +17,13 @@ export type { ConsumerHealth, ExposedHarborConfig, HarborConfig, HarborEvents, H
 
 export type { CoreContext, HarborErrorEvent } from './context'
 
+export type { Instrumentation, OutgoingRecord, ProduceBatch, ProduceKind } from './instrumentation'
+export type { ProduceEvents, ProducedEvent } from './produce'
+
 export type { RedriveEvents, RedriveOptions, RedriveResult } from './redrive'
 
 export { Producer } from './producer'
-export type { ProducerContext, ProducerOptions, ProducerRetryOptions } from './producer'
+export type { ProducerContext, ProducerEvents, ProducerOptions, ProducerRetryOptions } from './producer'
 
 export { Consumer } from './consumer'
 export type {
@@ -33,6 +36,7 @@ export type {
   FailureOutcome,
   Handler,
   HandlerContext,
+  PartitionLag,
   StopReason,
   SubscribeOptions,
   TopicDefaults
@@ -65,6 +69,12 @@ export type { Serializer } from './serializer'
 
 export { MAX_DURATION_MS, parseDuration } from './duration'
 
+export { OFFSET_PATTERN, offsetAfter, offsetDistance } from './commit'
+
+export { partitionKey, splitPartitionKey } from './topic-partition'
+
+export { DEFAULT_DURATION_BUCKETS, reportsOffsets } from './metrics'
+
 export { murmur2, partitionForKey } from './partitioner'
 
 export { defaultDlqTopicNaming, defaultRetryTopicNaming } from './retry-topics'
@@ -79,8 +89,10 @@ export type {
   AdminApi,
   BrokerConfig,
   ClientAdapter,
+  CommittedOffset,
   ConsumeOptions,
   ConsumerHandle,
+  PartitionOffsets,
   RawHeaders,
   RawMessage,
   RawRecord,
@@ -92,4 +104,5 @@ export type {
 
 export { systemClock } from './clock'
 
-export type { EventMap, Listener, Observable } from './events'
+export { subscribe } from './events'
+export type { EventMap, Listener, Listeners, Observable } from './events'

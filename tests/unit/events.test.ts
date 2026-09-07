@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { describe, test } from 'node:test'
 
-import { createEmitter } from '../../src/events'
+import { createEmitter, subscribe } from '../../src/events'
 
 describe('createEmitter', () => {
   test('several listeners on one event all fire, in registration order', () => {
@@ -42,5 +42,32 @@ describe('createEmitter', () => {
     assert.equal(late, 0)
     emitter.emit('hit', 2)
     assert.equal(late, 1)
+  })
+})
+
+describe('subscribe', () => {
+  test('registers every listener of the map and the returned function removes exactly those', () => {
+    const emitter = createEmitter<{ hit: number, miss: number }>(() => {})
+    const seen: string[] = []
+    emitter.on('hit', (n) => { seen.push(`kept${n}`) })
+    const unsubscribe = subscribe(emitter, { hit: (n) => { seen.push(`hit${n}`) }, miss: (n) => { seen.push(`miss${n}`) } })
+    emitter.emit('hit', 1)
+    emitter.emit('miss', 2)
+    unsubscribe()
+    unsubscribe()
+    emitter.emit('hit', 3)
+    emitter.emit('miss', 4)
+    assert.deepEqual(seen, ['kept1', 'hit1', 'miss2', 'kept3'])
+  })
+
+  test('a member spelled out as undefined is no listener: emitting that event stays silent', () => {
+    const failures: unknown[] = []
+    const emitter = createEmitter<{ hit: number, miss: number }>((error) => { failures.push(error) })
+    const seen: number[] = []
+    subscribe(emitter, { hit: (n: number) => { seen.push(n) }, miss: undefined })
+    emitter.emit('miss', 1)
+    emitter.emit('hit', 2)
+    assert.deepEqual(seen, [2])
+    assert.deepEqual(failures, [])
   })
 })

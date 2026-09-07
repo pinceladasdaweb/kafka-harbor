@@ -47,6 +47,7 @@ harbor.enableSignalHandlers()        // SIGTERM -> finish in-flight handlers, co
 - [Retry topics and the DLQ](#retry-topics-and-the-dlq)
 - [Graceful shutdown](#graceful-shutdown)
 - [Health](#health)
+- [Observability](#observability)
 - [Serialization](#serialization)
 - [Headers](#headers)
 - [Events](#events)
@@ -237,6 +238,7 @@ consumer.subscribe<Order>('orders', async (message, ctx) => {
   message.timestamp   // Date
   message.retry       // { count, originalTopic, firstFailureAt, lastError } on a retry topic
 
+  ctx.groupId         // the consumer group the handler runs in
   ctx.correlationId   // from the headers, if any
   ctx.attempt         // 1 on first delivery, retry count + 1 afterwards
   ctx.logger          // the harbor's logger
@@ -318,6 +320,69 @@ harbor.health()      // { healthy, state, adapter, consumers: [{ groupId, status
 
 Synchronous and cheap: it reads the state the harbor already tracks and never calls the broker. A harbor is healthy until it shuts down or until a consumer stops on its own (`stoppedBecause` is `'abort'` or `'crash'`); a consumer stopped by `shutdown()` does not count against it. Connection is lazy by design, so a harbor that has not connected yet is healthy.
 
+## Observability
+
+Three things feed every dashboard: the typed [events](#events), consumer lag, and two entry points that turn both into Prometheus metrics or OpenTelemetry signals. The core imports neither client; `prom-client` and `@opentelemetry/api` are optional peer dependencies, installed only by the application that uses the matching entry point.
+
+### Lag
+
+```ts
+await consumer.lag()   // [{ groupId, topic, partition, low, high, committed, lag }], every consumed topic, retry ladder included
+await harbor.lag()     // the same for every running consumer
+```
+
+Lag is the number of records between the group's position and the high watermark of the partition. The position is the committed offset while there is one inside the partition's range. Until the first commit, or when the committed offset fell out of range (the records expired, the topic was recreated), it is where the group would start: the first offset still held with `fromBeginning`, the high watermark otherwise. One round of admin calls per call, never per message: a metrics scrape is the caller this is meant for, and concurrent `harbor.lag()` calls share one round. The adapter must report offsets (`admin.fetchTopicOffsets` and `admin.fetchCommittedOffsets`; the Confluent and memory adapters do); one that does not makes `lag()` reject with a `ConfigError` naming the capability. A partition without a leader yet (right after the topic was created) is left out until it has one. `harbor.lag()` covers the running consumers: one whose offsets could not be fetched is reported through the `error` event with the `adapter` scope and left out, and the call rejects only when no consumer answered.
+
+### Prometheus
+
+```ts
+import { Registry } from 'prom-client'
+import { prometheusMetrics } from 'kafka-harbor/prometheus'
+
+const registry = new Registry()
+const metrics = prometheusMetrics(harbor, { registry })   // serve registry.metrics() on your scrape endpoint
+// later, if the harbor goes away before the process does:
+metrics.detach()
+```
+
+| Metric | Labels | What it counts |
+|---|---|---|
+| `kafka_harbor_messages_processed_total` | `group`, `topic` | handler succeeded, offset committed |
+| `kafka_harbor_message_processing_duration_seconds` | `group`, `topic`, `outcome` | handler duration, histogram; `outcome` is `processed`, `retry`, `dead-letter`, `abort` or `crash` |
+| `kafka_harbor_messages_failed_total` | `group`, `topic`, `outcome` | handler failures by what happened next |
+| `kafka_harbor_messages_retried_total` | `group`, `topic`, `level` | messages forwarded to a retry topic |
+| `kafka_harbor_messages_dead_lettered_total` | `group`, `topic` | messages forwarded to the DLQ, after the broker acknowledged |
+| `kafka_harbor_messages_redriven_total` | `from`, `to` | dead letters re-injected by `redrive()` |
+| `kafka_harbor_messages_produced_total` | `topic`, `kind` | records acknowledged by the broker; `kind` is `send` (`harbor.producer()`), `retry`, `dead-letter` or `redrive` |
+| `kafka_harbor_produce_duration_seconds` | `topic`, `kind` | produce call to acknowledgment, histogram |
+| `kafka_harbor_errors_total` | `scope` | `error` events: `consumer`, `producer`, `adapter` |
+| `kafka_harbor_consumer_stops_total` | `group`, `reason` | `shutdown`, `abort` or `crash` |
+| `kafka_harbor_consumer_lag` | `group`, `topic`, `partition` | gauge collected on scrape through `harbor.lag()` |
+
+Options: `registry` (default: prom-client's global one), `prefix` (default `kafka_harbor_`, `''` for none), `buckets` for the histograms in seconds (default 5ms to 10s), and `lag: false` to skip the gauge, which is required for an adapter that does not report offsets (otherwise a `ConfigError` at construction). A lag collection that fails leaves the gauge without series for that scrape and is reported through the harbor's `error` event; the scrape itself succeeds. `detach()` unsubscribes and removes the lag gauge; the counters and histograms stay registered until `registry.clear()`. Labels are deliberately low-cardinality: never an offset or a correlation id.
+
+A Grafana dashboard built on these metrics is in [examples/grafana/kafka-harbor.json](examples/grafana/kafka-harbor.json): throughput, outcomes, dead letters, handler latency percentiles and lag per group and topic.
+
+### OpenTelemetry
+
+```ts
+import { createHarbor } from 'kafka-harbor'
+import { otelMetrics, otelTracing } from 'kafka-harbor/otel'
+
+const harbor = createHarbor({ clientId: 'orders-service', brokers, adapter: myAdapter(), instrumentation: otelTracing() })
+const metrics = otelMetrics(harbor)   // instruments under kafka_harbor.*, the same signals as the Prometheus entry point
+```
+
+`otelMetrics` records the same signals as instruments named `kafka_harbor.messages.processed`, `kafka_harbor.message.processing.duration`, `kafka_harbor.messages.failed`, `kafka_harbor.messages.retried`, `kafka_harbor.messages.dead_lettered`, `kafka_harbor.messages.redriven`, `kafka_harbor.messages.produced`, `kafka_harbor.produce.duration`, `kafka_harbor.errors`, `kafka_harbor.consumer.stops` and the observable gauge `kafka_harbor.consumer.lag`, with `kafka_harbor.group`, `kafka_harbor.topic`, `kafka_harbor.outcome`, `kafka_harbor.level`, `kafka_harbor.kind`, `kafka_harbor.scope`, `kafka_harbor.reason`, `kafka_harbor.from`, `kafka_harbor.to` and `kafka_harbor.partition` attributes. Options: `meterProvider`, `boundaries` for the histograms in seconds (default 5ms to 10s) and `lag: false`, required for an adapter that does not report offsets. Start your SDK, or pass `meterProvider`, before calling it: the metrics API has no late-binding proxy. A lag collection that fails is reported through the harbor's `error` event.
+
+`otelTracing` returns the `instrumentation` hooks the harbor calls around produce calls and handlers. Every produce call runs inside a `PRODUCER` span named `<topic> send` with a `kafka_harbor.kind` attribute (`send`, `retry`, `dead-letter` or `redrive`), and the span's context is written into each record's headers by the configured propagator (W3C `traceparent` and `tracestate` with the SDK's default) unless the record already carries one. Every handler runs inside a `CONSUMER` span named `<topic> process`, parented to the context read from the message headers, with the OpenTelemetry messaging attributes (`messaging.system`, `messaging.destination.name`, `messaging.consumer.group.name`, `messaging.destination.partition.id`, `messaging.kafka.offset`) plus `kafka_harbor.attempt`, `kafka_harbor.correlation_id` and `kafka_harbor.original_topic`. The handler runs under the extracted context, so baggage the producer propagated is active there too. A retry, DLQ or redrive hop is a `PRODUCER` span parented to the context the forwarded message carries, and the hop copies that message's headers, so the first attempt, every retry, the dead-lettering and the redrive of one message belong to the trace that produced it. A handler that throws marks its span with the exception and an error status.
+
+A hook that throws, or an SDK that misbehaves, never changes what the pipeline does: the core logs the failure and runs the work unwrapped. Without an SDK registered the hooks are inert.
+
+### Your own instrumentation
+
+`instrumentation` accepts any object with some of `wrapProduce(batch, run)`, `onProduce(record)` and `wrapHandler(message, context, run)`; `otelTracing()` is one implementation. `wrapProduce` sees every produce call, the hops included: `batch.kind` says what it is for and, for a hop, `batch.origin` is the consumed message being forwarded, headers included. `onProduce` runs inside `wrapProduce`, so a context the wrapper sets up is what it sees, and whatever it returns is added to the record's headers, a header the record already carries taking precedence.
+
 ## Serialization
 
 The default is JSON, strict. `JSON.stringify` turns `Map`, `Set`, typed arrays, `RegExp`, `Error` and `Promise` into `{}` without a word, drops `undefined` inside objects, and encodes `NaN` as `null`. kafka-harbor rejects every one of those shapes with `SerializationError` before a byte is produced, so the handler always gets what the producer meant. `Date` is the single conversion accepted (encoded as ISO-8601, decoded as a string).
@@ -369,11 +434,12 @@ harbor
   .on('messageRetried', ({ topic, retryTopic, level, attempt, error }) => {})
   .on('messageDeadLettered', ({ topic, dlqTopic, attempts, error }) => alert(`${topic}: ${attempts} attempts, now in ${dlqTopic}`))
   .on('messageRedriven', ({ from, to, offset }) => {})
+  .on('messageProduced', ({ topic, kind, records, durationMs }) => {}) // one produce call acknowledged; kind: 'send' | 'retry' | 'dead-letter' | 'redrive'
   .on('consumerStopped', ({ groupId, reason }) => {})               // reason: 'shutdown' | 'abort' | 'crash'
-  .on('error', ({ error, scope, groupId, topic }) => {})
+  .on('error', ({ error, scope, groupId, topic }) => {})            // scope: 'consumer' | 'producer' | 'adapter'
 ```
 
-`messageDeadLettered` fires after the DLQ produce was acknowledged, never on the attempt. A listener that throws is reported to the logger and does not affect processing.
+`messageDeadLettered` fires after the DLQ produce was acknowledged, never on the attempt. `error` with the `adapter` scope covers the client: a connection that failed (once per attempt, however many calls were waiting on it), a fetch loop that reported a failure, a lag collection that could not read the offsets. A listener that throws is reported to the logger and does not affect processing.
 
 ## Errors
 
@@ -406,7 +472,7 @@ confluentAdapter({
 
 The Confluent adapter sets `acks=all` and `enable.idempotence=true` on the producer, `enable.auto.commit=false` on consumers, and loads the client module on first connect, so importing the adapter never touches the native binding. The three properties the offset policy depends on (`enable.auto.commit`, `enable.auto.offset.store`, `auto.offset.reset`) cannot be overridden through the passthrough; `fromBeginning` drives the reset policy. Client failures are retryable unless their code is definitive (authorization, oversized record, invalid argument), regardless of the client's own `retriable` flag, which only describes transactions.
 
-Writing your own adapter means implementing `ClientAdapter` (about 150 lines for the Confluent one) and running `runAdapterContract` from `kafka-harbor/testing` against your backend. The contract is small on purpose: connect, disconnect, produce with acknowledgment, consume with per-partition ordering and a settled-promise gate, commit, stop, optional pause/resume, and two admin calls. Everything else lives in the core.
+Writing your own adapter means implementing `ClientAdapter` and running `runAdapterContract` from `kafka-harbor/testing` against your backend. The contract is small on purpose: connect, disconnect, produce with acknowledgment, consume with per-partition ordering and a settled-promise gate, commit, stop, optional pause/resume, two admin calls, and two optional offset calls that `lag()` is computed from. Everything else lives in the core.
 
 ## Testing your handlers
 
