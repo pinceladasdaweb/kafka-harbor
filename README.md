@@ -41,6 +41,7 @@ harbor.enableSignalHandlers()        // SIGTERM -> finish in-flight handlers, co
 - [What it does not do](#what-it-does-not-do)
 - [Install](#install)
 - [Core concepts](#core-concepts)
+- [Durations](#durations)
 - [Producer](#producer)
 - [Consumer](#consumer)
 - [Retry topics and the DLQ](#retry-topics-and-the-dlq)
@@ -151,6 +152,20 @@ The default static build, the one `npm install` attempts on its own when no bina
 - **Consumer**: `harbor.consumer({ groupId })`. One consumer group, one or more topics, one handler per topic. Owns the retry ladder and the DLQ for each topic it subscribes to.
 - **Adapter**: the client behind it all. Explicit in the config so that the core has no dependency on any client.
 - **Message**: what the handler receives. Deserialized value, string key, string headers, `Date` timestamp, and `retry` metadata when it came through a retry topic.
+
+### Durations
+
+Every option that is a span of time (`shutdown()`, `enableSignalHandlers()`, `maxProcessingTime`, the `delay` of a retry level, the redrive `idleTimeout`) takes a number of milliseconds or a string with a unit:
+
+| Suffix | Unit | Example |
+|---|---|---|
+| `ms` | milliseconds | `'250ms'` |
+| `s` | seconds | `'30s'` |
+| `m` | minutes | `'1m'`, `'1.5m'` |
+| `h` | hours | `'2h'` |
+| `d` | days | `'1d'` |
+
+Decimals are accepted, a space before the unit is tolerated, and a bare number in a string (`'30'`) is refused: it is more likely a forgotten unit than thirty milliseconds. The ceiling is `2147483647` ms, about 24.8 days, the longest a timer can hold; anything above is a `ConfigError` at the call, never a wait that ends a millisecond later. `parseDuration()` and `MAX_DURATION_MS` are exported for code that wants the same rule.
 
 ## Producer
 
