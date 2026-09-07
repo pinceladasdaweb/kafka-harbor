@@ -120,9 +120,16 @@ interface Subscription {
   readonly serializer: Serializer
 }
 
-/** One consumed topic: the subscription it belongs to and its place on the ladder. */
+/**
+ * One consumed topic: its place on the ladder and the subscriptions it
+ * serves. An original topic serves exactly one. A retry topic serves one per
+ * subscription whose naming produced it, so a naming function that returns
+ * the same name for every original topic of a level (`svc-retry-1`) makes
+ * that topic shared: the message's original-topic header says which handler
+ * it belongs to.
+ */
 interface Route {
-  readonly subscription: Subscription
+  readonly owners: Map<string, Subscription>
   /** 0 for the original topic, 1..N for a retry topic. */
   readonly level: number
   /** How long a message waits on this topic before the handler runs. */
@@ -215,15 +222,37 @@ export class Consumer {
       handler: handler as Handler,
       serializer: (options.serializer ?? this.options.serializer ?? this.context.serializer) as Serializer
     }
-    for (const consumed of plan.consumedTopics) {
-      const owner = this.routes.get(consumed)
-      if (owner !== undefined) {
-        throw new ConfigError(`topic "${consumed}" is claimed by both "${owner.subscription.plan.original}" and "${topic}"`)
+    // An original topic belongs to one subscription. A retry topic may be
+    // shared, but only among topics of the same level: the level decides the
+    // delay, and a message must not wait one topic's delay on another's
+    // ladder. A DLQ is never consumed by the consumer that fills it.
+    const taken = this.routes.get(topic)
+    if (taken !== undefined) {
+      throw new ConfigError(`topic "${topic}" is claimed by both "${[...taken.owners.keys()].join('", "')}" and "${topic}"`)
+    }
+    for (const { level } of this.levels) {
+      const retryTopic = plan.retryTopic(level) as string
+      const existing = this.routes.get(retryTopic)
+      if (existing !== undefined && existing.level !== level) {
+        throw new ConfigError(`topic "${retryTopic}" is level ${level} of "${topic}" but ${existing.level === 0 ? 'the original topic' : `level ${existing.level}`} of "${[...existing.owners.keys()].join('", "')}"`)
       }
     }
-    this.routes.set(topic, { subscription, level: 0, delayMs: 0 })
+    if (plan.dlqTopic !== undefined && this.routes.has(plan.dlqTopic)) {
+      throw new ConfigError(`dlq.topicNaming produced "${plan.dlqTopic}" for "${topic}", a topic this consumer already consumes`)
+    }
+    for (const route of this.routes.values()) {
+      for (const owner of route.owners.values()) {
+        if (owner.plan.dlqTopic !== undefined && plan.consumedTopics.includes(owner.plan.dlqTopic)) {
+          throw new ConfigError(`topic "${owner.plan.dlqTopic}" is the DLQ of "${owner.plan.original}" and would be consumed through "${topic}"`)
+        }
+      }
+    }
+    this.routes.set(topic, { owners: new Map([[topic, subscription]]), level: 0, delayMs: 0 })
     for (const { level, delayMs } of this.levels) {
-      this.routes.set(plan.retryTopic(level) as string, { subscription, level, delayMs })
+      const retryTopic = plan.retryTopic(level) as string
+      const route = this.routes.get(retryTopic) ?? { owners: new Map<string, Subscription>(), level, delayMs }
+      route.owners.set(topic, subscription)
+      this.routes.set(retryTopic, route)
     }
     return this
   }
@@ -429,12 +458,15 @@ export class Consumer {
   }
 
   private async prepareTopics (): Promise<void> {
-    const derived: TopicSpec[] = []
-    for (const { subscription: { plan }, level } of this.routes.values()) {
-      if (level !== 0) continue
-      for (const topic of plan.retryTopics) derived.push(this.topicSpec(topic))
-      if (plan.dlqTopic !== undefined) derived.push(this.topicSpec(plan.dlqTopic))
+    // A shared retry topic or DLQ appears in several plans and is created once.
+    const names = new Set<string>()
+    for (const route of this.routes.values()) {
+      for (const { plan } of route.owners.values()) {
+        for (const topic of plan.retryTopics) names.add(topic)
+        if (plan.dlqTopic !== undefined) names.add(plan.dlqTopic)
+      }
     }
+    const derived = [...names].map((topic) => this.topicSpec(topic))
     if (derived.length === 0) return
     if (this.options.autoCreateTopics === true) {
       await this.context.adapter.admin.createTopics(derived)
@@ -482,12 +514,17 @@ export class Consumer {
     if (route === undefined) {
       throw new ConfigError(`received a message on "${raw.topic}", a topic this consumer never subscribed to`)
     }
-    const { subscription, level } = route
+    const { level } = route
     const names = this.context.headerNames
     const headers = decodeHeaders(raw.headers)
     const retry = level > 0 ? readRetryInfo(headers, names) : undefined
     const attempt = (retry?.count ?? level) + 1
     const correlationId = headers[names.correlationId]
+    const subscription = this.ownerOf(route, retry?.originalTopic)
+    if (subscription === undefined) {
+      await this.deadLetterUnroutable(raw, route, headers, retry, correlationId)
+      return
+    }
 
     // A retry topic message becomes due `delay` after it was produced. The
     // wait is bounded by construction (every delay fits under
@@ -568,6 +605,41 @@ export class Consumer {
     // without committing, so nothing is lost and someone has to look.
     this.context.emit('messageFailed', { ...at, error, durationMs, outcome: 'crash' })
     throw error
+  }
+
+  /**
+   * The subscription a message on this topic belongs to. An original topic
+   * and an unshared retry topic have one owner, whatever the headers say (a
+   * corrupt tracking block there means a first delivery, not a lost
+   * message). A shared retry topic has to trust the original-topic header,
+   * validated as network input; a message it cannot place has no owner.
+   */
+  private ownerOf (route: Route, originalTopic: string | undefined): Subscription | undefined {
+    if (route.owners.size === 1) return route.owners.values().next().value
+    // No tracking block, no original topic: the empty name is never a key.
+    return route.owners.get(originalTopic ?? '')
+  }
+
+  /**
+   * A message on a shared retry topic whose original-topic header names no
+   * subscription of this consumer cannot be handled by anyone here. When the
+   * owners of the topic share one DLQ it goes there, tracking headers as they
+   * are, so someone can look; when they do not, there is no honest
+   * destination and the consumer stops with the offset uncommitted.
+   */
+  private async deadLetterUnroutable (raw: RawMessage, route: Route, headers: MessageHeaders, retry: Message['retry'], correlationId: string | undefined): Promise<void> {
+    const names = this.context.headerNames
+    const claimed = retry?.originalTopic ?? headers[names.originalTopic]
+    const error = new ConfigError(`message on shared retry topic "${raw.topic}" names ${claimed === undefined ? 'no original topic' : `"${claimed}" as its original topic`}, which this consumer does not subscribe to`)
+    const dlqTopics = new Set([...route.owners.values()].map(({ plan }) => plan.dlqTopic))
+    const [dlqTopic] = dlqTopics
+    if (dlqTopics.size !== 1 || dlqTopic === undefined) throw error
+    const at = { topic: raw.topic, partition: raw.partition, offset: raw.offset, groupId: this.groupId, correlationId }
+    const tracking: MessageHeaders = { ...headers, [names.lastError]: describeError(error), [names.deadLetteredAt]: new Date(this.context.clock.now()).toISOString() }
+    await this.forward(raw, dlqTopic, tracking)
+    if (!await this.commit(raw)) return
+    this.context.emit('messageFailed', { ...at, error, durationMs: 0, outcome: 'dead-letter' })
+    this.context.emit('messageDeadLettered', { ...at, dlqTopic, attempts: (retry?.count ?? 0) + 1, error })
   }
 
   /**

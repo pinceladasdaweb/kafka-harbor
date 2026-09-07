@@ -104,6 +104,25 @@ Three consequences:
   `orders` or `orders-retry-1` is waiting for, whatever `concurrency` is;
   the original partition keeps flowing while retries wait.
 
+## Shared retry topics
+
+A retry topic serves every subscription whose naming function produced its
+name. With the default naming (`orders-retry-1`) that is one; with a naming
+function that returns the same name for every topic of a level
+(`svc-retry-1`) the topic is shared, and the `x-original-topic` header
+decides which handler a message belongs to. That header is network input:
+a message on a shared topic whose header names no subscription of the
+consumer is dead-lettered to the owners' DLQ when they share one, tracking
+headers untouched, so someone can look. When the owners have different
+DLQs there is no honest destination and the consumer stops with the offset
+uncommitted. An unshared retry topic never consults the header for routing:
+its single owner is the answer, and a corrupt tracking block there is a
+first delivery, as before.
+
+Levels never mix. A name that is level 1 of one topic and level 2 of another
+is refused at `subscribe()`, because the level decides the delay a message
+waits and a message must not wait one ladder's delay on another's.
+
 ## Ordering
 
 Order is preserved within a partition on the original topic. A message that
