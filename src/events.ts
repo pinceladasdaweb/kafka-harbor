@@ -21,6 +21,25 @@ export interface TypedEmitter<E extends EventMap> extends Observable<E> {
   emit: <K extends keyof E>(event: K, payload: E[K]) => void
 }
 
+/** A listener per event, for `subscribe()`. */
+export type Listeners<E extends EventMap> = { [K in keyof E]?: Listener<E[K]> }
+
+/**
+ * Registers every listener of the map on the observable and returns the
+ * function that removes exactly those listeners again. Calling it twice is
+ * harmless.
+ */
+export function subscribe<E extends EventMap> (target: Observable<E>, listeners: Listeners<E>): () => void {
+  // An optional member spelled out as undefined is no listener; registering
+  // it would make every emit of that event a TypeError.
+  const entries = (Object.entries(listeners) as Array<[keyof E, Listener<E[keyof E]> | undefined]>)
+    .filter((entry): entry is [keyof E, Listener<E[keyof E]>] => entry[1] !== undefined)
+  for (const [event, listener] of entries) target.on(event, listener)
+  return () => {
+    for (const [event, listener] of entries) target.off(event, listener)
+  }
+}
+
 export function createEmitter<E extends EventMap> (onListenerError: (error: unknown) => void): TypedEmitter<E> {
   const listeners = new Map<keyof E, Set<Listener<E[keyof E]>>>()
   const emitter: TypedEmitter<E> = {

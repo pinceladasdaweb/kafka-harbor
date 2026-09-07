@@ -1,8 +1,10 @@
 import { isRetryable } from './errors'
+import { stampProducer } from './headers'
+import type { RawRecord } from './adapter'
 import type { Serializer } from './serializer'
-import type { Clock, OutgoingMessage } from './types'
-import type { ClientAdapter, RawRecord } from './adapter'
-import { stampProducer, type HeaderNames } from './headers'
+import type { OutgoingMessage } from './types'
+import type { CoreContext, HarborErrorEvent } from './context'
+import { produceRecords, type ProduceEvents } from './produce'
 import { requireNonEmptyString, requirePositiveInteger } from './validate'
 import { exponential, retry, type Backoff, type RetryPolicy } from 'breakwater'
 
@@ -24,16 +26,12 @@ export interface ProducerOptions<T = unknown> {
   retry?: ProducerRetryOptions
 }
 
-/** What the core needs from the harbor to build a producer. */
-export interface ProducerContext {
-  readonly adapter: ClientAdapter
-  readonly clientId: string
-  readonly serializer: Serializer
-  readonly headerNames: HeaderNames
-  readonly correlationId: () => string
-  readonly clock: Clock
-  readonly ensureConnected: () => Promise<void>
+export interface ProducerEvents extends ProduceEvents {
+  error: HarborErrorEvent
 }
+
+/** What the core needs from the harbor to build a producer. */
+export type ProducerContext = CoreContext<ProducerEvents>
 
 export function buildProducerRetry (options: ProducerRetryOptions | undefined): RetryPolicy {
   const attempts = requirePositiveInteger(options?.attempts ?? 5, 'producer retry.attempts')
@@ -61,10 +59,17 @@ export class Producer<T = unknown> {
 
   /**
    * Produces every message and resolves once the broker acknowledged all of
-   * them. Serialization happens before any byte leaves the process, so a
-   * batch with one unencodable value produces nothing. A `null` value is a
-   * tombstone: no value bytes at all, which is what a compacted topic reads
-   * as "delete this key"; the serializer never sees it.
+   * them; the harbor connects first if it has not yet. Serialization happens
+   * before any byte leaves the process, so a batch with one unencodable
+   * value produces nothing. A `null` value is a tombstone: no value bytes at
+   * all, which is what a compacted topic reads as "delete this key"; the
+   * serializer never sees it.
+   *
+   * A batch that the broker acknowledged is reported as `messageProduced`
+   * with kind `send`; one that failed after the retries is reported as
+   * `error` with the producer scope and rejected to the caller. A connection
+   * that fails is the harbor's to report (once, with the adapter scope) and
+   * rejects the send without a producer error.
    */
   async sendBatch (topic: string, messages: readonly OutgoingMessage<T>[]): Promise<void> {
     requireNonEmptyString(topic, 'topic')
@@ -79,6 +84,11 @@ export class Producer<T = unknown> {
     }))
     if (records.length === 0) return
     await this.context.ensureConnected()
-    await this.policy.execute(() => this.context.adapter.produce(records))
+    try {
+      await produceRecords(this.context, { topic, kind: 'send' }, records, this.policy)
+    } catch (error) {
+      this.context.emit('error', { error, scope: 'producer', topic })
+      throw error
+    }
   }
 }

@@ -6,6 +6,8 @@
 // adapters unusable for every consumer while every test passed. `npm run
 // check:dist` builds and compiles this file.
 import { memoryAdapter } from 'kafka-harbor/testing'
+import { prometheusMetrics } from 'kafka-harbor/prometheus'
+import { otelMetrics, otelTracing } from 'kafka-harbor/otel'
 import { confluentAdapter } from 'kafka-harbor/adapters/confluent'
 import { createHarbor, type ClientAdapter, type Message } from 'kafka-harbor'
 
@@ -29,6 +31,12 @@ harbor.on('messageProcesed', () => {})
 // The exposed configuration never carries the SASL password.
 // @ts-expect-error password is not exposed
 export const leaked: string | undefined = harbor.config.sasl?.password
+
+// The metrics entry points take the Harbor class from the core declarations:
+// a class inlined into a subpath's d.ts would be another nominal type.
+export const metrics = prometheusMetrics(harbor, { prefix: 'check_' })
+export const otel = otelMetrics(harbor)
+export const traced = createHarbor({ clientId: 'consumer-check', brokers: ['localhost:9092'], adapter, instrumentation: otelTracing() })
 
 export const producer = harbor.producer<Order>()
 export const send = async (): Promise<void> => await producer.send('orders', { key: '1', value: { id: '1', total: 10 } })

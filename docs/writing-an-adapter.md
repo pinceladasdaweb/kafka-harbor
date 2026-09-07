@@ -77,6 +77,17 @@ and a `consume` or `topicExists` issued right after must find the topic.
 Poll the metadata until it does, bounded by your admin timeout. `topicExists`
 tells the truth.
 
+`fetchTopicOffsets(topics)` and `fetchCommittedOffsets(groupId, topics)` are
+optional and come as a pair: the core computes `lag()` from them, and an
+adapter without them makes `lag()` reject with a `ConfigError` naming the
+capability while everything else works. `low` is the first offset still
+held on the partition, `high` the offset the next record gets (the high
+watermark, so an empty partition reads `low: '0', high: '0'`), and a
+committed offset reads back exactly as committed. A partition the group
+never committed on may come back with a `null` offset or not at all, as the
+broker answers; the core treats both the same. Invariant 10 of the contract
+suite checks all of that and skips when the pair is absent.
+
 ## Errors
 
 Wrap client errors in `AdapterError` from `kafka-harbor`, with the original
@@ -117,7 +128,7 @@ runAdapterContract('mine', async () => {
 })
 ```
 
-The suite is a `node:test` suite; run the file with `node --test`. The nine invariants are listed in its header. An adapter that
+The suite is a `node:test` suite; run the file with `node --test`. The ten invariants are listed in its header. An adapter that
 passes them can be dropped into any harbor; an adapter that needs one of them
 relaxed has found either a bug in the client or a leak in the contract, and
 both are worth an issue.

@@ -6,12 +6,15 @@
  */
 import {
   AdapterError,
+  OFFSET_PATTERN,
   ConfigError,
   describeError,
   type BrokerConfig,
   type ClientAdapter,
+  type CommittedOffset,
   type ConsumeOptions,
   type ConsumerHandle,
+  type PartitionOffsets,
   type RawMessage,
   type RawRecord,
   type TopicPartition,
@@ -399,6 +402,44 @@ export function confluentAdapter (options: ConfluentAdapterOptions = {}): Client
           return topics.includes(topic)
         } catch (error) {
           throw wrap(error, 'listTopics failed')
+        }
+      },
+      async fetchTopicOffsets (topics: readonly string[]): Promise<PartitionOffsets[]> {
+        const { admin: current } = requireConnected()
+        // The client answers one topic per call.
+        const watermarksOf = async (topic: string): Promise<PartitionOffsets[]> => {
+          let entries: Array<{ partition: number, high: string, low: string }>
+          try {
+            // The isolation level is optional at runtime (read uncommitted, the
+            // broker default); the client's declaration marks it required.
+            entries = await current.fetchTopicOffsets(topic, { timeout: adminTimeout } as Parameters<KafkaJS.Admin['fetchTopicOffsets']>[1])
+          } catch (error) {
+            throw wrap(error, 'fetchTopicOffsets failed')
+          }
+          // A partition whose leader is not serving (right after the topic
+          // was created, during an election) answers -1. A watermark is a
+          // count of records, never negative, so that partition is left out,
+          // as the contract allows: its lag is unknown for now, and a
+          // scrape must not wait for a leader.
+          return entries
+            .filter((entry) => OFFSET_PATTERN.test(entry.high) && OFFSET_PATTERN.test(entry.low))
+            .map((entry) => ({ topic, partition: entry.partition, low: entry.low, high: entry.high }))
+        }
+        return (await Promise.all(topics.map(watermarksOf))).flat()
+      },
+      async fetchCommittedOffsets (groupId: string, topics: readonly string[]): Promise<CommittedOffset[]> {
+        const { admin: current } = requireConnected()
+        try {
+          const result = await current.fetchOffsets({ groupId, topics: [...topics], timeout: adminTimeout })
+          // librdkafka reports a partition the group never committed on with a
+          // negative offset (RD_KAFKA_OFFSET_INVALID, -1001).
+          return result.flatMap(({ topic, partitions }) => partitions.map(({ partition, offset }) => ({
+            topic,
+            partition,
+            offset: OFFSET_PATTERN.test(offset) ? offset : null
+          })))
+        } catch (error) {
+          throw wrap(error, 'fetchOffsets failed')
         }
       }
     }

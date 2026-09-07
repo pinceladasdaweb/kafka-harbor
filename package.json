@@ -12,7 +12,9 @@
     "graceful-shutdown",
     "confluent",
     "librdkafka",
-    "typescript"
+    "typescript",
+    "prometheus",
+    "opentelemetry"
   ],
   "homepage": "https://github.com/pinceladasdaweb/kafka-harbor#readme",
   "bugs": {
@@ -59,6 +61,26 @@
         "types": "./dist/testing.d.cts",
         "default": "./dist/testing.cjs"
       }
+    },
+    "./prometheus": {
+      "import": {
+        "types": "./dist/prometheus.d.ts",
+        "default": "./dist/prometheus.mjs"
+      },
+      "require": {
+        "types": "./dist/prometheus.d.cts",
+        "default": "./dist/prometheus.cjs"
+      }
+    },
+    "./otel": {
+      "import": {
+        "types": "./dist/otel.d.ts",
+        "default": "./dist/otel.mjs"
+      },
+      "require": {
+        "types": "./dist/otel.d.cts",
+        "default": "./dist/otel.cjs"
+      }
     }
   },
   "files": [
@@ -100,10 +122,18 @@
     "breakwater": "^1.1.3"
   },
   "peerDependencies": {
-    "@confluentinc/kafka-javascript": "^1.10.0"
+    "@confluentinc/kafka-javascript": "^1.10.0",
+    "@opentelemetry/api": "^1.9.0",
+    "prom-client": "^15.0.0"
   },
   "peerDependenciesMeta": {
     "@confluentinc/kafka-javascript": {
+      "optional": true
+    },
+    "@opentelemetry/api": {
+      "optional": true
+    },
+    "prom-client": {
       "optional": true
     }
   },
@@ -112,6 +142,11 @@
     "@commitlint/config-conventional": "^21.2.2",
     "@confluentinc/kafka-javascript": "^1.10.0",
     "@microsoft/api-extractor": "^7.59.0",
+    "@opentelemetry/api": "^1.9.1",
+    "@opentelemetry/context-async-hooks": "^2.11.0",
+    "@opentelemetry/core": "^2.11.0",
+    "@opentelemetry/sdk-metrics": "^2.11.0",
+    "@opentelemetry/sdk-trace-base": "^2.11.0",
     "@rollup/plugin-typescript": "^12.3.0",
     "@stryker-mutator/core": "^10.0.0",
     "@stryker-mutator/tap-runner": "^10.0.0",
@@ -121,6 +156,7 @@
     "eslint": "^9.39.5",
     "lint-staged": "^17.4.1",
     "neostandard": "^0.13.0",
+    "prom-client": "^15.1.3",
     "rollup": "^4.63.1",
     "rollup-plugin-dts": "^6.4.1",
     "testcontainers": "^12.1.0",

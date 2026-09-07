@@ -1,4 +1,5 @@
 import {
+  AdapterError,
   ClosedError,
   ConfigError,
   ShutdownTimeoutError,
@@ -19,17 +20,22 @@ import {
   type RetryTopicNaming
 } from './retry-topics'
 import { toMessage } from './message'
-import { commitAfter } from './commit'
 import { parseDuration } from './duration'
+import { wrapped } from './instrumentation'
 import type { Serializer } from './serializer'
+import { partitionKey } from './topic-partition'
+import { produceHop, type ProduceEvents } from './produce'
 import type { CoreContext, HarborErrorEvent } from './context'
+import { OFFSET_PATTERN, commitAfter, offsetDistance } from './commit'
 import type { Duration, MessageHeaders, Logger, Message } from './types'
-import { decodeHeaders, readRetryInfo, stampProducer, writeRetryInfo } from './headers'
+import { decodeHeaders, readRetryInfo, writeRetryInfo } from './headers'
+import type { ConsumerHandle, RawMessage, TopicPartition, TopicSpec } from './adapter'
 import { firstRejection, requireNonEmptyString, requirePositiveInteger } from './validate'
-import type { ConsumerHandle, RawMessage, RawRecord, TopicPartition, TopicSpec } from './adapter'
 
 /** What a handler receives besides the message. */
 export interface HandlerContext {
+  /** The consumer group the handler runs in. */
+  readonly groupId: string
   /** The correlation id read from the headers, if the producer sent one. */
   readonly correlationId: string | undefined
   readonly logger: Logger
@@ -98,7 +104,7 @@ export interface ConsumerOptions {
   maxProcessingTime?: Duration
 }
 
-export interface ConsumerEvents {
+export interface ConsumerEvents extends ProduceEvents {
   messageProcessed: { topic: string, partition: number, offset: string, groupId: string, durationMs: number, correlationId: string | undefined }
   messageRetried: { topic: string, partition: number, offset: string, groupId: string, retryTopic: string, level: number, attempt: number, error: unknown, correlationId: string | undefined }
   messageDeadLettered: { topic: string, partition: number, offset: string, groupId: string, dlqTopic: string, attempts: number, error: unknown, correlationId: string | undefined }
@@ -108,6 +114,28 @@ export interface ConsumerEvents {
 }
 
 export type FailureOutcome = 'retry' | 'dead-letter' | 'abort' | 'crash'
+
+/** How far behind a consumer group is on one partition it consumes. */
+export interface PartitionLag {
+  readonly groupId: string
+  readonly topic: string
+  readonly partition: number
+  /** The first offset still held on the partition. */
+  readonly low: string
+  /** The high watermark: the offset the next record produced gets. */
+  readonly high: string
+  /** What the group committed, or null when it never committed on this partition. */
+  readonly committed: string | null
+  /**
+   * Records between the group's position and the high watermark. The
+   * position is the committed offset while there is one inside the
+   * partition's range; until the first commit, or when the committed offset
+   * fell out of range (the records expired, the topic was recreated), it is
+   * where the group would start: the first offset still held with
+   * `fromBeginning`, the high watermark otherwise.
+   */
+  readonly lag: number
+}
 export type StopReason = 'shutdown' | 'abort' | 'crash'
 export type ConsumerState = 'idle' | 'starting' | 'running' | 'stopping' | 'stopped'
 
@@ -257,6 +285,45 @@ export class Consumer {
     return this
   }
 
+  /**
+   * How far behind the group is on every topic this consumer consumes, the
+   * original ones and the retry ladder. One round of admin calls per
+   * invocation, never per message: a metrics scrape is the caller this is
+   * meant for. Connects the harbor if it is not yet; rejects with a
+   * ConfigError when the adapter does not report offsets and with a
+   * ClosedError once the harbor is shutting down.
+   */
+  async lag (): Promise<PartitionLag[]> {
+    const { admin, name } = this.context.adapter
+    if (admin.fetchTopicOffsets === undefined || admin.fetchCommittedOffsets === undefined) {
+      throw new ConfigError(`adapter "${name}" does not report offsets (admin.fetchTopicOffsets and admin.fetchCommittedOffsets), so lag is not available`)
+    }
+    // Connecting a closed harbor is a ClosedError, which is the right answer here too.
+    await this.context.ensureConnected()
+    const topics = [...this.routes.keys()]
+    const [watermarks, committed] = await Promise.all([admin.fetchTopicOffsets(topics), admin.fetchCommittedOffsets(this.groupId, topics)])
+    const committedAt = new Map(committed.map((entry) => [partitionKey(entry.topic, entry.partition), entry.offset]))
+    const fromBeginning = this.options.fromBeginning ?? false
+    // Offsets cross the adapter boundary as strings; an adapter that hands
+    // back a sentinel or garbage must not turn into a negative or NaN lag.
+    const checked = (value: string, what: string, at: TopicPartition): string => {
+      if (!OFFSET_PATTERN.test(value)) throw new AdapterError(`adapter "${name}" reported an invalid ${what} for ${at.topic}[${at.partition}]: ${JSON.stringify(value)}`, { retryable: false })
+      return value
+    }
+    return watermarks.map((partition): PartitionLag => {
+      const low = checked(partition.low, 'low watermark', partition)
+      const high = checked(partition.high, 'high watermark', partition)
+      const offset = committedAt.get(partitionKey(partition.topic, partition.partition)) ?? null
+      const committedOffset = offset === null ? null : checked(offset, 'committed offset', partition)
+      // A committed offset outside [low, high] is one the broker would reset
+      // (the records expired, the topic was recreated): the group's position
+      // is then where a fresh group would start, not the stale number.
+      const inRange = committedOffset !== null && offsetDistance(low, committedOffset) >= 0 && offsetDistance(committedOffset, high) >= 0
+      const position = inRange ? committedOffset : fromBeginning ? low : high
+      return { groupId: this.groupId, topic: partition.topic, partition: partition.partition, low, high, committed: committedOffset, lag: offsetDistance(position, high) }
+    })
+  }
+
   /** Connects, prepares the topics and starts fetching. */
   async start (): Promise<void> {
     if (this.context.isClosed()) throw new ClosedError('harbor')
@@ -353,8 +420,8 @@ export class Consumer {
    * maxProcessingTime, the longest a handler may take anyway.
    */
   private async settleRevoked (partitions: readonly TopicPartition[]): Promise<void> {
-    const revoked = new Set(partitions.map(({ topic, partition }) => `${topic}\u0000${partition}`))
-    const running = [...this.deliveries].filter(([, entry]) => entry.active && revoked.has(`${entry.raw.topic}\u0000${entry.raw.partition}`))
+    const revoked = new Set(partitions.map(({ topic, partition }) => partitionKey(topic, partition)))
+    const running = [...this.deliveries].filter(([, entry]) => entry.active && revoked.has(partitionKey(entry.raw.topic, entry.raw.partition)))
     await this.settledInTime(Promise.all(running.map(([work]) => work)), this.maxProcessingTimeMs)
   }
 
@@ -545,12 +612,16 @@ export class Consumer {
     let error: unknown
     try {
       const message = toMessage(raw, headers, subscription.serializer, subscription.plan.original, retry)
-      await subscription.handler(message, {
+      const handlerContext: HandlerContext = {
+        groupId: this.groupId,
         correlationId,
         logger: this.context.logger,
         signal: this.shutdownController.signal,
         attempt
-      })
+      }
+      const wrapHandler = this.context.instrumentation?.wrapHandler
+      if (wrapHandler === undefined) await subscription.handler(message, handlerContext)
+      else await wrapped((run) => wrapHandler(message, handlerContext, run), async () => { await subscription.handler(message, handlerContext) }, this.context.logger)
     } catch (thrown) {
       error = thrown
     }
@@ -586,7 +657,7 @@ export class Consumer {
     })
 
     if (wantsRetry && retryTopic !== undefined) {
-      await this.forward(raw, retryTopic, tracking)
+      await produceHop(this.context, raw, headers, retryTopic, 'retry', tracking)
       if (!await this.commit(raw)) return
       this.context.emit('messageFailed', { ...at, error, durationMs, outcome: 'retry' })
       this.context.emit('messageRetried', { ...at, retryTopic, level: nextLevel, attempt, error })
@@ -595,7 +666,7 @@ export class Consumer {
     if (subscription.plan.dlqTopic !== undefined) {
       const dlqTopic = subscription.plan.dlqTopic
       tracking[names.deadLetteredAt] = new Date(this.context.clock.now()).toISOString()
-      await this.forward(raw, dlqTopic, tracking)
+      await produceHop(this.context, raw, headers, dlqTopic, 'dead-letter', tracking)
       if (!await this.commit(raw)) return
       this.context.emit('messageFailed', { ...at, error, durationMs, outcome: 'dead-letter' })
       this.context.emit('messageDeadLettered', { ...at, dlqTopic, attempts: attempt, error })
@@ -636,30 +707,10 @@ export class Consumer {
     if (dlqTopics.size !== 1 || dlqTopic === undefined) throw error
     const at = { topic: raw.topic, partition: raw.partition, offset: raw.offset, groupId: this.groupId, correlationId }
     const tracking: MessageHeaders = { ...headers, [names.lastError]: describeError(error), [names.deadLetteredAt]: new Date(this.context.clock.now()).toISOString() }
-    await this.forward(raw, dlqTopic, tracking)
+    await produceHop(this.context, raw, headers, dlqTopic, 'dead-letter', tracking)
     if (!await this.commit(raw)) return
     this.context.emit('messageFailed', { ...at, error, durationMs: 0, outcome: 'dead-letter' })
     this.context.emit('messageDeadLettered', { ...at, dlqTopic, attempts: (retry?.count ?? 0) + 1, error })
-  }
-
-  /**
-   * Re-produces the ORIGINAL bytes (key and value untouched) to the next
-   * topic with the tracking headers, and resolves only after the broker
-   * acknowledged. The offset is committed after this resolves, never
-   * before: a produce that fails leaves the message where it is.
-   */
-  private async forward (raw: RawMessage, topic: string, headers: MessageHeaders): Promise<void> {
-    const record: RawRecord = {
-      topic,
-      key: raw.key,
-      value: raw.value,
-      headers: stampProducer(headers, this.context.headerNames, {
-        clientId: this.context.clientId,
-        at: new Date(this.context.clock.now()),
-        correlationId: this.context.correlationId
-      })
-    }
-    await this.context.producePolicy.execute(() => this.context.adapter.produce([record]))
   }
 
   /** Commits the offset after this message; see `commitAfter` for what a failure means. */

@@ -127,6 +127,20 @@ export interface TopicSpec {
   readonly config?: Record<string, string>
 }
 
+/** The extent of one partition: what is still on it and what comes next. */
+export interface PartitionOffsets extends TopicPartition {
+  /** The first offset still held on the partition. */
+  readonly low: string
+  /** The offset the next record produced gets: the high watermark. */
+  readonly high: string
+}
+
+/** What a group committed on one partition. */
+export interface CommittedOffset extends TopicPartition {
+  /** The committed offset (the next one to read), or null when the group never committed there. */
+  readonly offset: string | null
+}
+
 export interface AdminApi {
   /**
    * Creates the topics that do not exist yet; existing ones are not an error.
@@ -136,6 +150,24 @@ export interface AdminApi {
    */
   createTopics: (topics: readonly TopicSpec[]) => Promise<void>
   topicExists: (topic: string) => Promise<boolean>
+  /**
+   * Optional: the low and high watermarks of every partition of these
+   * topics, in one call so an adapter can ask the broker once. A partition
+   * whose watermarks the broker cannot give yet (no leader serving, right
+   * after the topic was created or during an election) may be left out
+   * rather than waited for; it shows up on a later call. Together with
+   * `fetchCommittedOffsets` it is what `lag()` is computed from; an adapter
+   * without the pair makes `lag()` reject with a ConfigError naming the
+   * capability, and everything else works.
+   */
+  fetchTopicOffsets?: (topics: readonly string[]) => Promise<PartitionOffsets[]>
+  /**
+   * Optional: what `groupId` committed on the partitions of these topics. A
+   * partition the group never committed on may be reported with a null
+   * offset or left out entirely (a broker answers with what it has); the
+   * core treats both the same.
+   */
+  fetchCommittedOffsets?: (groupId: string, topics: readonly string[]) => Promise<CommittedOffset[]>
 }
 
 export interface ClientAdapter {

@@ -22,6 +22,7 @@ interface FakeCalls {
   paused: unknown[]
   resumed: unknown[]
   disconnected: string[]
+  offsetQueries: unknown[]
 }
 
 const fakeClient = (behavior: {
@@ -29,8 +30,11 @@ const fakeClient = (behavior: {
   sendError?: unknown
   createTopicsError?: unknown
   topics?: string[] | (() => string[])
+  topicOffsets?: Array<{ partition: number, offset: string, high: string, low: string }> | (() => Array<{ partition: number, offset: string, high: string, low: string }>)
+  committedOffsets?: Array<{ topic: string, partitions: Array<{ partition: number, offset: string }> }>
+  offsetsError?: unknown
 } = {}): { module: ConfluentClientModule, calls: FakeCalls } => {
-  const calls: FakeCalls = { kafkaConfig: undefined, producerConfig: undefined, consumerConfigs: [], sent: [], committed: [], created: [], runConfig: undefined, paused: [], resumed: [], disconnected: [] }
+  const calls: FakeCalls = { kafkaConfig: undefined, producerConfig: undefined, consumerConfigs: [], sent: [], committed: [], created: [], runConfig: undefined, paused: [], resumed: [], disconnected: [], offsetQueries: [] }
   class Kafka {
     constructor (config: unknown) {
       calls.kafkaConfig = config
@@ -71,7 +75,17 @@ const fakeClient = (behavior: {
           if (behavior.createTopicsError !== undefined) throw behavior.createTopicsError
           return true
         },
-        listTopics: async () => (typeof behavior.topics === 'function' ? behavior.topics() : behavior.topics) ?? []
+        listTopics: async () => (typeof behavior.topics === 'function' ? behavior.topics() : behavior.topics) ?? [],
+        fetchTopicOffsets: async (topic: string, options: unknown) => {
+          calls.offsetQueries.push({ topic, options })
+          if (behavior.offsetsError !== undefined) throw behavior.offsetsError
+          return (typeof behavior.topicOffsets === 'function' ? behavior.topicOffsets() : behavior.topicOffsets) ?? []
+        },
+        fetchOffsets: async (options: unknown) => {
+          calls.offsetQueries.push({ options })
+          if (behavior.offsetsError !== undefined) throw behavior.offsetsError
+          return behavior.committedOffsets ?? []
+        }
       } as unknown as KafkaJS.Admin
     }
   }
@@ -290,6 +304,64 @@ describe('confluentAdapter', () => {
     const adapter3 = confluentAdapter({ client: failingList.module })
     await adapter3.connect(broker)
     await assert.rejects(adapter3.admin.createTopics([{ topic: 't' }]), /metadata timeout/)
+  })
+})
+
+describe('confluentAdapter: offsets', () => {
+  test('maps watermarks and committed offsets, reading a negative committed offset as null', async () => {
+    const { module, calls } = fakeClient({
+      topicOffsets: [{ partition: 0, offset: '7', high: '7', low: '2' }, { partition: 1, offset: '0', high: '0', low: '0' }],
+      committedOffsets: [{ topic: 't', partitions: [{ partition: 0, offset: '5' }, { partition: 1, offset: '-1001' }] }]
+    })
+    const adapter = confluentAdapter({ client: module, adminTimeoutMs: 1_234 })
+    await adapter.connect(broker)
+    assert.deepEqual(await adapter.admin.fetchTopicOffsets?.(['t']), [
+      { topic: 't', partition: 0, low: '2', high: '7' },
+      { topic: 't', partition: 1, low: '0', high: '0' }
+    ])
+    assert.deepEqual(await adapter.admin.fetchCommittedOffsets?.('g', ['t']), [
+      { topic: 't', partition: 0, offset: '5' },
+      { topic: 't', partition: 1, offset: null }
+    ])
+    assert.deepEqual(calls.offsetQueries, [
+      { topic: 't', options: { timeout: 1_234 } },
+      { options: { groupId: 'g', topics: ['t'], timeout: 1_234 } }
+    ])
+  })
+
+  test('a partition without a leader yet answers -1 and is left out; the others are reported', async () => {
+    const { module } = fakeClient({
+      topicOffsets: [{ partition: 0, offset: '4', high: '4', low: '0' }, { partition: 1, offset: '-1', high: '-1', low: '-1' }, { partition: 2, offset: '0', high: '0', low: '-1' }]
+    })
+    const adapter = confluentAdapter({ client: module })
+    await adapter.connect(broker)
+    assert.deepEqual(await adapter.admin.fetchTopicOffsets?.(['t']), [{ topic: 't', partition: 0, low: '0', high: '4' }])
+  })
+
+  test('several topics are asked one client call each and reported together', async () => {
+    const { module, calls } = fakeClient({ topicOffsets: [{ partition: 0, offset: '1', high: '1', low: '0' }] })
+    const adapter = confluentAdapter({ client: module, adminTimeoutMs: 500 })
+    await adapter.connect(broker)
+    assert.deepEqual(await adapter.admin.fetchTopicOffsets?.(['a', 'b']), [
+      { topic: 'a', partition: 0, low: '0', high: '1' },
+      { topic: 'b', partition: 0, low: '0', high: '1' }
+    ])
+    assert.deepEqual(calls.offsetQueries, [{ topic: 'a', options: { timeout: 500 } }, { topic: 'b', options: { timeout: 500 } }])
+  })
+
+  test('offset failures are wrapped as adapter errors with the original as cause', async () => {
+    const { module } = fakeClient({ offsetsError: Object.assign(new Error('metadata timeout'), { code: -185 }) })
+    const adapter = confluentAdapter({ client: module })
+    await adapter.connect(broker)
+    await assert.rejects(adapter.admin.fetchTopicOffsets?.(['t']) as Promise<unknown>, (error: unknown) => {
+      assert.equal((error as { code: string }).code, ERROR_CODES.ADAPTER)
+      assert.match((error as Error).message, /fetchTopicOffsets failed: metadata timeout/)
+      assert.equal((error as { retryable: boolean }).retryable, true)
+      return true
+    })
+    await assert.rejects(adapter.admin.fetchCommittedOffsets?.('g', ['t']) as Promise<unknown>, /fetchOffsets failed: metadata timeout/)
+    await adapter.disconnect()
+    await assert.rejects(adapter.admin.fetchTopicOffsets?.(['t']) as Promise<unknown>, /not connected/)
   })
 })
 

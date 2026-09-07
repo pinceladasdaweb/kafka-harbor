@@ -3,6 +3,18 @@ import { describeError } from './errors'
 import type { HarborErrorEvent } from './context'
 import type { ConsumerHandle, RawMessage, TopicPartitionOffset } from './adapter'
 
+/** An offset as the contract carries it: a non-negative decimal integer. */
+export const OFFSET_PATTERN = /^\d+$/
+
+/**
+ * Records between two offsets of one partition, `to` not included. Offsets
+ * are strings because they outgrow 2^53 on long-lived topics; a distance
+ * between two of them does not, so it comes back as a number.
+ */
+export function offsetDistance (from: string, to: string): number {
+  return Number(BigInt(to) - BigInt(from))
+}
+
 /** The offset to commit once `message` is done: the next one to read, as the contract spells it. */
 export function offsetAfter (message: RawMessage): TopicPartitionOffset {
   return { topic: message.topic, partition: message.partition, offset: (BigInt(message.offset) + 1n).toString() }

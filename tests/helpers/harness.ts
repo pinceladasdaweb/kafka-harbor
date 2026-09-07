@@ -1,4 +1,4 @@
-import { createHarbor, type Harbor, type HarborConfig, type Logger } from '../../src/index'
+import { createHarbor, type Harbor, type HarborConfig, type HarborEvents, type Logger } from '../../src/index'
 import { memoryAdapter, type MemoryAdapter, type MemoryAdapterOptions } from '../../src/testing/index'
 import { ManualClock } from './manual-clock'
 
@@ -40,3 +40,22 @@ export function harness (config: Partial<HarborConfig> = {}, adapterOptions: Mem
 
 export const text = (buffer: Buffer | null): string | null => buffer === null ? null : buffer.toString('utf8')
 export const json = (buffer: Buffer | null): unknown => buffer === null ? null : JSON.parse(buffer.toString('utf8'))
+
+/** Every `error` event the harbor emits from now on, in order. */
+export function captureErrors (harbor: Harbor): Array<HarborEvents['error']> {
+  const errors: Array<HarborEvents['error']> = []
+  harbor.on('error', (event) => { errors.push(event) })
+  return errors
+}
+
+/** A promise a handler can wait on until the test lets it go. */
+export interface Gate {
+  readonly wait: Promise<void>
+  readonly release: () => void
+}
+
+export function gate (): Gate {
+  let release!: () => void
+  const wait = new Promise<void>((resolve) => { release = resolve })
+  return { wait, release }
+}
