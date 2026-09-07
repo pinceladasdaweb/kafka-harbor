@@ -1,5 +1,11 @@
 # CHANGELOG
 
+## 0.3.0 (2026-09-07)
+
+* feat: share retry topics by naming; document the Docker images the Confluent client installs on by Pedro Rogério [View](https://github.com/pinceladasdaweb/kafka-harbor/commit/eec568e239131e69779944ed7f8ed602fcf1e867)
+* docs: explain the duration format every time option accepts by Pedro Rogério [View](https://github.com/pinceladasdaweb/kafka-harbor/commit/4943ff34dd256b339aecf465f21ef71baab00e75)
+
+
 ## 0.2.0 (2026-09-06)
 
 * fix: one member per retry level, bounded shutdown waits, no self-redrive by Pedro Rogério [View](https://github.com/pinceladasdaweb/kafka-harbor/commit/cbc35c9201e1da355b9b31692961ceca49f08770)
