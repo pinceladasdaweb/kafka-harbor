@@ -648,6 +648,153 @@ describe('Consumer: configuration and topics', () => {
   })
 })
 
+describe('Consumer: shared retry topics', () => {
+  const shared = { retry: { levels: [{ delay: 0 }, { delay: 0 }], topicNaming: (_topic: string, level: number) => `svc-retry-${level}` }, dlq: { topicNaming: () => 'svc-dlq' } }
+
+  test('a naming function that returns one name per level makes the retry topics shared, routed by the original-topic header', async () => {
+    const h = harness()
+    const events = capture(h)
+    const seen: string[] = []
+    const consumer = h.harbor.consumer({ groupId: 'g', fromBeginning: true, autoCreateTopics: true, ...shared })
+    consumer.subscribe<string>('orders', (message, ctx) => {
+      seen.push(`orders:${message.value}@${message.topic}#${ctx.attempt}`)
+      if (ctx.attempt === 1) throw new Error('orders first attempt')
+    })
+    consumer.subscribe<string>('payments', (message, ctx) => {
+      seen.push(`payments:${message.value}@${message.topic}#${ctx.attempt}`)
+      if (ctx.attempt < 3) throw new Error('payments first two attempts')
+    })
+    await h.harbor.producer<string>().send('orders', { value: 'o1' })
+    await h.harbor.producer<string>().send('payments', { value: 'p1' })
+    await consumer.start()
+    await until(() => seen.length === 5)
+
+    // One consumption per level, the shared topic once per level; the derived topics created once.
+    const consumptions = h.adapter.calls.filter((call) => call.method === 'consume').map((call) => (call.args[0] as { topics: string[] }).topics)
+    assert.deepEqual(consumptions, [['orders', 'payments'], ['svc-retry-1'], ['svc-retry-2']])
+    const created = (h.adapter.calls.find((call) => call.method === 'createTopics')?.args[0] as Array<{ topic: string }>).map((spec) => spec.topic)
+    assert.deepEqual(created, ['svc-retry-1', 'svc-retry-2', 'svc-dlq'])
+
+    // Each message came back to its own handler, on the shared topics.
+    assert.deepEqual(seen.sort(), [
+      'orders:o1@orders#1',
+      'orders:o1@svc-retry-1#2',
+      'payments:p1@payments#1',
+      'payments:p1@svc-retry-1#2',
+      'payments:p1@svc-retry-2#3'
+    ])
+    assert.equal(h.adapter.messages('svc-retry-1').length, 2)
+    assert.equal(h.adapter.messages('svc-retry-2').length, 1)
+    assert.equal(h.adapter.messages('svc-dlq').length, 0)
+    assert.deepEqual(events.messageRetried.map((e) => e.retryTopic), ['svc-retry-1', 'svc-retry-1', 'svc-retry-2'])
+    assert.equal(events.messageProcessed.length, 2)
+    await h.harbor.shutdown()
+  })
+
+  test('a message on a shared retry topic that names no subscription is dead-lettered when the owners share a DLQ', async () => {
+    const h = harness()
+    const events = capture(h)
+    const consumer = h.harbor.consumer({ groupId: 'g', fromBeginning: true, autoCreateTopics: true, ...shared })
+    let handled = 0
+    consumer.subscribe('orders', () => { handled++ }).subscribe('payments', () => { handled++ })
+    await h.harbor.connect()
+    await consumer.start()
+    const at = new Date(h.clock.now()).toISOString()
+    await h.adapter.produce([
+      { topic: 'svc-retry-1', key: null, value: Buffer.from('1'), headers: { 'x-retry-count': '1', 'x-original-topic': 'invoices', 'x-first-failure-at': at } },
+      { topic: 'svc-retry-1', key: null, value: Buffer.from('2'), headers: {} }
+    ])
+    await h.adapter.whenDrained('g', 'svc-retry-1')
+    assert.equal(handled, 0)
+    const dead = h.adapter.messages('svc-dlq')
+    assert.equal(dead.length, 2)
+    assert.match(String(dead[0]?.headers['x-last-error']), /names "invoices" as its original topic/)
+    assert.equal(dead[0]?.headers['x-original-topic'], 'invoices', 'the tracking headers travel as they are')
+    assert.match(String(dead[1]?.headers['x-last-error']), /names no original topic/)
+    assert.equal(h.adapter.committed('g', 'svc-retry-1', 0), '2')
+    assert.deepEqual(events.messageDeadLettered.map((e) => e.attempts), [2, 1])
+    assert.deepEqual(events.messageDeadLettered.map(({ topic, partition, offset, groupId, dlqTopic }) => ({ topic, partition, offset, groupId, dlqTopic })), [
+      { topic: 'svc-retry-1', partition: 0, offset: '0', groupId: 'g', dlqTopic: 'svc-dlq' },
+      { topic: 'svc-retry-1', partition: 0, offset: '1', groupId: 'g', dlqTopic: 'svc-dlq' }
+    ])
+    assert.deepEqual(events.messageFailed.map((e) => e.outcome), ['dead-letter', 'dead-letter'])
+    assert.equal(consumer.status, 'running')
+    await h.harbor.shutdown()
+  })
+
+  test('an unroutable message whose DLQ commit fails is reported and withheld from the outcome events, like any other', async () => {
+    const h = harness()
+    const events = capture(h)
+    const original = h.adapter.consume
+    h.adapter.consume = async (options) => {
+      const handle = await original(options)
+      handle.commit = async () => { throw new Error('REBALANCE_IN_PROGRESS') }
+      return handle
+    }
+    const consumer = h.harbor.consumer({ groupId: 'g', fromBeginning: true, autoCreateTopics: true, ...shared })
+    consumer.subscribe('orders', () => {}).subscribe('payments', () => {})
+    await h.harbor.connect()
+    await consumer.start()
+    await h.adapter.produce([{ topic: 'svc-retry-1', key: null, value: Buffer.from('1'), headers: { 'x-original-topic': 'invoices' } }])
+    await until(() => h.adapter.messages('svc-dlq').length === 1)
+    await until(() => events.error.length >= 1)
+    assert.match((events.error[0]?.error as Error).message, /REBALANCE_IN_PROGRESS/)
+    assert.equal(events.messageDeadLettered.length, 0)
+    assert.equal(consumer.status, 'running')
+    await h.harbor.shutdown()
+  })
+
+  test('the same message stops the consumer, uncommitted, when the owners of the shared topic have different DLQs', async () => {
+    const h = harness()
+    const events = capture(h)
+    const consumer = h.harbor.consumer({ groupId: 'g', fromBeginning: true, autoCreateTopics: true, retry: shared.retry })
+    consumer.subscribe('orders', () => {}).subscribe('payments', () => {})
+    await h.harbor.connect()
+    await consumer.start()
+    await h.adapter.produce([{ topic: 'svc-retry-1', key: null, value: Buffer.from('1'), headers: { 'x-original-topic': 'invoices' } }])
+    await until(() => consumer.status === 'stopped')
+    assert.equal(consumer.stoppedBecause, 'crash')
+    assert.equal(h.adapter.committed('g', 'svc-retry-1', 0), undefined)
+    assert.equal(h.adapter.messages('orders-dlq').length + h.adapter.messages('payments-dlq').length, 0)
+    assert.match((events.error[0]?.error as Error).message, /shared retry topic "svc-retry-1" names "invoices"/)
+    await h.harbor.shutdown()
+  })
+
+  test('an unshared retry topic keeps trusting its single owner whatever the headers say', async () => {
+    const h = harness()
+    const consumer = h.harbor.consumer({ groupId: 'g', fromBeginning: true, autoCreateTopics: true, retry: { levels: [{ delay: 0 }] } })
+    const seen: string[] = []
+    consumer.subscribe<string>('orders', (message) => { seen.push(message.topic) })
+    await h.harbor.connect()
+    await consumer.start()
+    await h.adapter.produce([{ topic: 'orders-retry-1', key: null, value: Buffer.from('"x"'), headers: { 'x-original-topic': 'somewhere-else' } }])
+    await h.adapter.whenDrained('g', 'orders-retry-1')
+    assert.deepEqual(seen, ['orders-retry-1'])
+    await h.harbor.shutdown()
+  })
+
+  test('a shared name may not cross levels, name an original topic, or be a DLQ the consumer would consume', () => {
+    const h = harness()
+    // Level 1 of payments named like level 2 of orders.
+    assert.throws(() => h.harbor.consumer({ groupId: 'g', retry: { levels: [{ delay: 0 }, { delay: 0 }], topicNaming: (topic, level) => topic === 'payments' && level === 1 ? 'orders-retry-2' : `${topic}-retry-${level}` } })
+      .subscribe('orders', () => {}).subscribe('payments', () => {}), /is level 1 of "payments" but level 2 of "orders"/)
+    // A retry topic named like another subscription's original topic, from either side of the subscribe order.
+    const retryOnPayments = { levels: [{ delay: 0 }], topicNaming: (topic: string, level: number) => topic === 'orders' ? 'payments' : `${topic}-retry-${level}` }
+    assert.throws(() => h.harbor.consumer({ groupId: 'g', retry: retryOnPayments })
+      .subscribe('orders', () => {}).subscribe('payments', () => {}), /claimed by both "orders" and "payments"/)
+    assert.throws(() => h.harbor.consumer({ groupId: 'g', retry: retryOnPayments })
+      .subscribe('payments', () => {}).subscribe('orders', () => {}), /is level 1 of "orders" but the original topic of "payments"/)
+    // A DLQ that is also consumed, from either side of the subscribe order.
+    const dlqOnPayments = { topicNaming: (topic: string) => topic === 'orders' ? 'payments' : `${topic}-dlq` }
+    assert.throws(() => h.harbor.consumer({ groupId: 'g', dlq: dlqOnPayments })
+      .subscribe('payments', () => {}).subscribe('orders', () => {}), /produced "payments" for "orders", a topic this consumer already consumes/)
+    assert.throws(() => h.harbor.consumer({ groupId: 'g', dlq: dlqOnPayments })
+      .subscribe('orders', () => {}).subscribe('payments', () => {}), /is the DLQ of "orders" and would be consumed through "payments"/)
+    // The plain collision still reads the same.
+    assert.throws(() => h.harbor.consumer({ groupId: 'g' }).subscribe('orders', () => {}).subscribe('orders', () => {}), /claimed by both "orders" and "orders"/)
+  })
+})
+
 describe('Consumer: review regressions', () => {
   test('a stop that begins while start() is joining the group closes the membership and start() rejects as closed', async () => {
     // Regression: stop() during 'starting' used to return early with no

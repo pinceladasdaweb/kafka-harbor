@@ -41,6 +41,7 @@ harbor.enableSignalHandlers()        // SIGTERM -> finish in-flight handlers, co
 - [What it does not do](#what-it-does-not-do)
 - [Install](#install)
 - [Core concepts](#core-concepts)
+- [Durations](#durations)
 - [Producer](#producer)
 - [Consumer](#consumer)
 - [Retry topics and the DLQ](#retry-topics-and-the-dlq)
@@ -83,11 +84,10 @@ The design principle behind every decision: **losing a message is never the defa
 ### What it does not do
 
 - **At-least-once only.** Duplicates are possible after a crash between handler and commit, a rebalance mid-handler, or an abandoned shutdown; [docs/delivery-semantics.md](docs/delivery-semantics.md) lists every case. Exactly-once effects come from deduplicating in the handler by a business key.
-- **One retry ladder per topic.** Three levels times twenty topics is sixty topics. A shared retry topic per service is not in 1.0.
 - **A retry delay must fit under the poll interval** (`maxProcessingTime`, default 5 minutes), because the retry consumer waits the delay before the handler runs. The Confluent adapter sets the client's `max.poll.interval.ms` from it; a longer ladder needs a longer `maxProcessingTime`.
 - **Retry breaks ordering.** A message that goes through a retry topic is processed after later messages on the original topic. The alternative, blocking the partition until it succeeds, is what `harbor.abort()` gives you.
 - **Durations top out at about 24.8 days** (`2147483647` ms), the longest a timer can hold. A longer shutdown timeout or retry delay is a `ConfigError`, not a wait that ends after a millisecond.
-- **The default adapter has a native dependency.** `@confluentinc/kafka-javascript` ships prebuilt binaries for Node 22 and 24 on Linux (glibc and musl) and macOS; Node 26 compiles librdkafka at install. Any other client can be plugged in through `ClientAdapter`.
+- **The default adapter has a native dependency.** `@confluentinc/kafka-javascript` ships prebuilt binaries for Node 18 to 24 on Linux (glibc and musl, x64 and arm64), macOS and Windows; on Node 26 it compiles librdkafka at install and needs a build toolchain in the image. [Docker images](#docker-images) lists what was verified. Any other client can be plugged in through `ClientAdapter`.
 - **No transactions, no batch handlers, no metrics exporters.** Observability is the typed event stream; wire it to the collector you use.
 
 ## Install
@@ -96,7 +96,54 @@ The design principle behind every decision: **losing a message is never the defa
 npm install kafka-harbor @confluentinc/kafka-javascript
 ```
 
-The Confluent client is a peer dependency: install it when you use `kafka-harbor/adapters/confluent`. It ships prebuilt binaries for Node 18 to 24 on Linux (glibc and musl) and macOS; on Node 26 it compiles librdkafka from source at install time. Node.js >= 22 is required by kafka-harbor itself.
+The Confluent client is a peer dependency: install it when you use `kafka-harbor/adapters/confluent`. Node.js >= 22 is required by kafka-harbor itself.
+
+### Docker images
+
+`@confluentinc/kafka-javascript` 1.10 downloads a prebuilt binary at install time when one exists for the platform, and compiles librdkafka from source otherwise. Its release publishes binaries for Node 18, 20, 21, 22, 23 and 24 (ABI 108 to 137) on Linux glibc and musl (x64 and arm64), macOS (x64 and arm64) and Windows (x64). There is no binary for Node 26 (ABI 147).
+
+What was verified with `npm install @confluentinc/kafka-javascript@1.10.0` followed by loading the module, on 2026-09-06:
+
+| Image | linux/arm64 | linux/amd64 | Outcome |
+|---|---|---|---|
+| `node:22-bookworm-slim` | yes | yes | prebuilt binary, no toolchain needed |
+| `node:22-alpine` | yes | | prebuilt binary (musl), no toolchain needed |
+| `node:24-bookworm-slim` | yes | | prebuilt binary, no toolchain needed |
+| `node:24-alpine` | yes | yes | prebuilt binary (musl), no toolchain needed |
+| `node:26-bookworm-slim` | yes | | **install fails**: no binary, and the image has no compiler |
+| `node:26-bookworm` | yes | | **install fails**: the build downloads zlib, OpenSSL, zstd and libcurl sources and the image has no `curl` or `wget` |
+| `node:26-bookworm-slim` + `librdkafka-dev` from Confluent's apt repository, `CKJS_LINKING=dynamic BUILD_LIBRDKAFKA=0` | yes | | **works**, install in 78s: the binding links against the system librdkafka 2.15.0 instead of compiling one |
+| `node:26-alpine` + `librdkafka-dev` from Alpine's own repository, `CKJS_LINKING=dynamic BUILD_LIBRDKAFKA=0` | yes | | **works**, install in about 2 minutes: links against Alpine's librdkafka 2.14.1 |
+| `node:26-bookworm-slim` and `node:26-alpine` with a compiler, `python3`, `make`, `curl`, `perl` and `patch`, default static build | yes | | **install fails** after about 10 minutes of compiling: `ar: /probe/node_modules/: file format not recognized` while merging `librdkafka-static.a` |
+
+Confluent tracks Node 26 prebuilt binaries in [confluentinc/confluent-kafka-javascript#397](https://github.com/confluentinc/confluent-kafka-javascript/issues/397). Until they ship, the route that works on Node 26 is the one the client documents for unsupported platforms: link the binding dynamically against a librdkafka installed from a package repository, instead of letting the install compile librdkafka and its dependencies statically. Debian:
+
+```dockerfile
+FROM node:26-bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends curl gnupg ca-certificates python3 make g++ pkg-config \
+ && install -d /etc/apt/keyrings \
+ && curl -fsSL https://packages.confluent.io/deb/8.0/archive.key | gpg --dearmor -o /etc/apt/keyrings/confluent.gpg \
+ && echo "deb [signed-by=/etc/apt/keyrings/confluent.gpg] https://packages.confluent.io/clients/deb bookworm main" > /etc/apt/sources.list.d/confluent-clients.list \
+ && apt-get update && apt-get install -y --no-install-recommends librdkafka-dev \
+ && rm -rf /var/lib/apt/lists/*
+ENV CKJS_LINKING=dynamic BUILD_LIBRDKAFKA=0
+COPY package*.json ./
+RUN npm ci
+```
+
+Alpine, whose own repository carries a recent librdkafka:
+
+```dockerfile
+FROM node:26-alpine
+RUN apk add --no-cache python3 make g++ pkgconfig librdkafka-dev
+ENV CKJS_LINKING=dynamic BUILD_LIBRDKAFKA=0
+COPY package*.json ./
+RUN npm ci
+```
+
+The runtime image then needs the shared library the binding was linked against (`librdkafka1` from the Confluent repository on Debian, `librdkafka` on Alpine), not the compiler; a multi-stage build copies `node_modules` from the build stage. `librdkafka-dev` from Debian's own repository is older than what the client bundles; the Confluent repository carries the matching one. On Node 22 and 24 none of this is needed: the prebuilt binary is downloaded and the official images work as they are.
+
+The default static build, the one `npm install` attempts on its own when no binary exists, cannot complete on Linux from an npm install: librdkafka merges its static dependencies with a GNU `ar` MRI script (`ADDLIB /path/to/lib.a`), and GNU `ar` (binutils 2.40 verified) cuts such a path at an `@`, which every scoped package path (`node_modules/@confluentinc/...`) contains. The same script with the `@` removed from the path succeeds. macOS builds from source because Apple's `libtool` is used there instead of `ar`, which is why a Node 26 install works on a Mac with Xcode's command line tools and fails in a Linux container with the same toolchain. Any other client can be plugged in through `ClientAdapter`, without a native dependency.
 
 ## Core concepts
 
@@ -105,6 +152,20 @@ The Confluent client is a peer dependency: install it when you use `kafka-harbor
 - **Consumer**: `harbor.consumer({ groupId })`. One consumer group, one or more topics, one handler per topic. Owns the retry ladder and the DLQ for each topic it subscribes to.
 - **Adapter**: the client behind it all. Explicit in the config so that the core has no dependency on any client.
 - **Message**: what the handler receives. Deserialized value, string key, string headers, `Date` timestamp, and `retry` metadata when it came through a retry topic.
+
+### Durations
+
+Every option that is a span of time (`shutdown()`, `enableSignalHandlers()`, `maxProcessingTime`, the `delay` of a retry level, the redrive `idleTimeout`) takes a number of milliseconds or a string with a unit:
+
+| Suffix | Unit | Example |
+|---|---|---|
+| `ms` | milliseconds | `'250ms'` |
+| `s` | seconds | `'30s'` |
+| `m` | minutes | `'1m'`, `'1.5m'` |
+| `h` | hours | `'2h'` |
+| `d` | days | `'1d'` |
+
+Decimals are accepted, a space before the unit is tolerated, and a bare number in a string (`'30'`) is refused: it is more likely a forgotten unit than thirty milliseconds. The ceiling is `2147483647` ms, about 24.8 days, the longest a timer can hold; anything above is a `ConfigError` at the call, never a wait that ends a millisecond later. `parseDuration()` and `MAX_DURATION_MS` are exported for code that wants the same rule.
 
 ## Producer
 
@@ -218,7 +279,7 @@ Things to know:
 - **Each retry level is a group member of its own.** A consumer with two levels joins its group three times: once for the original topics, once per level. A message sleeping out its delay on `orders-retry-2` never holds a worker that `orders` or `orders-retry-1` is waiting for, whatever `concurrency` is. Kafka assigns each topic among the members subscribed to it, so the members of one group may consume different topics.
 - **Retention must exceed the delay.** A message with a 1h delay on a topic with 30 minutes of retention is a lost message. `topicDefaults` and your own topic configs are yours to set accordingly.
 - **Naming uses hyphens** (`orders-retry-1`, `orders-dlq`), the same as Spring Kafka's defaults, because Kafka warns that `.` and `_` collide in metric names. Both naming functions are configurable.
-- **One ladder per topic.** Three levels times twenty topics is sixty retry topics. A shared retry topic per service is a possible future mode; it is not in 1.0.
+- **One ladder per topic by default; share it by naming.** Three levels times twenty topics is sixty retry topics. A naming function that returns one name per level makes that level's topic shared by every subscription of the consumer, and a DLQ naming function that returns one name shares the DLQ: `retry: { topicNaming: (_topic, level) => \`orders-service-retry-${level}\` }, dlq: { topicNaming: () => 'orders-service-dlq' }` turns sixty topics into four. On a shared topic the `x-original-topic` header decides which handler a message belongs to, so the delay of a level stays the same for every topic on it. A message there whose header names a topic the consumer does not subscribe to goes to the shared DLQ (the consumer stops instead when the owners have different DLQs). A shared name may not cross levels or name a topic the consumer consumes; both are `ConfigError` at `subscribe()`.
 - With no levels configured (the default), a failure goes straight to the DLQ.
 
 ### Draining the DLQ back into service
