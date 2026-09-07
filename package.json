@@ -1,6 +1,6 @@
 {
   "name": "kafka-harbor",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "The application layer that Kafka clients don't give you: retry topics, DLQ, graceful shutdown, serialization and observability for Node.js. Client-agnostic by design.",
   "keywords": [
     "kafka",

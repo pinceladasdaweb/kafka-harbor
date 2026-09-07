@@ -1,5 +1,10 @@
 # CHANGELOG
 
+## 0.4.0 (2026-09-07)
+
+* feat: observability: lag, instrumentation hooks, Prometheus and OpenTelemetry entry points by Pedro Rogério [View](https://github.com/pinceladasdaweb/kafka-harbor/commit/5a5d5e09f712e9a725aa628ee997e8b5bfda3f32)
+
+
 ## 0.3.0 (2026-09-07)
 
 * feat: share retry topics by naming; document the Docker images the Confluent client installs on by Pedro Rogério [View](https://github.com/pinceladasdaweb/kafka-harbor/commit/eec568e239131e69779944ed7f8ed602fcf1e867)
