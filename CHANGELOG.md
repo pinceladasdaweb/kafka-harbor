@@ -1,5 +1,11 @@
 # CHANGELOG
 
+## 0.6.0 (2026-09-13)
+
+* feat: schema registry serializer, and serializers may be asynchronous by Pedro Rogério [View](https://github.com/pinceladasdaweb/kafka-harbor/commit/a4a73673eb0cf999b366887b2d84040c70830011)
+* feat: decorators for listener classes and a NestJS module by Pedro Rogério [View](https://github.com/pinceladasdaweb/kafka-harbor/commit/8ceebf95701d57524360e120c9c9d16e884c10fa)
+
+
 ## 0.5.0 (2026-09-13)
 
 * chore(deps-dev): bump @types/node from 26.4.1 to 26.5.0 by dependabot[bot] [View](https://github.com/pinceladasdaweb/kafka-harbor/commit/3c7885862446c9bdaa77e5d6fee1e5f5d52f9903)
