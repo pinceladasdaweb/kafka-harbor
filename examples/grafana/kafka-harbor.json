@@ -73,6 +73,11 @@
           "refId": "A",
           "expr": "sum by (group, topic) (rate(kafka_harbor_messages_processed_total{group=~\"$group\", topic=~\"$topic\"}[$__rate_interval]))",
           "legendFormat": "{{group}} {{topic}}"
+        },
+        {
+          "refId": "B",
+          "expr": "sum by (group, topic) (rate(kafka_harbor_messages_replayed_total{group=~\"$group\", topic=~\"$topic\"}[$__rate_interval]))",
+          "legendFormat": "{{group}} {{topic}} replayed"
         }
       ],
       "fieldConfig": {

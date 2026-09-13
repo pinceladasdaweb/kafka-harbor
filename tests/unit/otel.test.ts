@@ -9,7 +9,7 @@ import { BasicTracerProvider, InMemorySpanExporter, SimpleSpanProcessor } from '
 
 import { ERROR_CODES } from '../../src/index'
 import { otelMetrics, otelTracing } from '../../src/otel/index'
-import { captureErrors, gate, harness, silentLogger } from '../helpers/harness'
+import { captureErrors, captureEvents, gate, harness, silentLogger } from '../helpers/harness'
 import { until } from '../helpers/manual-clock'
 
 const metering = () => {
@@ -62,6 +62,46 @@ describe('kafka-harbor/otel metrics', () => {
     await h.harbor.shutdown()
     assert.equal(await m.point('kafka_harbor.consumer.stops', { 'kafka_harbor.group': 'g', 'kafka_harbor.reason': 'shutdown' }), 1)
     metrics.detach()
+    await m.shutdown()
+  })
+
+  test('a batch is one duration observation in its own histogram; its messages count without a duration of their own', async () => {
+    const h = harness()
+    const m = metering()
+    otelMetrics(h.harbor, { meterProvider: m.provider, lag: false })
+    const processed = captureEvents(h.harbor, 'messageProcessed')
+    const consumer = h.harbor.consumer({ groupId: 'g', fromBeginning: true, autoCreateTopics: true })
+    consumer.subscribeBatch('orders', () => { h.clock.advance(400) }, { size: 3 })
+    await consumer.start()
+    await h.harbor.producer().sendBatch('orders', [{ value: 1 }, { value: 2 }, { value: 3 }])
+    await until(() => processed.length === 3)
+    assert.equal(await m.point('kafka_harbor.messages.processed', { 'kafka_harbor.group': 'g' }), 3)
+    assert.equal((await m.points('kafka_harbor.message.processing.duration')).length, 0)
+    assert.equal(await m.point('kafka_harbor.batches.processed', { 'kafka_harbor.topic': 'orders', 'kafka_harbor.outcome': 'processed' }), 1)
+    const duration = (await m.points('kafka_harbor.batch.processing.duration'))[0] as unknown as { value: { sum: number, count: number } }
+    assert.deepEqual([duration.value.count, duration.value.sum], [1, 0.4])
+    await h.harbor.shutdown()
+    await m.shutdown()
+  })
+
+  test('a replay counts as processed and as replayed', async () => {
+    const h = harness()
+    const m = metering()
+    otelMetrics(h.harbor, { meterProvider: m.provider, lag: false })
+    let first = true
+    const consumer = h.harbor.consumer({
+      groupId: 'g',
+      fromBeginning: true,
+      autoCreateTopics: true,
+      idempotency: { engine: { async executeWithMetadata (_input, run) { const replayed = !first; first = false; return { value: await run(), replayed } } } }
+    })
+    consumer.subscribe('orders', () => {})
+    await consumer.start()
+    await h.harbor.producer().sendBatch('orders', [{ value: 1 }, { value: 2 }])
+    await h.adapter.whenDrained('g', 'orders')
+    assert.equal(await m.point('kafka_harbor.messages.processed', { 'kafka_harbor.group': 'g', 'kafka_harbor.topic': 'orders' }), 2)
+    assert.equal(await m.point('kafka_harbor.messages.replayed', { 'kafka_harbor.group': 'g', 'kafka_harbor.topic': 'orders' }), 1)
+    await h.harbor.shutdown()
     await m.shutdown()
   })
 
@@ -291,6 +331,32 @@ describe('kafka-harbor/otel tracing', () => {
     await h.adapter.whenDrained('g', 'orders')
     assert.equal(h.adapter.messages('orders')[0]?.headers.baggage, 'tenant=acme')
     assert.deepEqual(seen, ['acme'])
+    await h.harbor.shutdown()
+  })
+
+  test('a batch handler gets one consumer span linked to every message\'s producer span', async () => {
+    const { exporter, instrumentation } = tracing()
+    const h = harness({ instrumentation })
+    const processed: unknown[] = []
+    h.harbor.on('messageProcessed', (event) => { processed.push(event) })
+    const consumer = h.harbor.consumer({ groupId: 'g', fromBeginning: true, autoCreateTopics: true })
+    consumer.subscribeBatch('orders', () => {}, { size: 2 })
+    await consumer.start()
+    const producer = h.harbor.producer()
+    await producer.send('orders', { value: 1 })
+    await producer.send('orders', { value: 2 })
+    await until(() => processed.length === 2)
+    const spans = exporter.getFinishedSpans()
+    const sends = spans.filter((span) => span.name === 'orders send')
+    const process = spans.find((span) => span.name === 'orders process')
+    assert.equal(sends.length, 2)
+    assert.ok(process !== undefined)
+    assert.equal(process.kind, SpanKind.CONSUMER)
+    assert.equal(process.parentSpanContext, undefined, 'no single parent')
+    assert.deepEqual(process.links.map((link) => link.context.spanId).sort(), sends.map((span) => span.spanContext().spanId).sort())
+    assert.equal(process.attributes['messaging.batch.message_count'], 2)
+    assert.equal(process.attributes['messaging.consumer.group.name'], 'g')
+    assert.equal(process.attributes['messaging.destination.partition.id'], '0')
     await h.harbor.shutdown()
   })
 

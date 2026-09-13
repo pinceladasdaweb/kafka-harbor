@@ -9,6 +9,8 @@
  * type guards below therefore check `code`, not the prototype chain, and
  * they are the supported way to branch on an error.
  */
+import type { Message } from './types'
+
 export const ERROR_CODES = {
   /** The configuration passed to the library is invalid. */
   CONFIG_INVALID: 'CONFIG_INVALID',
@@ -23,7 +25,9 @@ export const ERROR_CODES = {
   /** An operation was attempted on a harbor that is shutting down or closed. */
   CLOSED: 'CLOSED',
   /** Handlers were still running when the shutdown timeout elapsed. */
-  SHUTDOWN_TIMEOUT: 'SHUTDOWN_TIMEOUT'
+  SHUTDOWN_TIMEOUT: 'SHUTDOWN_TIMEOUT',
+  /** A batch handler named the messages of its batch that failed (`BatchFailedError`). */
+  BATCH_FAILED: 'BATCH_FAILED'
 } as const
 
 export type HarborErrorCode = (typeof ERROR_CODES)[keyof typeof ERROR_CODES]
@@ -70,6 +74,22 @@ export class SerializationError extends HarborError {
 export class AbortProcessingError extends HarborError {
   constructor (cause: unknown) {
     super(ERROR_CODES.ABORT_PROCESSING, 'handler aborted processing; the offset was not committed', { cause })
+  }
+}
+
+/**
+ * Thrown by a batch handler (`subscribeBatch`) to fail SOME of its
+ * messages: the ones named walk the retry ladder with `cause` as their
+ * error, the rest of the batch counts as processed, and the batch's offset
+ * is committed once as usual. Throwing anything else fails the whole batch.
+ */
+export class BatchFailedError extends HarborError {
+  /** The messages of the batch that failed, as the handler received them. */
+  readonly failed: readonly Message[]
+
+  constructor (failed: readonly Message[], cause: unknown) {
+    super(ERROR_CODES.BATCH_FAILED, `${failed.length} of the batch's messages failed: ${describeError(cause)}`, { cause, retryable: isRetryable(cause) })
+    this.failed = failed
   }
 }
 
@@ -122,6 +142,9 @@ export const isTopicMissingError = (error: unknown): error is TopicMissingError 
 
 export const isShutdownTimeoutError = (error: unknown): error is ShutdownTimeoutError =>
   hasCode(error, ERROR_CODES.SHUTDOWN_TIMEOUT)
+
+export const isBatchFailedError = (error: unknown): error is BatchFailedError =>
+  hasCode(error, ERROR_CODES.BATCH_FAILED) && Array.isArray((error as { failed?: unknown }).failed)
 
 /**
  * The default retry predicate: every error is retried unless it says

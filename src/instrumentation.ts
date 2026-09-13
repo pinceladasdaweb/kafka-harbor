@@ -1,5 +1,5 @@
 import { describeError } from './errors'
-import type { HandlerContext } from './consumer'
+import type { BatchContext, HandlerContext } from './consumer'
 import type { Logger, Message, MessageHeaders } from './types'
 
 /**
@@ -58,6 +58,12 @@ export interface Instrumentation {
    * handler's span to the producer's, however many retry hops lie between.
    */
   wrapHandler?: <T>(message: Message, context: HandlerContext, run: () => Promise<T>) => Promise<T>
+  /**
+   * Wraps one batch handler invocation (`subscribeBatch`). The messages
+   * carry the headers their producers wrote; a tracing integration links
+   * the batch span to each of them.
+   */
+  wrapBatchHandler?: <T>(messages: readonly Message[], context: BatchContext, run: () => Promise<T>) => Promise<T>
 }
 
 /**

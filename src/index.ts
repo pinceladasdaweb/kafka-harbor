@@ -18,6 +18,8 @@ export type { ConsumerHealth, ExposedHarborConfig, HarborConfig, HarborEvents, H
 export type { CoreContext, HarborErrorEvent } from './context'
 
 export type { Instrumentation, OutgoingRecord, ProduceBatch, ProduceKind } from './instrumentation'
+export { defaultIdempotencyKey } from './idempotency'
+export type { IdempotencyEngine, IdempotencyInput, IdempotencyOptions } from './idempotency'
 export type { ProduceEvents, ProducedEvent } from './produce'
 
 export type { RedriveEvents, RedriveOptions, RedriveResult } from './redrive'
@@ -27,6 +29,8 @@ export type { ProducerContext, ProducerEvents, ProducerOptions, ProducerRetryOpt
 
 export { Consumer } from './consumer'
 export type {
+  BatchContext,
+  BatchHandler,
   ConsumerContext,
   ConsumerDlqOptions,
   ConsumerEvents,
@@ -38,6 +42,7 @@ export type {
   HandlerContext,
   PartitionLag,
   StopReason,
+  SubscribeBatchOptions,
   SubscribeOptions,
   TopicDefaults
 } from './consumer'
@@ -46,6 +51,7 @@ export type { Clock, Duration, MessageHeaders, Logger, Message, OutgoingMessage,
 
 export {
   AbortProcessingError,
+  BatchFailedError,
   AdapterError,
   ClosedError,
   ConfigError,
@@ -56,6 +62,7 @@ export {
   TopicMissingError,
   describeError,
   isAbortProcessingError,
+  isBatchFailedError,
   isHarborError,
   isRetryable,
   isSerializationError,

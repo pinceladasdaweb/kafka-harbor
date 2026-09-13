@@ -43,9 +43,14 @@ export const json = (buffer: Buffer | null): unknown => buffer === null ? null :
 
 /** Every `error` event the harbor emits from now on, in order. */
 export function captureErrors (harbor: Harbor): Array<HarborEvents['error']> {
-  const errors: Array<HarborEvents['error']> = []
-  harbor.on('error', (event) => { errors.push(event) })
-  return errors
+  return captureEvents(harbor, 'error')
+}
+
+/** Every event of one kind the harbor emits from now on, in order. */
+export function captureEvents<K extends keyof HarborEvents> (harbor: Harbor, event: K): Array<HarborEvents[K]> {
+  const events: Array<HarborEvents[K]> = []
+  harbor.on(event, (payload) => { events.push(payload) })
+  return events
 }
 
 /** A promise a handler can wait on until the test lets it go. */

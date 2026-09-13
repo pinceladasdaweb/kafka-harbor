@@ -75,9 +75,28 @@ export function prometheusMetrics (harbor: Harbor, options: PrometheusMetricsOpt
     labelNames: ['group', 'topic'],
     registers
   })
+  const replayed = new Counter({
+    name: `${prefix}messages_replayed_total`,
+    help: 'Messages whose handler did not run because the idempotency engine replayed an earlier outcome; counted in messages_processed_total too.',
+    labelNames: ['group', 'topic'],
+    registers
+  })
   const processingDuration = new Histogram({
     name: `${prefix}message_processing_duration_seconds`,
-    help: 'Handler duration by outcome (processed, retry, dead-letter, abort, crash), retry delays excluded.',
+    help: 'Handler duration per message by outcome (processed, retry, dead-letter, abort, crash), retry delays excluded; messages handled in a batch are measured by batch_processing_duration_seconds instead.',
+    labelNames: ['group', 'topic', 'outcome'],
+    buckets,
+    registers
+  })
+  const batches = new Counter({
+    name: `${prefix}batches_processed_total`,
+    help: 'Batch handler runs (subscribeBatch) by outcome: processed, retry, dead-letter, abort or crash.',
+    labelNames: ['group', 'topic', 'outcome'],
+    registers
+  })
+  const batchDuration = new Histogram({
+    name: `${prefix}batch_processing_duration_seconds`,
+    help: 'Batch handler duration by outcome; the messages of the batch are counted in messages_processed_total and messages_failed_total.',
     labelNames: ['group', 'topic', 'outcome'],
     buckets,
     registers
@@ -154,11 +173,16 @@ export function prometheusMetrics (harbor: Harbor, options: PrometheusMetricsOpt
   const listeners: Listeners<HarborEvents> = {
     messageProcessed: (event) => {
       processed.inc({ group: event.groupId, topic: event.topic })
-      processingDuration.observe({ group: event.groupId, topic: event.topic, outcome: 'processed' }, event.durationMs / 1_000)
+      if (event.replayed) replayed.inc({ group: event.groupId, topic: event.topic })
+      if (event.batch === undefined) processingDuration.observe({ group: event.groupId, topic: event.topic, outcome: 'processed' }, event.durationMs / 1_000)
     },
     messageFailed: (event) => {
       failed.inc({ group: event.groupId, topic: event.topic, outcome: event.outcome })
-      processingDuration.observe({ group: event.groupId, topic: event.topic, outcome: event.outcome }, event.durationMs / 1_000)
+      if (event.batch === undefined) processingDuration.observe({ group: event.groupId, topic: event.topic, outcome: event.outcome }, event.durationMs / 1_000)
+    },
+    batchProcessed: (event) => {
+      batches.inc({ group: event.groupId, topic: event.topic, outcome: event.outcome })
+      batchDuration.observe({ group: event.groupId, topic: event.topic, outcome: event.outcome }, event.durationMs / 1_000)
     },
     messageRetried: (event) => { retried.inc({ group: event.groupId, topic: event.topic, level: String(event.level) }) },
     messageDeadLettered: (event) => { deadLettered.inc({ group: event.groupId, topic: event.topic }) },

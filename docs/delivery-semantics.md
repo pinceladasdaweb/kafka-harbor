@@ -34,6 +34,17 @@ Nothing else commits. In particular:
 The consumer stopping is the loud failure. It is never the default; it is
 what remains when every safe destination is unavailable.
 
+## Batches
+
+`subscribeBatch` moves the offset once per batch, after the last message
+of the batch, and only once the batch resolved or every failed message of
+it was forwarded and acknowledged. Nothing in a batch is committed before
+the batch is done, so a crash mid-batch redelivers the whole batch: at-
+least-once at the batch's grain. A batch still collecting when the
+consumer stops was never committed and comes back to the next member; one
+collecting when a partition is taken away runs before the partition is
+released, the way a running handler does.
+
 ## Stopping on purpose
 
 `harbor.abort()` and the no-destination-left case stop the consumer. With
@@ -74,9 +85,14 @@ At-least-once means these can happen and your handler should tolerate them:
   retry topic *and* gets redelivered from the source, so the handler sees it
   twice (once per topic) and both copies walk the ladder.
 
-For exactly-once *effects* on top of at-least-once *delivery*, deduplicate
-in the handler by a business key, or by `topic:partition:offset` when the
-message has no natural one.
+For exactly-once *effects* on top of at-least-once *delivery*, run the
+handler through an idempotency engine (`consumer({ idempotency })`, see the
+README). The default key, `groupId:topic:partition:offset`, collapses a
+redelivery whose first run completed; one that arrives while the first run
+is still executing is a conflict the engine's policy decides (quayside's
+`onConflict: 'wait'` waits and replays). The last case is two deliveries
+with two keys; a business key collapses that one too, and the duplicates
+the producer sent.
 
 ## Retry delays
 

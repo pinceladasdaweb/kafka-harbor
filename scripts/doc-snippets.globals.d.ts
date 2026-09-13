@@ -24,6 +24,9 @@ declare global {
   const schema: unknown
 
   function fulfill (order: Order): Promise<void>
+  function bulkInsert (orders: Order[]): Promise<void>
+  const failedMessages: Array<import('kafka-harbor').Message>
+  const cause: Error
   function avroSerializer (schema: unknown): Serializer<OrderEvent>
   function protobufSerializer (type: typeof Payment): Serializer<Payment>
   function encode (value: MyType): Buffer
@@ -33,6 +36,8 @@ declare global {
   function randomUUID (): string
 
   const onOrder: Handler<Order>
+  const handleOrder: Handler<Order>
+  const redis: never
   const onPayment: Handler<Payment>
   const handler: Handler<string>
   const asyncLocalStorage: AsyncLocalStorage<{ requestId: string }>
