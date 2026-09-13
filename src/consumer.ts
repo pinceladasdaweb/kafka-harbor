@@ -766,7 +766,10 @@ export class Consumer {
     let error: unknown
     let replayed = false
     try {
-      const message = toMessage(raw, headers, subscription.serializer, subscription.plan.original, retry)
+      const message = await toMessage(raw, headers, subscription.serializer, subscription.plan.original, retry)
+      // Decoding may take a while (a schema registry); a shutdown that gave
+      // up meanwhile must not see the handler start on a stopped consumer.
+      if (this.shutdownController.signal.aborted) return
       const handlerContext: HandlerContext = {
         groupId: this.groupId,
         correlationId,
@@ -963,15 +966,17 @@ export class Consumer {
     const failures = new Map<Pending, unknown>()
     const messages: Message[] = []
     const decoded: Pending[] = []
+    // Decoding counts as processing, as it does for a single message.
+    const startedAt = this.context.clock.now()
     for (const item of items) {
       try {
-        messages.push(toMessage(item.raw, item.headers, subscription.serializer, subscription.plan.original, item.retry))
+        messages.push(await toMessage(item.raw, item.headers, subscription.serializer, subscription.plan.original, item.retry))
         decoded.push(item)
       } catch (error) {
         failures.set(item, error)
       }
     }
-    const startedAt = this.context.clock.now()
+    if (this.shutdownController.signal.aborted) return
     let error: unknown
     if (messages.length > 0) {
       const wrapBatch = this.context.instrumentation?.wrapBatchHandler

@@ -81,6 +81,16 @@
         "types": "./dist/otel.d.cts",
         "default": "./dist/otel.cjs"
       }
+    },
+    "./schema-registry": {
+      "import": {
+        "types": "./dist/schema-registry.d.ts",
+        "default": "./dist/schema-registry.mjs"
+      },
+      "require": {
+        "types": "./dist/schema-registry.d.cts",
+        "default": "./dist/schema-registry.cjs"
+      }
     }
   },
   "files": [
@@ -123,11 +133,15 @@
   },
   "peerDependencies": {
     "@confluentinc/kafka-javascript": "^1.10.0",
+    "@confluentinc/schemaregistry": "^1.10.0",
     "@opentelemetry/api": "^1.9.0",
     "prom-client": "^15.0.0"
   },
   "peerDependenciesMeta": {
     "@confluentinc/kafka-javascript": {
+      "optional": true
+    },
+    "@confluentinc/schemaregistry": {
       "optional": true
     },
     "@opentelemetry/api": {
@@ -141,6 +155,7 @@
     "@commitlint/cli": "^21.2.2",
     "@commitlint/config-conventional": "^21.2.2",
     "@confluentinc/kafka-javascript": "^1.10.0",
+    "@confluentinc/schemaregistry": "^1.10.1",
     "@microsoft/api-extractor": "^7.59.0",
     "@opentelemetry/api": "^1.9.1",
     "@opentelemetry/context-async-hooks": "^2.11.0",

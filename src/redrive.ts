@@ -2,11 +2,11 @@ import { toMessage } from './message'
 import { commitAfter } from './commit'
 import { parseDuration } from './duration'
 import type { Serializer } from './serializer'
+import { decodeHeaders, readRetryInfo } from './headers'
 import { produceHop, type ProduceEvents } from './produce'
+import type { ConsumerHandle, RawMessage } from './adapter'
 import type { CoreContext, HarborErrorEvent } from './context'
 import type { Duration, Message, MessageHeaders } from './types'
-import type { ConsumerHandle, RawMessage } from './adapter'
-import { decodeHeaders, readRetryInfo } from './headers'
 import { requireNonEmptyString, requirePositiveInteger } from './validate'
 import { ClosedError, ConfigError, describeError, isSerializationError } from './errors'
 
@@ -108,7 +108,7 @@ export async function redrive (context: RedriveContext, options: RedriveOptions)
       let keep: boolean
       try {
         const retry = readRetryInfo(headers, names)
-        const message = toMessage(raw, headers, serializer, retry?.originalTopic ?? raw.topic, retry)
+        const message = await toMessage(raw, headers, serializer, retry?.originalTopic ?? raw.topic, retry)
         keep = await options.filter(message)
       } catch (error) {
         if (!isSerializationError(error)) throw error

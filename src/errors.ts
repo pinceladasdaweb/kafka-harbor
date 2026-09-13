@@ -155,6 +155,15 @@ export const isBatchFailedError = (error: unknown): error is BatchFailedError =>
 export const isRetryable = (error: unknown): boolean =>
   (error as { retryable?: unknown } | null | undefined)?.retryable !== false
 
+/**
+ * Whether an error says `retryable: true` in so many words. The opposite
+ * default from `isRetryable`: where a handler's failure is transient unless
+ * it says otherwise, a serializer's failure is malformed bytes unless it
+ * says otherwise, and this is how it says so.
+ */
+export const isDeclaredRetryable = (error: unknown): boolean =>
+  typeof error === 'object' && error !== null && (error as { retryable?: unknown }).retryable === true
+
 /** The text stored in the `last-error` tracking header, bounded in size. */
 export const describeError = (error: unknown, maxLength = 1024): string => {
   let text: string

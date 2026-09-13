@@ -67,5 +67,6 @@ export default [
   ...entry('src/adapters/confluent/index.ts', 'adapters/confluent', { core: true }),
   ...entry('src/testing/index.ts', 'testing', { core: true }),
   ...entry('src/prometheus/index.ts', 'prometheus', { core: true }),
-  ...entry('src/otel/index.ts', 'otel', { core: true })
+  ...entry('src/otel/index.ts', 'otel', { core: true }),
+  ...entry('src/schema-registry/index.ts', 'schema-registry', { core: true })
 ]

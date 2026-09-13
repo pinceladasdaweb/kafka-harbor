@@ -63,6 +63,7 @@ export {
   describeError,
   isAbortProcessingError,
   isBatchFailedError,
+  isDeclaredRetryable,
   isHarborError,
   isRetryable,
   isSerializationError,
@@ -72,7 +73,7 @@ export {
 export type { HarborErrorCode } from './errors'
 
 export { jsonSerializer, rawSerializer, stringSerializer } from './serializer'
-export type { Serializer } from './serializer'
+export type { Serializer, SyncSerializer } from './serializer'
 
 export { MAX_DURATION_MS, parseDuration } from './duration'
 

@@ -8,7 +8,9 @@
 import { memoryAdapter } from 'kafka-harbor/testing'
 import { prometheusMetrics } from 'kafka-harbor/prometheus'
 import { otelMetrics, otelTracing } from 'kafka-harbor/otel'
+import { schemaRegistrySerializer } from 'kafka-harbor/schema-registry'
 import { confluentAdapter } from 'kafka-harbor/adapters/confluent'
+import { AvroDeserializer, AvroSerializer, MockClient, SerdeType } from '@confluentinc/schemaregistry'
 import { Idempotency } from 'quayside'
 import { MemoryStorage } from 'quayside/memory'
 
@@ -54,3 +56,11 @@ export const batched = harbor.consumer({ groupId: 'batch' })
   .subscribeBatch<Order>('orders', async (messages, ctx) => {
     ctx.logger.info(`${messages.length} orders from ${ctx.topic}[${ctx.partition}]`)
   }, { size: 50, maxWait: '500ms' })
+
+// The registry serdes fit the serializer seam as they are; a serializer may be asynchronous.
+const registry = new MockClient()
+export const avro = schemaRegistrySerializer<Order>({
+  serializer: new AvroSerializer(registry, SerdeType.VALUE, { useLatestVersion: true }),
+  deserializer: new AvroDeserializer(registry, SerdeType.VALUE, {})
+})
+export const schemaAware = harbor.producer<Order>({ serializer: avro })

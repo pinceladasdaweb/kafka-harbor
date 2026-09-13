@@ -50,6 +50,7 @@ harbor.enableSignalHandlers()        // SIGTERM -> finish in-flight handlers, co
 - [Idempotency](#idempotency)
 - [Observability](#observability)
 - [Serialization](#serialization)
+- [Schema Registry](#schema-registry)
 - [Headers](#headers)
 - [Events](#events)
 - [Errors](#errors)
@@ -71,7 +72,7 @@ Every Node.js team using Kafka ends up writing the same application layer on top
 | Offset committed only after the retry/DLQ produce was **acknowledged** | ✅ by construction; a failed produce stops the consumer instead of committing | ➖ your ordering | ➖ your ordering | ➖ your ordering |
 | Graceful shutdown: wait for handlers with a deadline, commit, leave, disconnect, **report** what was abandoned | ✅ `ShutdownTimeoutError` names the count | ➖ `disconnect()` waits for the running handler, no deadline, no report | ➖ same | ➖ `close()` |
 | `harbor.abort()`: stop without committing when reprocessing is the right call | ✅ | ➖ throw and hope auto-commit is off | ➖ | ➖ |
-| Serialization that never silently flattens (`Map`, `undefined`, `NaN` rejected) | ✅ strict JSON default, pluggable per topic | ➖ bytes | ➖ bytes | ✅ pluggable serdes, schema registry |
+| Serialization that never silently flattens (`Map`, `undefined`, `NaN` rejected) | ✅ strict JSON default, pluggable per topic, Schema Registry through `kafka-harbor/schema-registry` | ➖ bytes | ➖ bytes | ✅ pluggable serdes, schema registry |
 | In-memory broker for unit tests, same core code, no Docker | ✅ `kafka-harbor/testing` | ❌ | ❌ | ❌ |
 | Client-agnostic: swap the client without touching handlers | ✅ `ClientAdapter`, contract suite for authors | n/a | n/a | n/a |
 | Typed outcome events (`messageRetried`, `messageDeadLettered`, ...) with correlation id | ✅ | ➖ client events | ➖ instrumentation events | ➖ |
@@ -79,7 +80,7 @@ Every Node.js team using Kafka ends up writing the same application layer on top
 | Idempotent producer and `acks=all` on by default | ✅ set by the adapter, cannot be overridden by accident | ➖ opt-in | ➖ opt-in | ➖ opt-in |
 | Runtime dependencies | breakwater + the client you choose | native librdkafka | none (pure JS) | none (pure TS) |
 
-The rows are not a knock on the clients: transactions, exactly-once, schema registry, fetch tuning and wire performance are theirs, and the Confluent client is the one kafka-harbor recommends underneath. The rows are the layer every project rebuilds by hand, done once, with the ordering guarantees tested against a real broker.
+The rows are not a knock on the clients: transactions, exactly-once, the schema registry client itself, fetch tuning and wire performance are theirs, and the Confluent client is the one kafka-harbor recommends underneath. The rows are the layer every project rebuilds by hand, done once, with the ordering guarantees tested against a real broker.
 
 The design principle behind every decision: **losing a message is never the default.** Every failure ends in a retry topic, in the DLQ, or in an explicit stop of the consumer. There is no silent path.
 
@@ -311,7 +312,7 @@ const result = await harbor.redrive({
 result // { from: 'orders-dlq', reprocessed: 498, skipped: 2 }
 ```
 
-Each message is re-produced with its original key and value; the failed run's tracking headers are removed so it starts a fresh retry ladder, and `x-redriven-from` / `x-redriven-at` record the operation. The DLQ offset is committed only after the broker acknowledged the re-produce, so an interrupted redrive resumes where it stopped. A `messageRedriven` event fires per message. A message without `x-original-topic` fails the run unless `to` is given; a filter that throws, or a re-produce that is not acknowledged, stops the run with that error and leaves the message uncommitted.
+Each message is re-produced with its original key and value; the failed run's tracking headers are removed so it starts a fresh retry ladder, and `x-redriven-from` / `x-redriven-at` record the operation. The DLQ offset is committed only after the broker acknowledged the re-produce, so an interrupted redrive resumes where it stopped. A `messageRedriven` event fires per message. A message without `x-original-topic` fails the run unless `to` is given; a filter that throws, a re-produce that is not acknowledged, or a serializer reporting a transient failure (`retryable: true`, a schema registry that is away) stops the run with that error and leaves the message uncommitted, so running it again picks up there.
 
 ## Idempotency
 
@@ -449,7 +450,27 @@ const msgpack: Serializer<MyType> = {
 }
 ```
 
-A serializer applies harbor-wide, per producer, per consumer or per topic, most specific wins.
+A serializer applies harbor-wide, per producer, per consumer or per topic, most specific wins. Whatever `deserialize` throws is taken as malformed bytes and sent straight to the DLQ, unless the error carries `retryable: true`, the way a serializer backed by a service reports the service being away; that message walks the retry ladder instead. Either method may return a promise: the producer serializes every value of a batch before any byte leaves, and the consumer awaits the value before the handler runs. A serializer backed by a schema registry is the case in point: [Schema Registry](#schema-registry).
+
+## Schema Registry
+
+```ts
+import { AvroDeserializer, AvroSerializer, SchemaRegistryClient, SerdeType } from '@confluentinc/schemaregistry'
+import { createHarbor } from 'kafka-harbor'
+import { confluentAdapter } from 'kafka-harbor/adapters/confluent'
+import { schemaRegistrySerializer } from 'kafka-harbor/schema-registry'
+
+const registry = new SchemaRegistryClient({ baseURLs: ['http://schema-registry:8081'] })
+const orders = schemaRegistrySerializer({
+  serializer: new AvroSerializer(registry, SerdeType.VALUE, { useLatestVersion: true }),
+  deserializer: new AvroDeserializer(registry, SerdeType.VALUE, {})
+})
+const harbor = createHarbor({ clientId: 'orders-service', brokers, adapter: confluentAdapter(), serializer: orders })
+```
+
+`kafka-harbor/schema-registry` fits the serdes of [`@confluentinc/schemaregistry`](https://www.npmjs.com/package/@confluentinc/schemaregistry) to the harbor's `Serializer` (`npm install @confluentinc/schemaregistry`; it is an optional peer dependency). The Avro, JSON Schema and Protobuf serdes share one shape, with the registry client's subject strategies, rules and caching as you configured them; the suite exercises Avro and JSON Schema against the client's in-memory registry. Give it the serializer, the deserializer, or both. The topic the registry sees is the original topic of the message, so the same subject serves `orders` and its retry topics, and `redrive()` reads the DLQ under the original topic too; a consumer subscribed to the DLQ topic directly asks the registry about that topic's own subject.
+
+What it adds is the classification the pipelines need. A registry that is unavailable (an HTTP 5xx, 429, 401 or 403, a connection or TLS error, a bearer token that could not be obtained) is a transient fault: the produce rejects with a retryable `AdapterError`, a consumer walks the message down the retry ladder and decodes it once the registry is back, and a `redrive()` stops on it, uncommitted, to be run again. A value the schema refuses, a subject that does not exist, or bytes no schema describes are a `SerializationError`: deterministic, so straight to the DLQ.
 
 ## Headers
 

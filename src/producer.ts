@@ -75,13 +75,16 @@ export class Producer<T = unknown> {
     requireNonEmptyString(topic, 'topic')
     // One instant for the whole batch: the records leave together.
     const stamp = { clientId: this.context.clientId, at: new Date(this.context.clock.now()), correlationId: this.context.correlationId }
-    const records = messages.map((message): RawRecord => ({
+    // Every value is serialized before any byte leaves: a batch with one
+    // unencodable value produces nothing, a serializer that is asynchronous
+    // (a schema registry) is awaited here, and the records leave together.
+    const records = await Promise.all(messages.map(async (message): Promise<RawRecord> => ({
       topic,
       key: message.key === undefined || message.key === null ? null : Buffer.from(message.key, 'utf8'),
-      value: message.value === null ? null : this.serializer.serialize(message.value, topic),
+      value: message.value === null ? null : await this.serializer.serialize(message.value, topic),
       headers: stampProducer(message.headers ?? {}, this.context.headerNames, stamp),
       partition: message.partition
-    }))
+    })))
     if (records.length === 0) return
     await this.context.ensureConnected()
     try {
