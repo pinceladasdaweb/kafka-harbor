@@ -1,5 +1,14 @@
 # CHANGELOG
 
+## 0.5.0 (2026-09-13)
+
+* chore(deps-dev): bump @types/node from 26.4.1 to 26.5.0 by dependabot[bot] [View](https://github.com/pinceladasdaweb/kafka-harbor/commit/3c7885862446c9bdaa77e5d6fee1e5f5d52f9903)
+* chore(deps-dev): bump @microsoft/api-extractor from 7.59.0 to 7.59.1 by dependabot[bot] [View](https://github.com/pinceladasdaweb/kafka-harbor/commit/04a8cd58e77e2f5adaf78e3558f62d482ce1a4ee)
+* chore(deps): npm audit by Pedro Rogério [View](https://github.com/pinceladasdaweb/kafka-harbor/commit/78e4f6891b11c7e67822ce441f9e76d402e6c1ad)
+* feat: consumer idempotency through a pluggable engine by Pedro Rogério [View](https://github.com/pinceladasdaweb/kafka-harbor/commit/d265ecf8f392b530c3df754c473186841c7e441a)
+* feat: batch processing with one commit per batch by Pedro Rogério [View](https://github.com/pinceladasdaweb/kafka-harbor/commit/4dabb18d441122fc3ac27fd06415070364da1a71)
+
+
 ## 0.4.0 (2026-09-07)
 
 * feat: observability: lag, instrumentation hooks, Prometheus and OpenTelemetry entry points by Pedro Rogério [View](https://github.com/pinceladasdaweb/kafka-harbor/commit/5a5d5e09f712e9a725aa628ee997e8b5bfda3f32)
