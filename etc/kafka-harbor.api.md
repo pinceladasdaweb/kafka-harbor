@@ -39,6 +39,32 @@ export interface AdminApi {
     topicExists: (topic: string) => Promise<boolean>;
 }
 
+// Warning: (ae-missing-release-tag) "BatchContext" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
+//
+// @public
+export interface BatchContext {
+    readonly groupId: string;
+    // (undocumented)
+    readonly logger: Logger;
+    // (undocumented)
+    readonly partition: number;
+    readonly signal: AbortSignal;
+    readonly topic: string;
+}
+
+// Warning: (ae-missing-release-tag) "BatchFailedError" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
+//
+// @public
+export class BatchFailedError extends HarborError {
+    constructor(failed: readonly Message[], cause: unknown);
+    readonly failed: readonly Message[];
+}
+
+// Warning: (ae-missing-release-tag) "BatchHandler" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
+//
+// @public
+export type BatchHandler<T = unknown> = (messages: Array<Message<T>>, context: BatchContext) => Promise<void> | void;
+
 // Warning: (ae-missing-release-tag) "BrokerConfig" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
 //
 // @public (undocumented)
@@ -130,6 +156,7 @@ export class Consumer {
     stop(timeoutMs?: number): Promise<void>;
     get stoppedBecause(): StopReason | undefined;
     subscribe<T = unknown>(topic: string, handler: Handler<T>, options?: SubscribeOptions<T>): this;
+    subscribeBatch<T = unknown>(topic: string, handler: BatchHandler<T>, options?: SubscribeBatchOptions<T>): this;
 }
 
 // Warning: (ae-missing-release-tag) "ConsumerContext" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
@@ -150,6 +177,14 @@ export interface ConsumerDlqOptions {
 //
 // @public (undocumented)
 export interface ConsumerEvents extends ProduceEvents {
+    batchProcessed: {
+        topic: string;
+        partition: number;
+        groupId: string;
+        size: number;
+        durationMs: number;
+        outcome: 'processed' | FailureOutcome;
+    };
     // (undocumented)
     consumerStopped: {
         groupId: string;
@@ -178,8 +213,8 @@ export interface ConsumerEvents extends ProduceEvents {
         durationMs: number;
         outcome: FailureOutcome;
         correlationId: string | undefined;
+        batch?: number;
     };
-    // (undocumented)
     messageProcessed: {
         topic: string;
         partition: number;
@@ -188,6 +223,7 @@ export interface ConsumerEvents extends ProduceEvents {
         durationMs: number;
         correlationId: string | undefined;
         replayed: boolean;
+        batch?: number;
     };
     // (undocumented)
     messageRetried: {
@@ -343,6 +379,7 @@ export const ERROR_CODES: {
     readonly ADAPTER: "ADAPTER";
     readonly CLOSED: "CLOSED";
     readonly SHUTDOWN_TIMEOUT: "SHUTDOWN_TIMEOUT";
+    readonly BATCH_FAILED: "BATCH_FAILED";
 };
 
 // Warning: (ae-missing-release-tag) "EventMap" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
@@ -559,6 +596,7 @@ export interface IdempotencyOptions<T = unknown> {
 // @public
 export interface Instrumentation {
     onProduce?: (record: OutgoingRecord) => MessageHeaders | undefined;
+    wrapBatchHandler?: <T>(messages: readonly Message[], context: BatchContext, run: () => Promise<T>) => Promise<T>;
     wrapHandler?: <T>(message: Message, context: HandlerContext, run: () => Promise<T>) => Promise<T>;
     wrapProduce?: <T>(batch: ProduceBatch, run: () => Promise<T>) => Promise<T>;
 }
@@ -567,6 +605,11 @@ export interface Instrumentation {
 //
 // @public (undocumented)
 export const isAbortProcessingError: (error: unknown) => error is AbortProcessingError;
+
+// Warning: (ae-missing-release-tag) "isBatchFailedError" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
+//
+// @public (undocumented)
+export const isBatchFailedError: (error: unknown) => error is BatchFailedError;
 
 // Warning: (ae-missing-release-tag) "isHarborError" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
 //
@@ -1006,6 +1049,15 @@ export function stringSerializer(): Serializer<string>;
 //
 // @public
 export function subscribe<E extends EventMap>(target: Observable<E>, listeners: Listeners<E>): () => void;
+
+// Warning: (ae-missing-release-tag) "SubscribeBatchOptions" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
+//
+// @public (undocumented)
+export interface SubscribeBatchOptions<T = unknown> {
+    maxWait?: Duration;
+    serializer?: Serializer<T>;
+    size?: number;
+}
 
 // Warning: (ae-missing-release-tag) "SubscribeOptions" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
 //

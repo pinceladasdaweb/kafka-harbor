@@ -29,6 +29,8 @@ export type { ProducerContext, ProducerEvents, ProducerOptions, ProducerRetryOpt
 
 export { Consumer } from './consumer'
 export type {
+  BatchContext,
+  BatchHandler,
   ConsumerContext,
   ConsumerDlqOptions,
   ConsumerEvents,
@@ -40,6 +42,7 @@ export type {
   HandlerContext,
   PartitionLag,
   StopReason,
+  SubscribeBatchOptions,
   SubscribeOptions,
   TopicDefaults
 } from './consumer'
@@ -48,6 +51,7 @@ export type { Clock, Duration, MessageHeaders, Logger, Message, OutgoingMessage,
 
 export {
   AbortProcessingError,
+  BatchFailedError,
   AdapterError,
   ClosedError,
   ConfigError,
@@ -58,6 +62,7 @@ export {
   TopicMissingError,
   describeError,
   isAbortProcessingError,
+  isBatchFailedError,
   isHarborError,
   isRetryable,
   isSerializationError,

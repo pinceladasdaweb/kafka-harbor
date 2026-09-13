@@ -24,6 +24,9 @@ declare global {
   const schema: unknown
 
   function fulfill (order: Order): Promise<void>
+  function bulkInsert (orders: Order[]): Promise<void>
+  const failedMessages: Array<import('kafka-harbor').Message>
+  const cause: Error
   function avroSerializer (schema: unknown): Serializer<OrderEvent>
   function protobufSerializer (type: typeof Payment): Serializer<Payment>
   function encode (value: MyType): Buffer

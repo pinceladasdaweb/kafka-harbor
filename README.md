@@ -85,12 +85,12 @@ The design principle behind every decision: **losing a message is never the defa
 
 ### What it does not do
 
-- **At-least-once only.** Duplicates are possible after a crash between handler and commit, a rebalance mid-handler, or an abandoned shutdown; [docs/delivery-semantics.md](docs/delivery-semantics.md) lists every case. Exactly-once effects come from deduplicating in the handler by a business key.
+- **At-least-once only.** Duplicates are possible after a crash between handler and commit, a rebalance mid-handler, or an abandoned shutdown; [docs/delivery-semantics.md](docs/delivery-semantics.md) lists every case. Exactly-once effects come from [idempotency](#idempotency): an engine that runs the handler once per key.
 - **A retry delay must fit under the poll interval** (`maxProcessingTime`, default 5 minutes), because the retry consumer waits the delay before the handler runs. The Confluent adapter sets the client's `max.poll.interval.ms` from it; a longer ladder needs a longer `maxProcessingTime`.
 - **Retry breaks ordering.** A message that goes through a retry topic is processed after later messages on the original topic. The alternative, blocking the partition until it succeeds, is what `harbor.abort()` gives you.
 - **Durations top out at about 24.8 days** (`2147483647` ms), the longest a timer can hold. A longer shutdown timeout or retry delay is a `ConfigError`, not a wait that ends after a millisecond.
 - **The default adapter has a native dependency.** `@confluentinc/kafka-javascript` ships prebuilt binaries for Node 18 to 24 on Linux (glibc and musl, x64 and arm64), macOS and Windows; on Node 26 it compiles librdkafka at install and needs a build toolchain in the image. [Docker images](#docker-images) lists what was verified. Any other client can be plugged in through `ClientAdapter`.
-- **No transactions, no batch handlers, no metrics exporters.** Observability is the typed event stream; wire it to the collector you use.
+- **No transactions.** The producer is idempotent and the consumer commits after the handler; there is no `sendOffsetsToTransaction`, so a handler that produces and consumes is at-least-once on both sides.
 
 ## Install
 
@@ -259,6 +259,18 @@ What happens next depends on how the handler ends, and nothing else. There is no
 
 The retry or DLQ produce is acknowledged by the broker **before** the source offset is committed. If it is not acknowledged, the consumer stops and the message stays where it is: it will be redelivered. A commit that fails after the work is safe (a rebalance in progress, for instance) is reported through the `error` event and the consumer carries on; that message is redelivered too.
 
+### Batches
+
+```ts
+consumer.subscribeBatch<Order>('orders', async (messages, ctx) => {
+  await bulkInsert(messages.map((message) => message.value))   // ctx: { groupId, topic, partition, logger, signal }
+}, { size: 100, maxWait: '1s' })
+```
+
+A batch is up to `size` consecutive messages of one partition, in offset order, or fewer once `maxWait` passed since the first one arrived. Resolving commits the offset after the last message, once. Throwing sends every message of the batch down the retry ladder with that error, each with its own tracking headers; throwing `new BatchFailedError(failedMessages, cause)` sends only the messages it names and commits the rest as processed. On a retry topic the messages wait their delay and run as a batch again. A message that does not deserialize is dead-lettered on its own and the rest of the batch runs.
+
+One batch runs per partition at a time and at most `size` messages wait behind it, so offsets never commit out of order and a delivery never outlives one batch run (keep a batch under `maxProcessingTime`). A batch still collecting when the consumer stops is left uncommitted for the next member; one collecting when the partition is taken away runs first, like a handler already running. Events are per message plus one `batchProcessed` per run; a message from a batch carries `batch` (the size) and the batch's `durationMs`, and the metrics entry points measure batch duration in its own histogram. A batch subscription cannot share a retry topic with another subscription. Idempotency does not apply to batches: deduplicate inside the handler, or use another consumer.
+
 ## Retry topics and the DLQ
 
 A failed message is re-produced, bytes untouched, to `orders-retry-1`. The same consumer group also consumes `orders-retry-1`, waits until the message is `5s` old, and runs the handler again. Fail again: `orders-retry-2`, `1m`. And so on until the ladder is exhausted, then `orders-dlq`.
@@ -382,7 +394,9 @@ metrics.detach()
 |---|---|---|
 | `kafka_harbor_messages_processed_total` | `group`, `topic` | handler succeeded, offset committed |
 | `kafka_harbor_messages_replayed_total` | `group`, `topic` | of those, replayed by the idempotency engine without running the handler |
-| `kafka_harbor_message_processing_duration_seconds` | `group`, `topic`, `outcome` | handler duration, histogram; `outcome` is `processed`, `retry`, `dead-letter`, `abort` or `crash` |
+| `kafka_harbor_message_processing_duration_seconds` | `group`, `topic`, `outcome` | handler duration per message, histogram; `outcome` is `processed`, `retry`, `dead-letter`, `abort` or `crash`; messages handled in a batch are measured by the batch histogram instead |
+| `kafka_harbor_batches_processed_total` | `group`, `topic`, `outcome` | `subscribeBatch` handler runs |
+| `kafka_harbor_batch_processing_duration_seconds` | `group`, `topic`, `outcome` | batch handler duration, histogram |
 | `kafka_harbor_messages_failed_total` | `group`, `topic`, `outcome` | handler failures by what happened next |
 | `kafka_harbor_messages_retried_total` | `group`, `topic`, `level` | messages forwarded to a retry topic |
 | `kafka_harbor_messages_dead_lettered_total` | `group`, `topic` | messages forwarded to the DLQ, after the broker acknowledged |
@@ -407,15 +421,15 @@ const harbor = createHarbor({ clientId: 'orders-service', brokers, adapter: myAd
 const metrics = otelMetrics(harbor)   // instruments under kafka_harbor.*, the same signals as the Prometheus entry point
 ```
 
-`otelMetrics` records the same signals as instruments named `kafka_harbor.messages.processed`, `kafka_harbor.messages.replayed`, `kafka_harbor.message.processing.duration`, `kafka_harbor.messages.failed`, `kafka_harbor.messages.retried`, `kafka_harbor.messages.dead_lettered`, `kafka_harbor.messages.redriven`, `kafka_harbor.messages.produced`, `kafka_harbor.produce.duration`, `kafka_harbor.errors`, `kafka_harbor.consumer.stops` and the observable gauge `kafka_harbor.consumer.lag`, with `kafka_harbor.group`, `kafka_harbor.topic`, `kafka_harbor.outcome`, `kafka_harbor.level`, `kafka_harbor.kind`, `kafka_harbor.scope`, `kafka_harbor.reason`, `kafka_harbor.from`, `kafka_harbor.to` and `kafka_harbor.partition` attributes. Options: `meterProvider`, `boundaries` for the histograms in seconds (default 5ms to 10s) and `lag: false`, required for an adapter that does not report offsets. Start your SDK, or pass `meterProvider`, before calling it: the metrics API has no late-binding proxy. A lag collection that fails is reported through the harbor's `error` event.
+`otelMetrics` records the same signals as instruments named `kafka_harbor.messages.processed`, `kafka_harbor.messages.replayed`, `kafka_harbor.message.processing.duration`, `kafka_harbor.batches.processed`, `kafka_harbor.batch.processing.duration`, `kafka_harbor.messages.failed`, `kafka_harbor.messages.retried`, `kafka_harbor.messages.dead_lettered`, `kafka_harbor.messages.redriven`, `kafka_harbor.messages.produced`, `kafka_harbor.produce.duration`, `kafka_harbor.errors`, `kafka_harbor.consumer.stops` and the observable gauge `kafka_harbor.consumer.lag`, with `kafka_harbor.group`, `kafka_harbor.topic`, `kafka_harbor.outcome`, `kafka_harbor.level`, `kafka_harbor.kind`, `kafka_harbor.scope`, `kafka_harbor.reason`, `kafka_harbor.from`, `kafka_harbor.to` and `kafka_harbor.partition` attributes. Options: `meterProvider`, `boundaries` for the histograms in seconds (default 5ms to 10s) and `lag: false`, required for an adapter that does not report offsets. Start your SDK, or pass `meterProvider`, before calling it: the metrics API has no late-binding proxy. A lag collection that fails is reported through the harbor's `error` event.
 
-`otelTracing` returns the `instrumentation` hooks the harbor calls around produce calls and handlers. Every produce call runs inside a `PRODUCER` span named `<topic> send` with a `kafka_harbor.kind` attribute (`send`, `retry`, `dead-letter` or `redrive`), and the span's context is written into each record's headers by the configured propagator (W3C `traceparent` and `tracestate` with the SDK's default) unless the record already carries one. Every handler runs inside a `CONSUMER` span named `<topic> process`, parented to the context read from the message headers, with the OpenTelemetry messaging attributes (`messaging.system`, `messaging.destination.name`, `messaging.consumer.group.name`, `messaging.destination.partition.id`, `messaging.kafka.offset`) plus `kafka_harbor.attempt`, `kafka_harbor.correlation_id` and `kafka_harbor.original_topic`. The handler runs under the extracted context, so baggage the producer propagated is active there too. A retry, DLQ or redrive hop is a `PRODUCER` span parented to the context the forwarded message carries, and the hop copies that message's headers, so the first attempt, every retry, the dead-lettering and the redrive of one message belong to the trace that produced it. A handler that throws marks its span with the exception and an error status.
+`otelTracing` returns the `instrumentation` hooks the harbor calls around produce calls and handlers. Every produce call runs inside a `PRODUCER` span named `<topic> send` with a `kafka_harbor.kind` attribute (`send`, `retry`, `dead-letter` or `redrive`), and the span's context is written into each record's headers by the configured propagator (W3C `traceparent` and `tracestate` with the SDK's default) unless the record already carries one. Every handler runs inside a `CONSUMER` span named `<topic> process`, parented to the context read from the message headers (a batch handler gets one span, linked to every message's context, with `messaging.batch.message_count`), with the OpenTelemetry messaging attributes (`messaging.system`, `messaging.destination.name`, `messaging.consumer.group.name`, `messaging.destination.partition.id`, `messaging.kafka.offset`) plus `kafka_harbor.attempt`, `kafka_harbor.correlation_id` and `kafka_harbor.original_topic`. The handler runs under the extracted context, so baggage the producer propagated is active there too. A retry, DLQ or redrive hop is a `PRODUCER` span parented to the context the forwarded message carries, and the hop copies that message's headers, so the first attempt, every retry, the dead-lettering and the redrive of one message belong to the trace that produced it. A handler that throws marks its span with the exception and an error status.
 
 A hook that throws, or an SDK that misbehaves, never changes what the pipeline does: the core logs the failure and runs the work unwrapped. Without an SDK registered the hooks are inert.
 
 ### Your own instrumentation
 
-`instrumentation` accepts any object with some of `wrapProduce(batch, run)`, `onProduce(record)` and `wrapHandler(message, context, run)`; `otelTracing()` is one implementation. `wrapProduce` sees every produce call, the hops included: `batch.kind` says what it is for and, for a hop, `batch.origin` is the consumed message being forwarded, headers included. `onProduce` runs inside `wrapProduce`, so a context the wrapper sets up is what it sees, and whatever it returns is added to the record's headers, a header the record already carries taking precedence.
+`instrumentation` accepts any object with some of `wrapProduce(batch, run)`, `onProduce(record)`, `wrapHandler(message, context, run)` and `wrapBatchHandler(messages, context, run)`; `otelTracing()` is one implementation. `wrapProduce` sees every produce call, the hops included: `batch.kind` says what it is for and, for a hop, `batch.origin` is the consumed message being forwarded, headers included. `onProduce` runs inside `wrapProduce`, so a context the wrapper sets up is what it sees, and whatever it returns is added to the record's headers, a header the record already carries taking precedence.
 
 ## Serialization
 
@@ -463,7 +477,8 @@ harbor.headerNames.retryCount   // the names in effect, for code that reads them
 harbor
   .on('connected', ({ adapter }) => {})
   .on('disconnected', ({ adapter }) => {})
-  .on('messageProcessed', ({ topic, partition, offset, groupId, durationMs, correlationId, replayed }) => {})   // replayed: the idempotency engine answered
+  .on('messageProcessed', ({ topic, partition, offset, groupId, durationMs, correlationId, replayed, batch }) => {})   // replayed: the idempotency engine answered; batch: its size, for a message handled in a batch
+  .on('batchProcessed', ({ topic, partition, groupId, size, durationMs, outcome }) => {})   // one per subscribeBatch handler run
   .on('messageFailed', ({ topic, offset, error, outcome }) => {})   // outcome: 'retry' | 'dead-letter' | 'abort' | 'crash'
   .on('messageRetried', ({ topic, retryTopic, level, attempt, error }) => {})
   .on('messageDeadLettered', ({ topic, dlqTopic, attempts, error }) => alert(`${topic}: ${attempts} attempts, now in ${dlqTopic}`))
@@ -488,6 +503,7 @@ Every error carries a stable `code`; message text is documentation, not contract
 | `AdapterError` | `ADAPTER` | the client reported a failure |
 | `ClosedError` | `CLOSED` | the harbor is shutting down or closed |
 | `ShutdownTimeoutError` | `SHUTDOWN_TIMEOUT` | handlers were abandoned by shutdown; `inFlight` says how many |
+| `BatchFailedError` | `BATCH_FAILED` | thrown by a batch handler to fail only the messages it names; `cause` decides retry or DLQ for them |
 
 Every error has `retryable`. Throw any error with `retryable: false` from a handler and it goes straight to the DLQ; breakwater's errors and the RabbitMQ sibling's `RetryableError` follow the same convention.
 

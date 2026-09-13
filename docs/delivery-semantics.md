@@ -34,6 +34,17 @@ Nothing else commits. In particular:
 The consumer stopping is the loud failure. It is never the default; it is
 what remains when every safe destination is unavailable.
 
+## Batches
+
+`subscribeBatch` moves the offset once per batch, after the last message
+of the batch, and only once the batch resolved or every failed message of
+it was forwarded and acknowledged. Nothing in a batch is committed before
+the batch is done, so a crash mid-batch redelivers the whole batch: at-
+least-once at the batch's grain. A batch still collecting when the
+consumer stops was never committed and comes back to the next member; one
+collecting when a partition is taken away runs before the partition is
+released, the way a running handler does.
+
 ## Stopping on purpose
 
 `harbor.abort()` and the no-destination-left case stop the consumer. With

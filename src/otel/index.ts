@@ -10,6 +10,7 @@ import {
   context,
   defaultTextMapGetter,
   defaultTextMapSetter,
+  isSpanContextValid,
   metrics,
   propagation,
   trace,
@@ -18,6 +19,7 @@ import {
   type MeterProvider,
   type ObservableResult,
   type Span,
+  type SpanContext,
   type TextMapPropagator,
   type TracerProvider
 } from '@opentelemetry/api'
@@ -85,7 +87,9 @@ export function otelMetrics (harbor: Harbor, options: OtelMetricsOptions = {}): 
 
   const processed = meter.createCounter('kafka_harbor.messages.processed', { description: 'Messages whose handler succeeded and whose offset was committed.', unit: '{message}' })
   const replayed = meter.createCounter('kafka_harbor.messages.replayed', { description: 'Messages whose handler did not run because the idempotency engine replayed an earlier outcome; counted as processed too.', unit: '{message}' })
-  const processingDuration = meter.createHistogram('kafka_harbor.message.processing.duration', { description: 'Handler duration by outcome, retry delays excluded.', unit: 's', advice })
+  const processingDuration = meter.createHistogram('kafka_harbor.message.processing.duration', { description: 'Handler duration per message by outcome, retry delays excluded; messages handled in a batch are measured by the batch histogram instead.', unit: 's', advice })
+  const batches = meter.createCounter('kafka_harbor.batches.processed', { description: 'Batch handler runs by outcome: processed, retry, dead-letter, abort or crash.', unit: '{batch}' })
+  const batchDuration = meter.createHistogram('kafka_harbor.batch.processing.duration', { description: 'Batch handler duration by outcome.', unit: 's', advice })
   const failed = meter.createCounter('kafka_harbor.messages.failed', { description: 'Handler failures by what happened next: retry, dead-letter, abort or crash.', unit: '{message}' })
   const retried = meter.createCounter('kafka_harbor.messages.retried', { description: 'Messages forwarded to a retry topic, by level.', unit: '{message}' })
   const deadLettered = meter.createCounter('kafka_harbor.messages.dead_lettered', { description: 'Messages forwarded to the dead-letter topic, counted after the broker acknowledged the produce.', unit: '{message}' })
@@ -101,12 +105,17 @@ export function otelMetrics (harbor: Harbor, options: OtelMetricsOptions = {}): 
       const attributes = at(event)
       processed.add(1, attributes)
       if (event.replayed) replayed.add(1, attributes)
-      processingDuration.record(event.durationMs / 1_000, { ...attributes, 'kafka_harbor.outcome': 'processed' })
+      if (event.batch === undefined) processingDuration.record(event.durationMs / 1_000, { ...attributes, 'kafka_harbor.outcome': 'processed' })
     },
     messageFailed: (event) => {
       const attributes = { ...at(event), 'kafka_harbor.outcome': event.outcome }
       failed.add(1, attributes)
-      processingDuration.record(event.durationMs / 1_000, attributes)
+      if (event.batch === undefined) processingDuration.record(event.durationMs / 1_000, attributes)
+    },
+    batchProcessed: (event) => {
+      const attributes = { ...at(event), 'kafka_harbor.outcome': event.outcome }
+      batches.add(1, attributes)
+      batchDuration.record(event.durationMs / 1_000, attributes)
     },
     messageRetried: (event) => { retried.add(1, { ...at(event), 'kafka_harbor.level': event.level }) },
     messageDeadLettered: (event) => { deadLettered.add(1, at(event)) },
@@ -175,7 +184,8 @@ const recordFailure = (span: Span, error: unknown): void => {
  * Tracing hooks for `createHarbor({ instrumentation })`: a PRODUCER span per
  * produce call whose context is written into every record's headers, and a
  * CONSUMER span per handler run, parented to the context found in the
- * message headers. A retry, DLQ or redrive hop is a PRODUCER span of its own
+ * message headers (a batch handler gets one span linked to every message's
+ * context instead). A retry, DLQ or redrive hop is a PRODUCER span of its own
  * (`kafka_harbor.kind` says which), parented to the trace the forwarded
  * message carries, and the hop copies that message's headers, so the whole
  * ladder of one message, and its redrive, belong to the trace that produced
@@ -247,6 +257,27 @@ export function otelTracing (options: OtelTracingOptions = {}): Instrumentation 
       // The handler runs under the extracted context, so what else the
       // producer propagated (baggage) is active there too, not only the span.
       return await traced(span, parent, run)
+    },
+
+    async wrapBatchHandler (messages, batchContext, run) {
+      // A batch has many producers: the span links to each message's
+      // context rather than choosing one parent, as the messaging
+      // conventions prescribe for a batch receive.
+      const links = messages
+        .map((message) => trace.getSpanContext(extracted(message.headers)))
+        .filter((spanContext): spanContext is SpanContext => spanContext !== undefined && isSpanContextValid(spanContext))
+        .map((spanContext) => ({ context: spanContext }))
+      const span = tracer.startSpan(`${batchContext.topic} process`, {
+        kind: SpanKind.CONSUMER,
+        attributes: {
+          ...spanAttributes(batchContext.topic, 'process'),
+          'messaging.consumer.group.name': batchContext.groupId,
+          'messaging.destination.partition.id': String(batchContext.partition),
+          'messaging.batch.message_count': messages.length
+        },
+        links
+      })
+      return await traced(span, context.active(), run)
     }
   }
 }

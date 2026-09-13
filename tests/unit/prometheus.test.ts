@@ -5,7 +5,7 @@ import { Registry, register as globalRegistry } from 'prom-client'
 
 import { ERROR_CODES } from '../../src/index'
 import { prometheusMetrics } from '../../src/prometheus/index'
-import { captureErrors, gate, harness } from '../helpers/harness'
+import { captureErrors, captureEvents, gate, harness } from '../helpers/harness'
 import { until } from '../helpers/manual-clock'
 
 /** The value of one series, or 0 when it was never touched. */
@@ -57,6 +57,24 @@ describe('kafka-harbor/prometheus', () => {
     await h.harbor.shutdown()
     assert.equal(await value(registry, 'kafka_harbor_consumer_stops_total', { group: 'g', reason: 'shutdown' }), 1)
     metrics.detach()
+  })
+
+  test('a batch is one duration observation in its own histogram; its messages count without a duration of their own', async () => {
+    const h = harness()
+    const registry = new Registry()
+    prometheusMetrics(h.harbor, { registry, lag: false })
+    const processed = captureEvents(h.harbor, 'messageProcessed')
+    const consumer = h.harbor.consumer({ groupId: 'g', fromBeginning: true, autoCreateTopics: true })
+    consumer.subscribeBatch('orders', () => { h.clock.advance(400) }, { size: 3 })
+    await consumer.start()
+    await h.harbor.producer().sendBatch('orders', [{ value: 1 }, { value: 2 }, { value: 3 }])
+    await until(() => processed.length === 3)
+    assert.equal(await value(registry, 'kafka_harbor_messages_processed_total', { group: 'g', topic: 'orders' }), 3)
+    assert.equal(await value(registry, 'kafka_harbor_message_processing_duration_seconds_count', { group: 'g', topic: 'orders', outcome: 'processed' }), 0)
+    assert.equal(await value(registry, 'kafka_harbor_batches_processed_total', { group: 'g', topic: 'orders', outcome: 'processed' }), 1)
+    assert.equal(await value(registry, 'kafka_harbor_batch_processing_duration_seconds_count', { group: 'g', topic: 'orders', outcome: 'processed' }), 1)
+    assert.equal(await value(registry, 'kafka_harbor_batch_processing_duration_seconds_sum', { group: 'g', topic: 'orders', outcome: 'processed' }), 0.4)
+    await h.harbor.shutdown()
   })
 
   test('a replay counts as processed and as replayed', async () => {

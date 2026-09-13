@@ -44,6 +44,9 @@ rules the core relies on:
    `eachMessage` promise settled. The core's per-message commit depends on
    it.
 2. Never commit on your own. `enable.auto.commit=false`, or the equivalent.
+   A settled `eachMessage` promise says nothing about the offset: with
+   `subscribeBatch` the core settles deliveries it has not committed yet;
+   only `commit` moves the offset.
 
 `concurrency` is the number of partitions processed at once; `fromBeginning`
 is where a brand-new group starts; `maxProcessingTimeMs` is the longest one

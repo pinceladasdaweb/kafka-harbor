@@ -6,6 +6,7 @@ import {
   TopicMissingError,
   describeError,
   isAbortProcessingError,
+  isBatchFailedError,
   isRetryable,
   isSerializationError
 } from './errors'
@@ -52,11 +53,42 @@ export interface HandlerContext {
 
 export type Handler<T = unknown> = (message: Message<T>, context: HandlerContext) => Promise<void> | void
 
+/** What a batch handler receives besides the messages. */
+export interface BatchContext {
+  /** The consumer group the handler runs in. */
+  readonly groupId: string
+  /** The topic and partition every message of the batch came from. */
+  readonly topic: string
+  readonly partition: number
+  readonly logger: Logger
+  /** Aborts when the harbor gave up waiting for this handler during shutdown; see `HandlerContext.signal`. */
+  readonly signal: AbortSignal
+}
+
+/**
+ * Handles one batch: consecutive messages of one partition, in offset
+ * order. Resolving commits the offset after the last message; throwing
+ * sends every message of the batch down the retry ladder with that error,
+ * and throwing a `BatchFailedError` sends only the messages it names. Each
+ * message keeps its own `retry` information, so a batch on a retry topic
+ * may mix attempts.
+ */
+export type BatchHandler<T = unknown> = (messages: Array<Message<T>>, context: BatchContext) => Promise<void> | void
+
 export interface SubscribeOptions<T = unknown> {
   /** Overrides the consumer's serializer for this topic. */
   serializer?: Serializer<T>
   /** Overrides the consumer's idempotency for this topic; the key function sees the topic's message type. */
   idempotency?: IdempotencyOptions<T>
+}
+
+export interface SubscribeBatchOptions<T = unknown> {
+  /** Overrides the consumer's serializer for this topic. */
+  serializer?: Serializer<T>
+  /** The most messages a batch carries. Default: 100. */
+  size?: number
+  /** How long a partial batch waits for more messages before it runs, counted from its first message. Default: '1s'. */
+  maxWait?: Duration
 }
 
 export interface ConsumerRetryOptions {
@@ -114,10 +146,13 @@ export interface ConsumerOptions {
 }
 
 export interface ConsumerEvents extends ProduceEvents {
-  messageProcessed: { topic: string, partition: number, offset: string, groupId: string, durationMs: number, correlationId: string | undefined, replayed: boolean }
+  /** A message committed as processed. From a batch, `durationMs` is the batch's and `batch` its size; see `batchProcessed` for the batch itself. */
+  messageProcessed: { topic: string, partition: number, offset: string, groupId: string, durationMs: number, correlationId: string | undefined, replayed: boolean, batch?: number }
   messageRetried: { topic: string, partition: number, offset: string, groupId: string, retryTopic: string, level: number, attempt: number, error: unknown, correlationId: string | undefined }
   messageDeadLettered: { topic: string, partition: number, offset: string, groupId: string, dlqTopic: string, attempts: number, error: unknown, correlationId: string | undefined }
-  messageFailed: { topic: string, partition: number, offset: string, groupId: string, error: unknown, durationMs: number, outcome: FailureOutcome, correlationId: string | undefined }
+  messageFailed: { topic: string, partition: number, offset: string, groupId: string, error: unknown, durationMs: number, outcome: FailureOutcome, correlationId: string | undefined, batch?: number }
+  /** One batch handler run that ended: `outcome` is `processed` when the handler resolved (messages it named as failed notwithstanding), the failure outcome otherwise. */
+  batchProcessed: { topic: string, partition: number, groupId: string, size: number, durationMs: number, outcome: 'processed' | FailureOutcome }
   consumerStopped: { groupId: string, reason: StopReason }
   error: HarborErrorEvent
 }
@@ -151,12 +186,48 @@ export type ConsumerState = 'idle' | 'starting' | 'running' | 'stopping' | 'stop
 /** What the core needs from the harbor to build a consumer. */
 export type ConsumerContext = CoreContext<ConsumerEvents>
 
+interface BatchRun {
+  readonly kind: 'batch'
+  readonly handler: BatchHandler
+  readonly size: number
+  readonly maxWaitMs: number
+}
+
 interface Subscription {
   readonly plan: TopicPlan
-  readonly handler: Handler
   readonly serializer: Serializer
   readonly idempotency: IdempotencyOptions | undefined
+  readonly run: { readonly kind: 'each', readonly handler: Handler } | BatchRun
 }
+
+/** A delivery decoded as far as the pipeline needs before a handler runs. */
+interface Pending {
+  readonly raw: RawMessage
+  readonly headers: MessageHeaders
+  readonly retry: Message['retry']
+  readonly attempt: number
+  readonly correlationId: string | undefined
+}
+
+/**
+ * The messages of one partition waiting to run as a batch. The adapter has
+ * been told all but the last of them are done (the partition would not
+ * deliver the next one otherwise); none is committed until the batch ran.
+ */
+interface Batch {
+  readonly subscription: Subscription
+  readonly run: BatchRun
+  readonly level: number
+  readonly items: Pending[]
+  /** Cancels the maxWait timer. */
+  readonly timer: AbortController
+}
+
+/** What happened to a message the handler failed on, once it was forwarded. */
+type Verdict =
+  | { readonly outcome: 'retry', readonly retryTopic: string, readonly level: number }
+  | { readonly outcome: 'dead-letter', readonly dlqTopic: string }
+  | { readonly outcome: 'crash' }
 
 /**
  * One consumed topic: its place on the ladder and the subscriptions it
@@ -205,6 +276,19 @@ export class Consumer {
    * and only ever waits for handlers.
    */
   private readonly deliveries = new Map<Promise<void>, Delivery>()
+  /** The batch being collected on each partition of a batch subscription, keyed by `partitionKey`. */
+  private readonly batches = new Map<string, Batch>()
+  /**
+   * The batch running on each partition. A delivery that arrives meanwhile
+   * waits for it before joining the next batch, so the partition delivers
+   * nothing else until then: one batch per partition at a time, at most
+   * `size` messages buffered, and a delivery never outlives one batch run.
+   */
+  private readonly runningBatches = new Map<string, Promise<void>>()
+  /** How many times each partition was revoked, so a delivery that waited through a revocation does not start a batch on a partition this member lost. */
+  private readonly revocations = new Map<string, number>()
+  /** The partitions whose revocation is being settled: nothing new is collected on them meanwhile. */
+  private readonly revoking = new Set<string>()
   /** Aborts as soon as a stop begins: wakes retry waits, blocks new handlers. */
   private readonly drainController = new AbortController()
   /** Aborts when shutdown gives up on running handlers (the handler's `signal`). */
@@ -251,16 +335,50 @@ export class Consumer {
 
   /** Registers a handler for a topic. Its retry ladder is consumed as well. */
   subscribe<T = unknown> (topic: string, handler: Handler<T>, options: SubscribeOptions<T> = {}): this {
-    if (this.state !== 'idle') throw new ConfigError('subscribe() must be called before start()')
-    requireNonEmptyString(topic, 'topic')
-    if (typeof handler !== 'function') throw new ConfigError(`handler for "${topic}" must be a function`)
-    const plan = new TopicPlan(topic, this.levels.length, this.retryNaming, this.dlqNaming)
-    const subscription: Subscription = {
-      plan,
-      handler: handler as Handler,
+    this.assertSubscribable(topic, handler, 'subscribe')
+    return this.route(topic, {
+      run: { kind: 'each', handler: handler as Handler },
       serializer: (options.serializer ?? this.options.serializer ?? this.context.serializer) as Serializer,
       idempotency: (options.idempotency as IdempotencyOptions | undefined) ?? this.options.idempotency
+    })
+  }
+
+  /**
+   * Like `subscribe()`, for a handler that takes the messages of one
+   * partition in batches: up to `size` consecutive messages, or fewer once
+   * `maxWait` passed since the first one arrived. The offset after the last
+   * message of a batch is committed once the batch resolved; a batch that
+   * throws sends every one of its messages down the retry ladder, each with
+   * its own tracking headers. A message that does not deserialize is
+   * dead-lettered on its own and the rest of the batch runs. Idempotency is
+   * not applied to batches: a consumer configured with it refuses this.
+   */
+  subscribeBatch<T = unknown> (topic: string, handler: BatchHandler<T>, options: SubscribeBatchOptions<T> = {}): this {
+    this.assertSubscribable(topic, handler, 'subscribeBatch')
+    if (this.options.idempotency !== undefined) {
+      throw new ConfigError(`subscribeBatch("${topic}"): idempotency applies to single-message handlers; deduplicate inside the batch handler, or use another consumer`)
     }
+    return this.route(topic, {
+      run: {
+        kind: 'batch',
+        handler: handler as BatchHandler,
+        size: requirePositiveInteger(options.size ?? 100, 'size'),
+        maxWaitMs: parseDuration(options.maxWait ?? 1_000, 'maxWait')
+      },
+      serializer: (options.serializer ?? this.options.serializer ?? this.context.serializer) as Serializer,
+      idempotency: undefined
+    })
+  }
+
+  private assertSubscribable (topic: string, handler: unknown, method: string): void {
+    if (this.state !== 'idle') throw new ConfigError(`${method}() must be called before start()`)
+    requireNonEmptyString(topic, 'topic')
+    if (typeof handler !== 'function') throw new ConfigError(`handler for "${topic}" must be a function`)
+  }
+
+  private route (topic: string, settings: Omit<Subscription, 'plan'>): this {
+    const plan = new TopicPlan(topic, this.levels.length, this.retryNaming, this.dlqNaming)
+    const subscription: Subscription = { plan, ...settings }
     // An original topic belongs to one subscription. A retry topic may be
     // shared, but only among topics of the same level: the level decides the
     // delay, and a message must not wait one topic's delay on another's
@@ -272,8 +390,14 @@ export class Consumer {
     for (const { level } of this.levels) {
       const retryTopic = plan.retryTopic(level) as string
       const existing = this.routes.get(retryTopic)
-      if (existing !== undefined && existing.level !== level) {
+      if (existing === undefined) continue
+      if (existing.level !== level) {
         throw new ConfigError(`topic "${retryTopic}" is level ${level} of "${topic}" but ${existing.level === 0 ? 'the original topic' : `level ${existing.level}`} of "${[...existing.owners.keys()].join('", "')}"`)
+      }
+      // A batch is formed per partition, not per owner: on a shared retry
+      // topic it would mix the owners' messages and commit across them.
+      if (settings.run.kind === 'batch' || [...existing.owners.values()].some((owner) => owner.run.kind === 'batch')) {
+        throw new ConfigError(`retry topic "${retryTopic}" would be shared between "${topic}" and "${[...existing.owners.keys()].join('", "')}", and a batch subscription cannot share a retry topic; give it a retry.topicNaming of its own`)
       }
     }
     if (plan.dlqTopic !== undefined && this.routes.has(plan.dlqTopic)) {
@@ -432,8 +556,21 @@ export class Consumer {
    */
   private async settleRevoked (partitions: readonly TopicPartition[]): Promise<void> {
     const revoked = new Set(partitions.map(({ topic, partition }) => partitionKey(topic, partition)))
+    // A batch still collecting on a revoked partition runs now, so its
+    // messages are committed before the next owner starts, like a handler
+    // already running would be; the wait below covers it.
+    for (const key of revoked) {
+      this.revocations.set(key, (this.revocations.get(key) ?? 0) + 1)
+      this.revoking.add(key)
+      const batch = this.batches.get(key)
+      if (batch !== undefined) this.flushBatch(key, batch)
+    }
     const running = [...this.deliveries].filter(([, entry]) => entry.active && revoked.has(partitionKey(entry.raw.topic, entry.raw.partition)))
-    await this.settledInTime(Promise.all(running.map(([work]) => work)), this.maxProcessingTimeMs)
+    try {
+      await this.settledInTime(Promise.all(running.map(([work]) => work)), this.maxProcessingTimeMs)
+    } finally {
+      for (const key of revoked) this.revoking.delete(key)
+    }
   }
 
   /**
@@ -494,6 +631,7 @@ export class Consumer {
     // or queued behind readiness) unwind at once and are left uncommitted;
     // running handlers get what is left of the timeout.
     this.drainController.abort()
+    this.discardBatches([...this.batches.keys()])
     await this.settledInTime(
       Promise.all([...this.deliveries].filter(([, entry]) => entry.active).map(([work]) => work)),
       Math.max(0, deadline - this.context.clock.now())
@@ -617,6 +755,11 @@ export class Consumer {
     // in between would snapshot the handler as not running and then find it
     // running. A stop aborts the drain signal and leaves 'running' together.
     if (this.state !== 'running') return
+    const item: Pending = { raw, headers, retry, attempt, correlationId }
+    if (subscription.run.kind === 'batch') {
+      await this.collect(item, entry, subscription, subscription.run, level)
+      return
+    }
     entry.active = true
 
     const startedAt = this.context.clock.now()
@@ -631,7 +774,8 @@ export class Consumer {
         signal: this.shutdownController.signal,
         attempt
       }
-      const { handler, idempotency } = subscription
+      const { handler } = subscription.run
+      const { idempotency } = subscription
       const wrapHandler = this.context.instrumentation?.wrapHandler
       if (wrapHandler === undefined && idempotency === undefined) {
         await handler(message, handlerContext)
@@ -653,7 +797,7 @@ export class Consumer {
       error = thrown
     }
     const durationMs = this.context.clock.now() - startedAt
-    const at = { topic: raw.topic, partition: raw.partition, offset: raw.offset, groupId: this.groupId, correlationId }
+    const at = this.locate(item)
 
     if (this.shutdownController.signal.aborted) {
       // The handler was abandoned by shutdown; whatever it returned or threw
@@ -672,37 +816,228 @@ export class Consumer {
       return
     }
 
+    const verdict = await this.forwardFailed(item, subscription, level, error)
+    if (verdict.outcome === 'crash') {
+      this.context.emit('messageFailed', { ...at, error, durationMs, outcome: 'crash' })
+      throw error
+    }
+    if (!await this.commit(raw)) return
+    this.emitFailure(item, verdict, error, durationMs)
+  }
+
+  /**
+   * Sends a message the handler failed on to the next topic of its ladder
+   * (retry level, then DLQ) and says where it went; the caller commits. A
+   * message that cannot be decoded will not decode next time either, so it
+   * skips the retry levels. Without a level left and without a DLQ the
+   * verdict is a crash: the only honest outcome is to stop without
+   * committing, so nothing is lost and someone has to look.
+   */
+  private async forwardFailed (item: Pending, subscription: Subscription, level: number, error: unknown): Promise<Verdict> {
+    const names = this.context.headerNames
     const nextLevel = level + 1
     const retryTopic = subscription.plan.retryTopic(nextLevel)
-    // A message that cannot be decoded will not decode next time either.
     const wantsRetry = !isSerializationError(error) && this.retryIf(error)
-    const tracking = writeRetryInfo(headers, names, {
-      previous: retry,
+    const tracking = writeRetryInfo(item.headers, names, {
+      previous: item.retry,
       originalTopic: subscription.plan.original,
       error: describeError(error),
       now: new Date(this.context.clock.now())
     })
-
     if (wantsRetry && retryTopic !== undefined) {
-      await produceHop(this.context, raw, headers, retryTopic, 'retry', tracking)
-      if (!await this.commit(raw)) return
-      this.context.emit('messageFailed', { ...at, error, durationMs, outcome: 'retry' })
-      this.context.emit('messageRetried', { ...at, retryTopic, level: nextLevel, attempt, error })
-      return
+      await produceHop(this.context, item.raw, item.headers, retryTopic, 'retry', tracking)
+      return { outcome: 'retry', retryTopic, level: nextLevel }
     }
-    if (subscription.plan.dlqTopic !== undefined) {
-      const dlqTopic = subscription.plan.dlqTopic
+    const dlqTopic = subscription.plan.dlqTopic
+    if (dlqTopic !== undefined) {
       tracking[names.deadLetteredAt] = new Date(this.context.clock.now()).toISOString()
-      await produceHop(this.context, raw, headers, dlqTopic, 'dead-letter', tracking)
-      if (!await this.commit(raw)) return
-      this.context.emit('messageFailed', { ...at, error, durationMs, outcome: 'dead-letter' })
-      this.context.emit('messageDeadLettered', { ...at, dlqTopic, attempts: attempt, error })
-      return
+      await produceHop(this.context, item.raw, item.headers, dlqTopic, 'dead-letter', tracking)
+      return { outcome: 'dead-letter', dlqTopic }
     }
-    // No retry level left and no DLQ: the only honest outcome is to stop
-    // without committing, so nothing is lost and someone has to look.
-    this.context.emit('messageFailed', { ...at, error, durationMs, outcome: 'crash' })
-    throw error
+    return { outcome: 'crash' }
+  }
+
+  /** Where a message is, as every event names it. */
+  private locate (item: Pending): { topic: string, partition: number, offset: string, groupId: string, correlationId: string | undefined } {
+    return { topic: item.raw.topic, partition: item.raw.partition, offset: item.raw.offset, groupId: this.groupId, correlationId: item.correlationId }
+  }
+
+  /** The events of a forwarded failure, once its offset is committed. */
+  private emitFailure (item: Pending, verdict: Exclude<Verdict, { outcome: 'crash' }>, error: unknown, durationMs: number, batch?: number): void {
+    const at = this.locate(item)
+    this.context.emit('messageFailed', { ...at, error, durationMs, outcome: verdict.outcome, batch })
+    if (verdict.outcome === 'retry') this.context.emit('messageRetried', { ...at, retryTopic: verdict.retryTopic, level: verdict.level, attempt: item.attempt, error })
+    else this.context.emit('messageDeadLettered', { ...at, dlqTopic: verdict.dlqTopic, attempts: item.attempt, error })
+  }
+
+  /**
+   * Adds a delivery to its partition's batch. Every delivery but the one
+   * that fills the batch is reported settled to the adapter at once (the
+   * partition would not deliver the next one otherwise); the filling one
+   * holds its delivery open while the batch runs. A delivery that arrives
+   * while a batch of its partition runs waits for it first, so at most
+   * `size` messages are buffered per partition and one batch runs at a
+   * time. A batch that does not fill runs `maxWait` after its first message.
+   */
+  private async collect (item: Pending, entry: Delivery, subscription: Subscription, run: BatchRun, level: number): Promise<void> {
+    const key = partitionKey(item.raw.topic, item.raw.partition)
+    // A message on a partition being taken away is the next owner's; so is
+    // one that waited for a batch while the partition was taken away, or
+    // while that batch stopped the consumer. Left uncommitted either way.
+    if (this.revoking.has(key)) return
+    const running = this.runningBatches.get(key)
+    if (running !== undefined) {
+      const revocation = this.revocations.get(key)
+      await running
+      if (this.state !== 'running' || this.revocations.get(key) !== revocation) return
+    }
+    let batch = this.batches.get(key)
+    if (batch === undefined) {
+      const started: Batch = { subscription, run, level, items: [], timer: new AbortController() }
+      batch = started
+      this.batches.set(key, started)
+      this.context.clock.sleep(run.maxWaitMs, started.timer.signal).then(() => {
+        if (!started.timer.signal.aborted && this.batches.get(key) === started) this.flushBatch(key, started)
+      }).catch(() => undefined)
+    }
+    batch.items.push(item)
+    if (batch.items.length < run.size) return
+    this.batches.delete(key)
+    batch.timer.abort()
+    entry.active = true
+    await this.runBatch(key, batch)
+  }
+
+  /**
+   * Runs a batch that did not fill (its wait passed, or its partition is
+   * being revoked) on a delivery of its own, so shutdown and revocation
+   * wait for it like for any running handler.
+   */
+  private flushBatch (key: string, batch: Batch): void {
+    this.batches.delete(key)
+    batch.timer.abort()
+    const last = batch.items[batch.items.length - 1] as Pending
+    const owned: Delivery = { raw: last.raw, active: true, release: () => {} }
+    const work = this.runBatch(key, batch)
+    this.deliveries.set(work, owned)
+    work.finally(() => { this.deliveries.delete(work) }).catch(() => undefined)
+  }
+
+  /** Forgets the batches collected on these partitions without running them. */
+  private discardBatches (keys: readonly string[]): void {
+    for (const key of keys) {
+      this.batches.get(key)?.timer.abort()
+      this.batches.delete(key)
+    }
+  }
+
+  /**
+   * Runs a batch and lets the partition's next delivery wait for it. A
+   * pipeline failure crashes the consumer here, before the waiting delivery
+   * resumes, so what it finds is a consumer already stopping.
+   */
+  private async runBatch (key: string, batch: Batch): Promise<void> {
+    const last = batch.items[batch.items.length - 1] as Pending
+    const run = this.handleBatch(batch).catch(async (error: unknown) => { await this.crash(error, last.raw) })
+    this.runningBatches.set(key, run)
+    try {
+      await run
+    } finally {
+      if (this.runningBatches.get(key) === run) this.runningBatches.delete(key)
+    }
+  }
+
+  private async handleBatch (batch: Batch): Promise<void> {
+    const { subscription, run, level, items } = batch
+    const first = items[0] as Pending
+    const last = items[items.length - 1] as Pending
+    const context: BatchContext = {
+      groupId: this.groupId,
+      topic: first.raw.topic,
+      partition: first.raw.partition,
+      logger: this.context.logger,
+      signal: this.shutdownController.signal
+    }
+    // A message that does not decode is failed on its own, before the
+    // handler runs; the rest of the batch is what the handler gets.
+    const failures = new Map<Pending, unknown>()
+    const messages: Message[] = []
+    const decoded: Pending[] = []
+    for (const item of items) {
+      try {
+        messages.push(toMessage(item.raw, item.headers, subscription.serializer, subscription.plan.original, item.retry))
+        decoded.push(item)
+      } catch (error) {
+        failures.set(item, error)
+      }
+    }
+    const startedAt = this.context.clock.now()
+    let error: unknown
+    if (messages.length > 0) {
+      const wrapBatch = this.context.instrumentation?.wrapBatchHandler
+      try {
+        await wrapped(wrapBatch === undefined ? undefined : (wrappedRun) => wrapBatch(messages, context, wrappedRun), async () => { await run.handler(messages, context) }, this.context.logger)
+      } catch (thrown) {
+        error = thrown
+      }
+    }
+    const durationMs = this.context.clock.now() - startedAt
+    if (this.shutdownController.signal.aborted) return
+    const size = items.length
+    const batchAt = { topic: first.raw.topic, partition: first.raw.partition, groupId: this.groupId, size, durationMs }
+    // The handler's own failure, when it failed the whole batch: what the
+    // batch's outcome follows. A BatchFailedError is a handler that resolved
+    // for the rest, and a message that did not decode is its own failure.
+    const handlerFailure = error !== undefined && !isBatchFailedError(error) ? error : undefined
+    let outcome: ConsumerEvents['batchProcessed']['outcome'] = 'processed'
+    if (error !== undefined) {
+      if (isAbortProcessingError(error)) {
+        for (const item of decoded) this.context.emit('messageFailed', { ...this.locate(item), error, durationMs, outcome: 'abort', batch: size })
+        this.context.emit('batchProcessed', { ...batchAt, outcome: 'abort' })
+        this.context.emit('error', { error, scope: 'consumer', groupId: this.groupId, topic: first.raw.topic })
+        this.stopFromPipeline('abort')
+        return
+      }
+      if (isBatchFailedError(error)) {
+        // The handler named its failures; naming a message that is not in
+        // the batch is a bug in the handler, and stopping is the honest
+        // answer to a bug: nothing is committed, someone has to look.
+        const byOffset = new Map(decoded.map((item) => [item.raw.offset, item]))
+        for (const message of error.failed) {
+          const item = message.topic === first.raw.topic && message.partition === first.raw.partition ? byOffset.get(message.offset) : undefined
+          if (item === undefined) throw new ConfigError(`BatchFailedError names ${message.topic}[${message.partition}]@${message.offset}, which is not in the batch of ${first.raw.topic}[${first.raw.partition}] ${first.raw.offset}..${last.raw.offset}`)
+          failures.set(item, error.cause ?? error)
+        }
+      } else {
+        for (const item of decoded) failures.set(item, error)
+      }
+    }
+    // Forward in offset order, then one commit for the whole batch: a
+    // failure to forward leaves everything uncommitted, as for one message.
+    const verdicts = new Map<Pending, Exclude<Verdict, { outcome: 'crash' }>>()
+    for (const item of items) {
+      const failure = failures.get(item)
+      if (failure === undefined) continue
+      const verdict = await this.forwardFailed(item, subscription, level, failure)
+      if (verdict.outcome === 'crash') {
+        this.context.emit('messageFailed', { ...this.locate(item), error: failure, durationMs, outcome: 'crash', batch: size })
+        this.context.emit('batchProcessed', { ...batchAt, outcome: 'crash' })
+        throw failure
+      }
+      verdicts.set(item, verdict)
+      if (failure === handlerFailure) outcome = verdict.outcome
+    }
+    if (!await this.commit(last.raw)) return
+    for (const item of items) {
+      const verdict = verdicts.get(item)
+      if (verdict !== undefined) {
+        this.emitFailure(item, verdict, failures.get(item), durationMs, size)
+        continue
+      }
+      this.context.emit('messageProcessed', { ...this.locate(item), durationMs, replayed: false, batch: size })
+    }
+    // A batch with nothing to hand to the handler had no run to report.
+    if (messages.length > 0) this.context.emit('batchProcessed', { ...batchAt, outcome })
   }
 
   /**

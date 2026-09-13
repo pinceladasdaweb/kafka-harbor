@@ -48,3 +48,9 @@ export const send = async (): Promise<void> => await producer.send('orders', { k
 export const engine: IdempotencyEngine = new Idempotency({ storage: new MemoryStorage(), onConflict: 'wait', lockTtl: '5m' })
 export const deduplicated = harbor.consumer({ groupId: 'dedup', idempotency: { engine } })
   .subscribe<Order>('orders', () => {}, { idempotency: { engine, key: (message) => `order:${message.value.id}` } })
+
+// Batches: one handler per partition slice, the last offset committed once.
+export const batched = harbor.consumer({ groupId: 'batch' })
+  .subscribeBatch<Order>('orders', async (messages, ctx) => {
+    ctx.logger.info(`${messages.length} orders from ${ctx.topic}[${ctx.partition}]`)
+  }, { size: 50, maxWait: '500ms' })
