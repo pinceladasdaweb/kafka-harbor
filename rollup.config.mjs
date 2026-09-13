@@ -68,5 +68,7 @@ export default [
   ...entry('src/testing/index.ts', 'testing', { core: true }),
   ...entry('src/prometheus/index.ts', 'prometheus', { core: true }),
   ...entry('src/otel/index.ts', 'otel', { core: true }),
-  ...entry('src/schema-registry/index.ts', 'schema-registry', { core: true })
+  ...entry('src/schema-registry/index.ts', 'schema-registry', { core: true }),
+  ...entry('src/decorators/index.ts', 'decorators', { core: true }),
+  ...entry('src/nestjs/index.ts', 'nestjs', { core: true })
 ]

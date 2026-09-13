@@ -55,6 +55,7 @@ harbor.enableSignalHandlers()        // SIGTERM -> finish in-flight handlers, co
 - [Events](#events)
 - [Errors](#errors)
 - [Adapters](#adapters)
+- [NestJS and decorators](#nestjs-and-decorators)
 - [Testing your handlers](#testing-your-handlers)
 - [Development](#development)
 
@@ -544,6 +545,41 @@ confluentAdapter({
 The Confluent adapter sets `acks=all` and `enable.idempotence=true` on the producer, `enable.auto.commit=false` on consumers, and loads the client module on first connect, so importing the adapter never touches the native binding. The three properties the offset policy depends on (`enable.auto.commit`, `enable.auto.offset.store`, `auto.offset.reset`) cannot be overridden through the passthrough; `fromBeginning` drives the reset policy. Client failures are retryable unless their code is definitive (authorization, oversized record, invalid argument), regardless of the client's own `retriable` flag, which only describes transactions.
 
 Writing your own adapter means implementing `ClientAdapter` and running `runAdapterContract` from `kafka-harbor/testing` against your backend. The contract is small on purpose: connect, disconnect, produce with acknowledgment, consume with per-partition ordering and a settled-promise gate, commit, stop, optional pause/resume, two admin calls, and two optional offset calls that `lag()` is computed from. Everything else lives in the core.
+
+## NestJS and decorators
+
+```ts
+import { Injectable, Module } from '@nestjs/common'
+import type { HandlerContext, Message } from 'kafka-harbor'
+import { confluentAdapter } from 'kafka-harbor/adapters/confluent'
+import { KafkaBatchListener, KafkaConsumer, KafkaListener, KafkaRetry } from 'kafka-harbor/decorators'
+import { KafkaHarborModule } from 'kafka-harbor/nestjs'
+
+@Injectable()
+@KafkaConsumer({ groupId: 'orders-service', autoCreateTopics: true })
+@KafkaRetry({ levels: [{ delay: '30s' }, { delay: '5m' }] })
+export class OrdersListener {
+  @KafkaListener<Order>('orders')
+  async onOrder (message: Message<Order>, ctx: HandlerContext): Promise<void> { await fulfill(message.value) }
+
+  @KafkaBatchListener<Order>('invoices', { size: 100, maxWait: '1s' })
+  async onInvoices (messages: Array<Message<Order>>): Promise<void> { await bulkInsert(messages.map((message) => message.value)) }
+}
+
+@Module({
+  imports: [KafkaHarborModule.forRoot({ clientId: 'orders-service', brokers, adapter: confluentAdapter() })],
+  providers: [OrdersListener]
+})
+export class AppModule {}
+```
+
+Two entry points. `kafka-harbor/decorators` holds the decorators and `bindListeners()`, and depends on nothing but the core. `kafka-harbor/nestjs` holds the module, and needs `@nestjs/common` and `@nestjs/core` (optional peer dependencies of the package). `KafkaHarborModule.forRoot(config)` takes a `HarborConfig`, builds the `Harbor` (injectable under `KAFKA_HARBOR`; the module is global by default), discovers every singleton provider and controller with decorated methods when the application bootstraps, binds and starts one consumer per class, and shuts the harbor down with the application (`app.close()`, or `enableShutdownHooks()` for signals). If one consumer fails to start, the harbor is shut down before the failure propagates, so a failed bootstrap leaves nothing consuming; a decorated class that is not a singleton (request or transient scope) is refused. `forRootAsync({ imports, inject, useFactory })` is there for a configuration that comes from other providers. One module per application: the discovery covers every module.
+
+- `@KafkaConsumer(options)` on the class gives the consumer its group and any other `ConsumerOptions`; `@KafkaRetry(retry)` is a shorthand for the `retry` part.
+- `@KafkaListener(topic, options?)` and `@KafkaBatchListener(topic, options?)` on methods are `subscribe()` and `subscribeBatch()`; the method is called on the provider instance with the same arguments a handler gets.
+- `@DLQHandler(originalTopic)` subscribes the method to that topic's DLQ, named by the consumer's `dlq.topicNaming`. A consumer never consumes the DLQ it fills, so it goes in a class of its own, with its own group.
+
+The decorators keep their own metadata and accept both decorator dialects: TypeScript's standard decorators and the `experimentalDecorators` NestJS applications compile with. A method a subclass overrides and decorates again is one listener, the nearest declaration winning; of two class decorators the upper one wins where they overlap. Without NestJS, `bindListeners(harbor, instance, overrides?)` returns the consumer a decorated instance declares, not started, so any framework or none can host the same classes.
 
 ## Testing your handlers
 
