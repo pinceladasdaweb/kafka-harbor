@@ -59,6 +59,26 @@ describe('kafka-harbor/prometheus', () => {
     metrics.detach()
   })
 
+  test('a replay counts as processed and as replayed', async () => {
+    const h = harness()
+    const registry = new Registry()
+    prometheusMetrics(h.harbor, { registry, lag: false })
+    let first = true
+    const consumer = h.harbor.consumer({
+      groupId: 'g',
+      fromBeginning: true,
+      autoCreateTopics: true,
+      idempotency: { engine: { async executeWithMetadata (_input, run) { const replayed = !first; first = false; return { value: await run(), replayed } } } }
+    })
+    consumer.subscribe('orders', () => {})
+    await consumer.start()
+    await h.harbor.producer().sendBatch('orders', [{ value: 1 }, { value: 2 }])
+    await h.adapter.whenDrained('g', 'orders')
+    assert.equal(await value(registry, 'kafka_harbor_messages_processed_total', { group: 'g', topic: 'orders' }), 2)
+    assert.equal(await value(registry, 'kafka_harbor_messages_replayed_total', { group: 'g', topic: 'orders' }), 1)
+    await h.harbor.shutdown()
+  })
+
   test('without a registry the metrics land in prom-client\'s global one', async () => {
     const h = harness()
     const metrics = prometheusMetrics(h.harbor, { lag: false })

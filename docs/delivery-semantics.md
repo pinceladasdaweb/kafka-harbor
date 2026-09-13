@@ -74,9 +74,14 @@ At-least-once means these can happen and your handler should tolerate them:
   retry topic *and* gets redelivered from the source, so the handler sees it
   twice (once per topic) and both copies walk the ladder.
 
-For exactly-once *effects* on top of at-least-once *delivery*, deduplicate
-in the handler by a business key, or by `topic:partition:offset` when the
-message has no natural one.
+For exactly-once *effects* on top of at-least-once *delivery*, run the
+handler through an idempotency engine (`consumer({ idempotency })`, see the
+README). The default key, `groupId:topic:partition:offset`, collapses a
+redelivery whose first run completed; one that arrives while the first run
+is still executing is a conflict the engine's policy decides (quayside's
+`onConflict: 'wait'` waits and replays). The last case is two deliveries
+with two keys; a business key collapses that one too, and the duplicates
+the producer sent.
 
 ## Retry delays
 

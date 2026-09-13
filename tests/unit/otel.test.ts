@@ -65,6 +65,27 @@ describe('kafka-harbor/otel metrics', () => {
     await m.shutdown()
   })
 
+  test('a replay counts as processed and as replayed', async () => {
+    const h = harness()
+    const m = metering()
+    otelMetrics(h.harbor, { meterProvider: m.provider, lag: false })
+    let first = true
+    const consumer = h.harbor.consumer({
+      groupId: 'g',
+      fromBeginning: true,
+      autoCreateTopics: true,
+      idempotency: { engine: { async executeWithMetadata (_input, run) { const replayed = !first; first = false; return { value: await run(), replayed } } } }
+    })
+    consumer.subscribe('orders', () => {})
+    await consumer.start()
+    await h.harbor.producer().sendBatch('orders', [{ value: 1 }, { value: 2 }])
+    await h.adapter.whenDrained('g', 'orders')
+    assert.equal(await m.point('kafka_harbor.messages.processed', { 'kafka_harbor.group': 'g', 'kafka_harbor.topic': 'orders' }), 2)
+    assert.equal(await m.point('kafka_harbor.messages.replayed', { 'kafka_harbor.group': 'g', 'kafka_harbor.topic': 'orders' }), 1)
+    await h.harbor.shutdown()
+    await m.shutdown()
+  })
+
   test('without a meter provider the global one is used, which is inert until an SDK registers', async () => {
     const h = harness()
     const metrics = otelMetrics(h.harbor)

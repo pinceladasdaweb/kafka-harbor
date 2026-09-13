@@ -75,6 +75,12 @@ export function prometheusMetrics (harbor: Harbor, options: PrometheusMetricsOpt
     labelNames: ['group', 'topic'],
     registers
   })
+  const replayed = new Counter({
+    name: `${prefix}messages_replayed_total`,
+    help: 'Messages whose handler did not run because the idempotency engine replayed an earlier outcome; counted in messages_processed_total too.',
+    labelNames: ['group', 'topic'],
+    registers
+  })
   const processingDuration = new Histogram({
     name: `${prefix}message_processing_duration_seconds`,
     help: 'Handler duration by outcome (processed, retry, dead-letter, abort, crash), retry delays excluded.',
@@ -154,6 +160,7 @@ export function prometheusMetrics (harbor: Harbor, options: PrometheusMetricsOpt
   const listeners: Listeners<HarborEvents> = {
     messageProcessed: (event) => {
       processed.inc({ group: event.groupId, topic: event.topic })
+      if (event.replayed) replayed.inc({ group: event.groupId, topic: event.topic })
       processingDuration.observe({ group: event.groupId, topic: event.topic, outcome: 'processed' }, event.durationMs / 1_000)
     },
     messageFailed: (event) => {

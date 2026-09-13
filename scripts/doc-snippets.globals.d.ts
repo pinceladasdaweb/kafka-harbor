@@ -33,6 +33,8 @@ declare global {
   function randomUUID (): string
 
   const onOrder: Handler<Order>
+  const handleOrder: Handler<Order>
+  const redis: never
   const onPayment: Handler<Payment>
   const handler: Handler<string>
   const asyncLocalStorage: AsyncLocalStorage<{ requestId: string }>

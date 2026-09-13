@@ -47,6 +47,7 @@ harbor.enableSignalHandlers()        // SIGTERM -> finish in-flight handlers, co
 - [Retry topics and the DLQ](#retry-topics-and-the-dlq)
 - [Graceful shutdown](#graceful-shutdown)
 - [Health](#health)
+- [Idempotency](#idempotency)
 - [Observability](#observability)
 - [Serialization](#serialization)
 - [Headers](#headers)
@@ -300,6 +301,38 @@ result // { from: 'orders-dlq', reprocessed: 498, skipped: 2 }
 
 Each message is re-produced with its original key and value; the failed run's tracking headers are removed so it starts a fresh retry ladder, and `x-redriven-from` / `x-redriven-at` record the operation. The DLQ offset is committed only after the broker acknowledged the re-produce, so an interrupted redrive resumes where it stopped. A `messageRedriven` event fires per message. A message without `x-original-topic` fails the run unless `to` is given; a filter that throws, or a re-produce that is not acknowledged, stops the run with that error and leaves the message uncommitted.
 
+## Idempotency
+
+At-least-once delivery means a handler can see the same message twice (the [list of cases](docs/delivery-semantics.md#duplicates-you-can-expect) is short and honest). `idempotency` runs every handler of a consumer through an engine that executes once per key and replays the first outcome for a repeat, which is then committed without the handler running again. [quayside](https://github.com/pinceladasdaweb/quayside) fits the seam as it is, with its storages (memory, Redis, Postgres, MySQL, DynamoDB), fencing and replay window:
+
+```ts
+import { createHarbor } from 'kafka-harbor'
+import { confluentAdapter } from 'kafka-harbor/adapters/confluent'
+import { Idempotency } from 'quayside'
+import { RedisStorage } from 'quayside/redis'
+
+const harbor = createHarbor({ clientId: 'orders-service', brokers, adapter: confluentAdapter() })
+const engine = new Idempotency({
+  storage: new RedisStorage(redis),
+  namespace: 'orders-service',
+  onConflict: 'wait',      // a redelivery racing a live run waits for it and replays
+  lockTtl: '5m'            // at least the longest a handler may run (maxProcessingTime)
+})
+
+// Every handler of the consumer, keyed by the delivery: `${groupId}:${topic}:${partition}:${offset}`.
+const consumer = harbor.consumer({ groupId: 'orders-service', idempotency: { engine } })
+// One topic keyed by the business id, payload fingerprinted: the same id with other content is refused.
+consumer.subscribe<Order>('orders', handleOrder, {
+  idempotency: { engine, key: (message) => ({ key: `order:${message.value.id}`, payload: message.value }) }
+})
+```
+
+- **Key.** The default names the delivery (group, topic, partition, offset) and collapses exactly the redeliveries at-least-once allows; it is exported as `defaultIdempotencyKey` for a key that builds on it. A business key collapses duplicates the producer sent as well. Returning `{ key, payload }` has the engine fingerprint the payload and refuse the same key with different content; `{ key, resultTtl }` sets the replay window for that message.
+- **Outcomes.** A replay is reported as `messageProcessed` with `replayed: true` and counted in `messages_replayed_total`. A handler failure is not stored: the retry runs the handler again. An error from the engine itself (storage unavailable, key refused, key function threw) is a handler failure and walks the ladder like any other; quayside's errors carry a `code`, so `retry.retryIf` can send a deterministic refusal such as `IDEMPOTENCY_KEY_REUSE` straight to the DLQ.
+- **Conflicts and leases.** A redelivery that arrives while the first run is still executing is a conflict: with quayside's `onConflict: 'wait'` it waits for the winner and replays; with `'reject'` it fails and walks the ladder. The engine's lock must outlive the handler (`lockTtl` above `maxProcessingTime`), or a run that finishes after its lease expired is refused and retried.
+- **`persistFailures`.** quayside stores every failure under the key, transient ones included. With the per-delivery key that is what you want: a redelivery of a failed delivery replays the failure with its `retryable` flag, so a business rejection reaches the DLQ without the work running twice. With a business key the retry hops share the key and would replay the failure instead of retrying, so keep failures unpersisted there.
+- **Any engine.** The seam is one method, `executeWithMetadata(input, run)`, resolving `{ value, replayed }`; `IdempotencyEngine` is exported for an engine of your own. The core imports nothing.
+
 ## Graceful shutdown
 
 ```ts
@@ -348,6 +381,7 @@ metrics.detach()
 | Metric | Labels | What it counts |
 |---|---|---|
 | `kafka_harbor_messages_processed_total` | `group`, `topic` | handler succeeded, offset committed |
+| `kafka_harbor_messages_replayed_total` | `group`, `topic` | of those, replayed by the idempotency engine without running the handler |
 | `kafka_harbor_message_processing_duration_seconds` | `group`, `topic`, `outcome` | handler duration, histogram; `outcome` is `processed`, `retry`, `dead-letter`, `abort` or `crash` |
 | `kafka_harbor_messages_failed_total` | `group`, `topic`, `outcome` | handler failures by what happened next |
 | `kafka_harbor_messages_retried_total` | `group`, `topic`, `level` | messages forwarded to a retry topic |
@@ -373,7 +407,7 @@ const harbor = createHarbor({ clientId: 'orders-service', brokers, adapter: myAd
 const metrics = otelMetrics(harbor)   // instruments under kafka_harbor.*, the same signals as the Prometheus entry point
 ```
 
-`otelMetrics` records the same signals as instruments named `kafka_harbor.messages.processed`, `kafka_harbor.message.processing.duration`, `kafka_harbor.messages.failed`, `kafka_harbor.messages.retried`, `kafka_harbor.messages.dead_lettered`, `kafka_harbor.messages.redriven`, `kafka_harbor.messages.produced`, `kafka_harbor.produce.duration`, `kafka_harbor.errors`, `kafka_harbor.consumer.stops` and the observable gauge `kafka_harbor.consumer.lag`, with `kafka_harbor.group`, `kafka_harbor.topic`, `kafka_harbor.outcome`, `kafka_harbor.level`, `kafka_harbor.kind`, `kafka_harbor.scope`, `kafka_harbor.reason`, `kafka_harbor.from`, `kafka_harbor.to` and `kafka_harbor.partition` attributes. Options: `meterProvider`, `boundaries` for the histograms in seconds (default 5ms to 10s) and `lag: false`, required for an adapter that does not report offsets. Start your SDK, or pass `meterProvider`, before calling it: the metrics API has no late-binding proxy. A lag collection that fails is reported through the harbor's `error` event.
+`otelMetrics` records the same signals as instruments named `kafka_harbor.messages.processed`, `kafka_harbor.messages.replayed`, `kafka_harbor.message.processing.duration`, `kafka_harbor.messages.failed`, `kafka_harbor.messages.retried`, `kafka_harbor.messages.dead_lettered`, `kafka_harbor.messages.redriven`, `kafka_harbor.messages.produced`, `kafka_harbor.produce.duration`, `kafka_harbor.errors`, `kafka_harbor.consumer.stops` and the observable gauge `kafka_harbor.consumer.lag`, with `kafka_harbor.group`, `kafka_harbor.topic`, `kafka_harbor.outcome`, `kafka_harbor.level`, `kafka_harbor.kind`, `kafka_harbor.scope`, `kafka_harbor.reason`, `kafka_harbor.from`, `kafka_harbor.to` and `kafka_harbor.partition` attributes. Options: `meterProvider`, `boundaries` for the histograms in seconds (default 5ms to 10s) and `lag: false`, required for an adapter that does not report offsets. Start your SDK, or pass `meterProvider`, before calling it: the metrics API has no late-binding proxy. A lag collection that fails is reported through the harbor's `error` event.
 
 `otelTracing` returns the `instrumentation` hooks the harbor calls around produce calls and handlers. Every produce call runs inside a `PRODUCER` span named `<topic> send` with a `kafka_harbor.kind` attribute (`send`, `retry`, `dead-letter` or `redrive`), and the span's context is written into each record's headers by the configured propagator (W3C `traceparent` and `tracestate` with the SDK's default) unless the record already carries one. Every handler runs inside a `CONSUMER` span named `<topic> process`, parented to the context read from the message headers, with the OpenTelemetry messaging attributes (`messaging.system`, `messaging.destination.name`, `messaging.consumer.group.name`, `messaging.destination.partition.id`, `messaging.kafka.offset`) plus `kafka_harbor.attempt`, `kafka_harbor.correlation_id` and `kafka_harbor.original_topic`. The handler runs under the extracted context, so baggage the producer propagated is active there too. A retry, DLQ or redrive hop is a `PRODUCER` span parented to the context the forwarded message carries, and the hop copies that message's headers, so the first attempt, every retry, the dead-lettering and the redrive of one message belong to the trace that produced it. A handler that throws marks its span with the exception and an error status.
 
@@ -429,7 +463,7 @@ harbor.headerNames.retryCount   // the names in effect, for code that reads them
 harbor
   .on('connected', ({ adapter }) => {})
   .on('disconnected', ({ adapter }) => {})
-  .on('messageProcessed', ({ topic, partition, offset, groupId, durationMs, correlationId }) => {})
+  .on('messageProcessed', ({ topic, partition, offset, groupId, durationMs, correlationId, replayed }) => {})   // replayed: the idempotency engine answered
   .on('messageFailed', ({ topic, offset, error, outcome }) => {})   // outcome: 'retry' | 'dead-letter' | 'abort' | 'crash'
   .on('messageRetried', ({ topic, retryTopic, level, attempt, error }) => {})
   .on('messageDeadLettered', ({ topic, dlqTopic, attempts, error }) => alert(`${topic}: ${attempts} attempts, now in ${dlqTopic}`))
@@ -516,6 +550,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for the invariants worth knowing before c
 ## Related
 
 - [breakwater](https://github.com/pinceladasdaweb/breakwater): resilience policies (retry, circuit breaker, bulkhead). kafka-harbor's produce retry runs on it.
+- [quayside](https://github.com/pinceladasdaweb/quayside): idempotency with pluggable storage. Its engine fits `idempotency.engine` as is.
 
 ## License
 

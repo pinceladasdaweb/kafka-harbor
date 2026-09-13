@@ -9,7 +9,10 @@ import { memoryAdapter } from 'kafka-harbor/testing'
 import { prometheusMetrics } from 'kafka-harbor/prometheus'
 import { otelMetrics, otelTracing } from 'kafka-harbor/otel'
 import { confluentAdapter } from 'kafka-harbor/adapters/confluent'
-import { createHarbor, type ClientAdapter, type Message } from 'kafka-harbor'
+import { Idempotency } from 'quayside'
+import { MemoryStorage } from 'quayside/memory'
+
+import { createHarbor, type ClientAdapter, type IdempotencyEngine, type Message } from 'kafka-harbor'
 
 interface Order { id: string, total: number }
 
@@ -40,3 +43,8 @@ export const traced = createHarbor({ clientId: 'consumer-check', brokers: ['loca
 
 export const producer = harbor.producer<Order>()
 export const send = async (): Promise<void> => await producer.send('orders', { key: '1', value: { id: '1', total: 10 } })
+
+// quayside's engine fits the idempotency seam as it is, without glue.
+export const engine: IdempotencyEngine = new Idempotency({ storage: new MemoryStorage(), onConflict: 'wait', lockTtl: '5m' })
+export const deduplicated = harbor.consumer({ groupId: 'dedup', idempotency: { engine } })
+  .subscribe<Order>('orders', () => {}, { idempotency: { engine, key: (message) => `order:${message.value.id}` } })

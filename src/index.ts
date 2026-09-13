@@ -18,6 +18,8 @@ export type { ConsumerHealth, ExposedHarborConfig, HarborConfig, HarborEvents, H
 export type { CoreContext, HarborErrorEvent } from './context'
 
 export type { Instrumentation, OutgoingRecord, ProduceBatch, ProduceKind } from './instrumentation'
+export { defaultIdempotencyKey } from './idempotency'
+export type { IdempotencyEngine, IdempotencyInput, IdempotencyOptions } from './idempotency'
 export type { ProduceEvents, ProducedEvent } from './produce'
 
 export type { RedriveEvents, RedriveOptions, RedriveResult } from './redrive'

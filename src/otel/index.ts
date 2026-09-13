@@ -84,6 +84,7 @@ export function otelMetrics (harbor: Harbor, options: OtelMetricsOptions = {}): 
   const advice = { explicitBucketBoundaries: [...(options.boundaries ?? DEFAULT_DURATION_BUCKETS)] }
 
   const processed = meter.createCounter('kafka_harbor.messages.processed', { description: 'Messages whose handler succeeded and whose offset was committed.', unit: '{message}' })
+  const replayed = meter.createCounter('kafka_harbor.messages.replayed', { description: 'Messages whose handler did not run because the idempotency engine replayed an earlier outcome; counted as processed too.', unit: '{message}' })
   const processingDuration = meter.createHistogram('kafka_harbor.message.processing.duration', { description: 'Handler duration by outcome, retry delays excluded.', unit: 's', advice })
   const failed = meter.createCounter('kafka_harbor.messages.failed', { description: 'Handler failures by what happened next: retry, dead-letter, abort or crash.', unit: '{message}' })
   const retried = meter.createCounter('kafka_harbor.messages.retried', { description: 'Messages forwarded to a retry topic, by level.', unit: '{message}' })
@@ -99,6 +100,7 @@ export function otelMetrics (harbor: Harbor, options: OtelMetricsOptions = {}): 
     messageProcessed: (event) => {
       const attributes = at(event)
       processed.add(1, attributes)
+      if (event.replayed) replayed.add(1, attributes)
       processingDuration.record(event.durationMs / 1_000, { ...attributes, 'kafka_harbor.outcome': 'processed' })
     },
     messageFailed: (event) => {

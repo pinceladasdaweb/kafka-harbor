@@ -187,6 +187,7 @@ export interface ConsumerEvents extends ProduceEvents {
         groupId: string;
         durationMs: number;
         correlationId: string | undefined;
+        replayed: boolean;
     };
     // (undocumented)
     messageRetried: {
@@ -235,6 +236,7 @@ export interface ConsumerOptions {
     fromBeginning?: boolean;
     // (undocumented)
     groupId: string;
+    idempotency?: IdempotencyOptions;
     maxProcessingTime?: Duration;
     // (undocumented)
     retry?: ConsumerRetryOptions;
@@ -304,6 +306,11 @@ export const DEFAULT_DURATION_BUCKETS: readonly number[];
 //
 // @public (undocumented)
 export const defaultDlqTopicNaming: DlqTopicNaming;
+
+// Warning: (ae-missing-release-tag) "defaultIdempotencyKey" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
+//
+// @public
+export const defaultIdempotencyKey: (message: Message, context: HandlerContext) => string;
 
 // Warning: (ae-missing-release-tag) "defaultRetryTopicNaming" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
 //
@@ -515,6 +522,36 @@ export function headerNames(prefix?: string): HeaderNames;
 export interface HeaderOptions {
     correlationId?: () => string;
     prefix?: string;
+}
+
+// Warning: (ae-missing-release-tag) "IdempotencyEngine" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
+//
+// @public
+export interface IdempotencyEngine {
+    // (undocumented)
+    executeWithMetadata: <T>(input: string | IdempotencyInput, run: () => Promise<T>) => Promise<{
+        value: T;
+        replayed: boolean;
+    }>;
+}
+
+// Warning: (ae-missing-release-tag) "IdempotencyInput" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
+//
+// @public
+export interface IdempotencyInput {
+    // (undocumented)
+    readonly key: string;
+    // (undocumented)
+    readonly payload?: unknown;
+    readonly resultTtl?: Duration;
+}
+
+// Warning: (ae-missing-release-tag) "IdempotencyOptions" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
+//
+// @public (undocumented)
+export interface IdempotencyOptions<T = unknown> {
+    readonly engine: IdempotencyEngine;
+    readonly key?: (message: Message<T>, context: HandlerContext) => string | IdempotencyInput;
 }
 
 // Warning: (ae-missing-release-tag) "Instrumentation" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
@@ -974,6 +1011,7 @@ export function subscribe<E extends EventMap>(target: Observable<E>, listeners: 
 //
 // @public (undocumented)
 export interface SubscribeOptions<T = unknown> {
+    idempotency?: IdempotencyOptions<T>;
     serializer?: Serializer<T>;
 }
 

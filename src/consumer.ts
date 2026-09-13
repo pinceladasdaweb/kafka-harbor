@@ -29,6 +29,7 @@ import type { CoreContext, HarborErrorEvent } from './context'
 import { OFFSET_PATTERN, commitAfter, offsetDistance } from './commit'
 import type { Duration, MessageHeaders, Logger, Message } from './types'
 import { decodeHeaders, readRetryInfo, writeRetryInfo } from './headers'
+import { defaultIdempotencyKey, type IdempotencyOptions } from './idempotency'
 import type { ConsumerHandle, RawMessage, TopicPartition, TopicSpec } from './adapter'
 import { firstRejection, requireNonEmptyString, requirePositiveInteger } from './validate'
 
@@ -54,6 +55,8 @@ export type Handler<T = unknown> = (message: Message<T>, context: HandlerContext
 export interface SubscribeOptions<T = unknown> {
   /** Overrides the consumer's serializer for this topic. */
   serializer?: Serializer<T>
+  /** Overrides the consumer's idempotency for this topic; the key function sees the topic's message type. */
+  idempotency?: IdempotencyOptions<T>
 }
 
 export interface ConsumerRetryOptions {
@@ -97,6 +100,12 @@ export interface ConsumerOptions {
   /** Whether a brand-new group starts from the earliest offset. Default: false. */
   fromBeginning?: boolean
   /**
+   * Runs every handler of this consumer through an idempotency engine: one
+   * run per key, a repeat replays the first outcome and is committed without
+   * running the handler again. See `IdempotencyOptions` for the key.
+   */
+  idempotency?: IdempotencyOptions
+  /**
    * The longest a message may sit in the pipeline (retry delay included)
    * before the group would consider the consumer dead. Default: '5m',
    * Kafka's `max.poll.interval.ms`. Every retry delay must fit under it.
@@ -105,7 +114,7 @@ export interface ConsumerOptions {
 }
 
 export interface ConsumerEvents extends ProduceEvents {
-  messageProcessed: { topic: string, partition: number, offset: string, groupId: string, durationMs: number, correlationId: string | undefined }
+  messageProcessed: { topic: string, partition: number, offset: string, groupId: string, durationMs: number, correlationId: string | undefined, replayed: boolean }
   messageRetried: { topic: string, partition: number, offset: string, groupId: string, retryTopic: string, level: number, attempt: number, error: unknown, correlationId: string | undefined }
   messageDeadLettered: { topic: string, partition: number, offset: string, groupId: string, dlqTopic: string, attempts: number, error: unknown, correlationId: string | undefined }
   messageFailed: { topic: string, partition: number, offset: string, groupId: string, error: unknown, durationMs: number, outcome: FailureOutcome, correlationId: string | undefined }
@@ -146,6 +155,7 @@ interface Subscription {
   readonly plan: TopicPlan
   readonly handler: Handler
   readonly serializer: Serializer
+  readonly idempotency: IdempotencyOptions | undefined
 }
 
 /**
@@ -248,7 +258,8 @@ export class Consumer {
     const subscription: Subscription = {
       plan,
       handler: handler as Handler,
-      serializer: (options.serializer ?? this.options.serializer ?? this.context.serializer) as Serializer
+      serializer: (options.serializer ?? this.options.serializer ?? this.context.serializer) as Serializer,
+      idempotency: (options.idempotency as IdempotencyOptions | undefined) ?? this.options.idempotency
     }
     // An original topic belongs to one subscription. A retry topic may be
     // shared, but only among topics of the same level: the level decides the
@@ -610,6 +621,7 @@ export class Consumer {
 
     const startedAt = this.context.clock.now()
     let error: unknown
+    let replayed = false
     try {
       const message = toMessage(raw, headers, subscription.serializer, subscription.plan.original, retry)
       const handlerContext: HandlerContext = {
@@ -619,9 +631,24 @@ export class Consumer {
         signal: this.shutdownController.signal,
         attempt
       }
+      const { handler, idempotency } = subscription
       const wrapHandler = this.context.instrumentation?.wrapHandler
-      if (wrapHandler === undefined) await subscription.handler(message, handlerContext)
-      else await wrapped((run) => wrapHandler(message, handlerContext, run), async () => { await subscription.handler(message, handlerContext) }, this.context.logger)
+      if (wrapHandler === undefined && idempotency === undefined) {
+        await handler(message, handlerContext)
+      } else {
+        // The engine runs inside the instrumentation, so a span covers the
+        // lookup as well as the handler, and a replay shows as a short span.
+        const work = async (): Promise<void> => {
+          if (idempotency === undefined) {
+            await handler(message, handlerContext)
+            return
+          }
+          const input = (idempotency.key ?? defaultIdempotencyKey)(message, handlerContext)
+          const outcome = await idempotency.engine.executeWithMetadata(input, async () => { await handler(message, handlerContext) })
+          replayed = outcome.replayed
+        }
+        await wrapped(wrapHandler === undefined ? undefined : (run) => wrapHandler(message, handlerContext, run), work, this.context.logger)
+      }
     } catch (thrown) {
       error = thrown
     }
@@ -635,7 +662,7 @@ export class Consumer {
       return
     }
     if (error === undefined) {
-      if (await this.commit(raw)) this.context.emit('messageProcessed', { ...at, durationMs })
+      if (await this.commit(raw)) this.context.emit('messageProcessed', { ...at, durationMs, replayed })
       return
     }
     if (isAbortProcessingError(error)) {
