@@ -8,7 +8,11 @@
 import { memoryAdapter } from 'kafka-harbor/testing'
 import { prometheusMetrics } from 'kafka-harbor/prometheus'
 import { otelMetrics, otelTracing } from 'kafka-harbor/otel'
+import { schemaRegistrySerializer } from 'kafka-harbor/schema-registry'
+import { KafkaConsumer, KafkaListener, bindListeners } from 'kafka-harbor/decorators'
+import { KafkaHarborModule } from 'kafka-harbor/nestjs'
 import { confluentAdapter } from 'kafka-harbor/adapters/confluent'
+import { AvroDeserializer, AvroSerializer, MockClient, SerdeType } from '@confluentinc/schemaregistry'
 import { Idempotency } from 'quayside'
 import { MemoryStorage } from 'quayside/memory'
 
@@ -54,3 +58,20 @@ export const batched = harbor.consumer({ groupId: 'batch' })
   .subscribeBatch<Order>('orders', async (messages, ctx) => {
     ctx.logger.info(`${messages.length} orders from ${ctx.topic}[${ctx.partition}]`)
   }, { size: 50, maxWait: '500ms' })
+
+// The registry serdes fit the serializer seam as they are; a serializer may be asynchronous.
+const registry = new MockClient()
+export const avro = schemaRegistrySerializer<Order>({
+  serializer: new AvroSerializer(registry, SerdeType.VALUE, { useLatestVersion: true }),
+  deserializer: new AvroDeserializer(registry, SerdeType.VALUE, {})
+})
+export const schemaAware = harbor.producer<Order>({ serializer: avro })
+
+// The decorators entry point takes the Harbor class from the core declarations.
+@KafkaConsumer({ groupId: 'decorated' })
+class Decorated {
+  @KafkaListener<Order>('orders')
+  onOrder (message: Message<Order>): void { String(message.value.id) }
+}
+export const bound = bindListeners(harbor, new Decorated())
+export const nestModule = KafkaHarborModule.forRoot({ clientId: 'consumer-check', brokers: ['localhost:9092'], adapter })

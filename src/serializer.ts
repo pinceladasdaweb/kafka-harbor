@@ -2,12 +2,24 @@ import { SerializationError, isSerializationError } from './errors'
 
 /**
  * Turns a value into wire bytes and back. Symmetric by contract: the
- * consumer deserializes with the same serializer the producer used.
+ * consumer deserializes with the same serializer the producer used. Either
+ * side may be asynchronous (a schema registry is a network call with a
+ * cache); the pipelines await what they get.
  *
  * Implementations must fail loudly: a value that cannot be encoded
  * faithfully raises `SerializationError`, it is never silently flattened.
+ * Whatever `deserialize` throws is taken as malformed bytes and sent to the
+ * DLQ, unless the error carries `retryable: true`: that is how a serializer
+ * backed by a service reports the service being away, and the message then
+ * walks the retry ladder instead.
  */
 export interface Serializer<T = unknown> {
+  serialize: (value: T, topic: string) => Buffer | Promise<Buffer>
+  deserialize: (bytes: Buffer, topic: string) => T | Promise<T>
+}
+
+/** A serializer that answers without a promise, which the built-in ones do; usable wherever a `Serializer` is. */
+export interface SyncSerializer<T = unknown> extends Serializer<T> {
   serialize: (value: T, topic: string) => Buffer
   deserialize: (bytes: Buffer, topic: string) => T
 }
@@ -103,7 +115,7 @@ const assertEncodable = (value: unknown): void => {
  * Everything JSON would silently flatten is rejected with
  * `SerializationError` before any byte is produced.
  */
-export function jsonSerializer<T = unknown> (): Serializer<T> {
+export function jsonSerializer<T = unknown> (): SyncSerializer<T> {
   return {
     serialize (value, topic) {
       try {
@@ -126,7 +138,7 @@ export function jsonSerializer<T = unknown> (): Serializer<T> {
 }
 
 /** Passes bytes through untouched, for opaque payloads and custom codecs. */
-export function rawSerializer (): Serializer<Buffer> {
+export function rawSerializer (): SyncSerializer<Buffer> {
   return {
     serialize (value, topic) {
       if (!Buffer.isBuffer(value)) {
@@ -139,7 +151,7 @@ export function rawSerializer (): Serializer<Buffer> {
 }
 
 /** UTF-8 strings, for text payloads that are not JSON. */
-export function stringSerializer (): Serializer<string> {
+export function stringSerializer (): SyncSerializer<string> {
   return {
     serialize (value, topic) {
       if (typeof value !== 'string') {

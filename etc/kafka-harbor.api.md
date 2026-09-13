@@ -611,6 +611,11 @@ export const isAbortProcessingError: (error: unknown) => error is AbortProcessin
 // @public (undocumented)
 export const isBatchFailedError: (error: unknown) => error is BatchFailedError;
 
+// Warning: (ae-missing-release-tag) "isDeclaredRetryable" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
+//
+// @public
+export const isDeclaredRetryable: (error: unknown) => boolean;
+
 // Warning: (ae-missing-release-tag) "isHarborError" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
 //
 // @public (undocumented)
@@ -639,7 +644,7 @@ export const isTopicMissingError: (error: unknown) => error is TopicMissingError
 // Warning: (ae-missing-release-tag) "jsonSerializer" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
 //
 // @public
-export function jsonSerializer<T = unknown>(): Serializer<T>;
+export function jsonSerializer<T = unknown>(): SyncSerializer<T>;
 
 // Warning: (ae-missing-release-tag) "Listener" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
 //
@@ -906,7 +911,7 @@ export interface RawRecord {
 // Warning: (ae-missing-release-tag) "rawSerializer" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
 //
 // @public
-export function rawSerializer(): Serializer<Buffer>;
+export function rawSerializer(): SyncSerializer<Buffer>;
 
 // Warning: (ae-missing-release-tag) "RedriveEvents" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
 //
@@ -1005,9 +1010,9 @@ export class SerializationError extends HarborError {
 // @public
 export interface Serializer<T = unknown> {
     // (undocumented)
-    deserialize: (bytes: Buffer, topic: string) => T;
+    deserialize: (bytes: Buffer, topic: string) => T | Promise<T>;
     // (undocumented)
-    serialize: (value: T, topic: string) => Buffer;
+    serialize: (value: T, topic: string) => Buffer | Promise<Buffer>;
 }
 
 // Warning: (ae-missing-release-tag) "ShutdownTimeoutError" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
@@ -1043,7 +1048,7 @@ export type StopReason = 'shutdown' | 'abort' | 'crash';
 // Warning: (ae-missing-release-tag) "stringSerializer" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
 //
 // @public
-export function stringSerializer(): Serializer<string>;
+export function stringSerializer(): SyncSerializer<string>;
 
 // Warning: (ae-missing-release-tag) "subscribe" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
 //
@@ -1065,6 +1070,16 @@ export interface SubscribeBatchOptions<T = unknown> {
 export interface SubscribeOptions<T = unknown> {
     idempotency?: IdempotencyOptions<T>;
     serializer?: Serializer<T>;
+}
+
+// Warning: (ae-missing-release-tag) "SyncSerializer" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
+//
+// @public
+export interface SyncSerializer<T = unknown> extends Serializer<T> {
+    // (undocumented)
+    deserialize: (bytes: Buffer, topic: string) => T;
+    // (undocumented)
+    serialize: (value: T, topic: string) => Buffer;
 }
 
 // Warning: (ae-missing-release-tag) "systemClock" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)

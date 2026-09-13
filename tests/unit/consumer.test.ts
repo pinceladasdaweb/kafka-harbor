@@ -1412,3 +1412,67 @@ describe('Consumer: mutation follow-ups', () => {
     assert.equal(events.consumerStopped.length, 0)
   })
 })
+
+describe('asynchronous serializers', () => {
+  test('a serializer that answers with promises works on both sides, and one that declares a transient failure sends the message down the ladder rather than to the DLQ', async () => {
+    let outages = 1
+    const slow = {
+      serialize: async (value: unknown): Promise<Buffer> => {
+        await new Promise((resolve) => setImmediate(resolve))
+        return Buffer.from(JSON.stringify(value))
+      },
+      deserialize: async (bytes: Buffer): Promise<unknown> => {
+        await new Promise((resolve) => setImmediate(resolve))
+        if (outages-- > 0) throw Object.assign(new Error('codec service away'), { retryable: true })
+        return JSON.parse(bytes.toString('utf8'))
+      }
+    }
+    const h = harness({ serializer: slow })
+    const events = capture(h)
+    const seen: unknown[] = []
+    const consumer = h.harbor.consumer({ groupId: 'g', fromBeginning: true, autoCreateTopics: true, retry: { levels: [{ delay: 0 }] } })
+    consumer.subscribe('orders', (message) => { seen.push(message.value) })
+    await consumer.start()
+    await h.harbor.producer().send('orders', { value: { id: 'a' } })
+    await until(() => seen.length === 1)
+    assert.deepEqual(seen, [{ id: 'a' }])
+    assert.deepEqual(events.messageFailed.map((event) => [event.topic, event.outcome]), [['orders', 'retry']])
+    assert.equal((events.messageFailed[0]?.error as Error).message, 'codec service away')
+    assert.equal(h.adapter.messages('orders-dlq').length, 0)
+    await h.harbor.shutdown()
+  })
+
+  test('a redrive stops on a transient deserialization failure, uncommitted, instead of skipping the message', async () => {
+    let outages = 1
+    const flaky = {
+      serialize: (value: unknown): Buffer => Buffer.from(JSON.stringify(value)),
+      deserialize: async (bytes: Buffer): Promise<unknown> => {
+        if (outages-- > 0) throw Object.assign(new Error('codec service away'), { retryable: true })
+        return JSON.parse(bytes.toString('utf8'))
+      }
+    }
+    const h = harness({ serializer: flaky })
+    await h.harbor.connect()
+    h.adapter.createTopic('orders-dlq')
+    await h.adapter.produce([{ topic: 'orders-dlq', key: null, value: Buffer.from('{"id":"a"}'), headers: { 'x-original-topic': 'orders' } }])
+    await assert.rejects(h.harbor.redrive({ from: 'orders-dlq', idleTimeout: 0, filter: () => true }), /codec service away/)
+    assert.equal(h.adapter.committed('orders-dlq-redrive', 'orders-dlq', 0), undefined)
+    const again = await h.harbor.redrive({ from: 'orders-dlq', idleTimeout: 0, filter: () => true })
+    assert.equal(again.reprocessed, 1, 'run again once the service is back, it picks up where it stopped')
+    await h.harbor.shutdown()
+  })
+
+  test('a batch with one value an asynchronous serializer refuses produces nothing', async () => {
+    const picky = {
+      serialize: async (value: unknown): Promise<Buffer> => {
+        if (value === 'bad') throw new Error('refused')
+        return Buffer.from(String(value))
+      },
+      deserialize: async (bytes: Buffer): Promise<unknown> => bytes.toString('utf8')
+    }
+    const h = harness({ serializer: picky })
+    await assert.rejects(h.harbor.producer().sendBatch('orders', [{ value: 'ok' }, { value: 'bad' }]), /refused/)
+    assert.equal(h.adapter.messages('orders').length, 0)
+    await h.harbor.shutdown()
+  })
+})

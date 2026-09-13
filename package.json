@@ -81,6 +81,36 @@
         "types": "./dist/otel.d.cts",
         "default": "./dist/otel.cjs"
       }
+    },
+    "./schema-registry": {
+      "import": {
+        "types": "./dist/schema-registry.d.ts",
+        "default": "./dist/schema-registry.mjs"
+      },
+      "require": {
+        "types": "./dist/schema-registry.d.cts",
+        "default": "./dist/schema-registry.cjs"
+      }
+    },
+    "./decorators": {
+      "import": {
+        "types": "./dist/decorators.d.ts",
+        "default": "./dist/decorators.mjs"
+      },
+      "require": {
+        "types": "./dist/decorators.d.cts",
+        "default": "./dist/decorators.cjs"
+      }
+    },
+    "./nestjs": {
+      "import": {
+        "types": "./dist/nestjs.d.ts",
+        "default": "./dist/nestjs.mjs"
+      },
+      "require": {
+        "types": "./dist/nestjs.d.cts",
+        "default": "./dist/nestjs.cjs"
+      }
     }
   },
   "files": [
@@ -100,7 +130,7 @@
     "test:integration": "node --import tsx --test --test-timeout=180000 --test-concurrency=1 'tests/integration/**/*.test.ts'",
     "test:mutation": "stryker run",
     "test:mutation:changed": "node scripts/mutation-changed.mjs",
-    "examples": "node --import tsx examples/handler-signatures.ts && node --import tsx --test examples/testing-handlers.ts",
+    "examples": "node --import tsx examples/handler-signatures.ts && node --import tsx --test examples/testing-handlers.ts && node --import tsx examples/nestjs.ts",
     "check:types": "tsc --noEmit",
     "check:types:next": "node node_modules/typescript7/bin/tsc --noEmit",
     "check:dist": "npm run build && tsc -p tests/consumer/tsconfig.json",
@@ -123,11 +153,23 @@
   },
   "peerDependencies": {
     "@confluentinc/kafka-javascript": "^1.10.0",
+    "@confluentinc/schemaregistry": "^1.10.0",
+    "@nestjs/common": ">=10",
+    "@nestjs/core": ">=10",
     "@opentelemetry/api": "^1.9.0",
     "prom-client": "^15.0.0"
   },
   "peerDependenciesMeta": {
     "@confluentinc/kafka-javascript": {
+      "optional": true
+    },
+    "@confluentinc/schemaregistry": {
+      "optional": true
+    },
+    "@nestjs/common": {
+      "optional": true
+    },
+    "@nestjs/core": {
       "optional": true
     },
     "@opentelemetry/api": {
@@ -141,7 +183,11 @@
     "@commitlint/cli": "^21.2.2",
     "@commitlint/config-conventional": "^21.2.2",
     "@confluentinc/kafka-javascript": "^1.10.0",
+    "@confluentinc/schemaregistry": "^1.10.1",
     "@microsoft/api-extractor": "^7.59.0",
+    "@nestjs/common": "^12.0.1",
+    "@nestjs/core": "^12.0.1",
+    "@nestjs/testing": "^12.0.1",
     "@opentelemetry/api": "^1.9.1",
     "@opentelemetry/context-async-hooks": "^2.11.0",
     "@opentelemetry/core": "^2.11.0",
@@ -158,8 +204,10 @@
     "neostandard": "^0.13.0",
     "prom-client": "^15.1.3",
     "quayside": "^1.4.0",
+    "reflect-metadata": "^0.2.2",
     "rollup": "^4.63.1",
     "rollup-plugin-dts": "^6.4.1",
+    "rxjs": "^7.8.2",
     "testcontainers": "^12.1.0",
     "tslib": "^2.8.1",
     "tsx": "^4.23.13",
