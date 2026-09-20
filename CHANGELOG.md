@@ -1,5 +1,18 @@
 # CHANGELOG
 
+## 0.7.0 (2026-09-20)
+
+* chore(deps-dev): bump @nestjs/common from 12.0.1 to 12.0.3 by dependabot[bot] [View](https://github.com/pinceladasdaweb/kafka-harbor/commit/e77bb06876ef2418bf260549697051cb183afacc)
+* chore(deps-dev): bump lint-staged from 17.5.0 to 17.5.1 by dependabot[bot] [View](https://github.com/pinceladasdaweb/kafka-harbor/commit/dd70f58d34af9bf78b7df74c90590fcf860585f9)
+* chore(deps-dev): bump @types/node from 26.5.0 to 26.6.1 by dependabot[bot] [View](https://github.com/pinceladasdaweb/kafka-harbor/commit/948651b3c52d04b04f74a22d2570fcf7091eaf1c)
+* chore(deps-dev): bump @nestjs/core from 12.0.1 to 12.0.3 by dependabot[bot] [View](https://github.com/pinceladasdaweb/kafka-harbor/commit/07769e2815b44bfcd4da66ae425251a8171258c7)
+* chore(deps-dev): bump @confluentinc/kafka-javascript by dependabot[bot] [View](https://github.com/pinceladasdaweb/kafka-harbor/commit/e13aacc1488073942fabb51074ced309b11b45a5)
+* chore(deps-dev): bump @nestjs/testing from 12.0.1 to 12.0.3 by dependabot[bot] [View](https://github.com/pinceladasdaweb/kafka-harbor/commit/9b876fb881651cace2cdf7f80f3e72080009cac0)
+* chore(deps-dev): bump rollup from 4.63.1 to 4.63.3 by dependabot[bot] [View](https://github.com/pinceladasdaweb/kafka-harbor/commit/27e784614f511d2649a810abed2320342883dc3f)
+* feat: platformatic adapter, a second client behind the same contract by Pedro Rogério [View](https://github.com/pinceladasdaweb/kafka-harbor/commit/e0bdfe221d5e1a4a6e8b5739bf277baad6791876)
+* test: close the gaps a mutation round found in the suites by Pedro Rogério [View](https://github.com/pinceladasdaweb/kafka-harbor/commit/4109726d0ce7e820e9a18a30d8a2679aeb49f552)
+
+
 ## 0.6.0 (2026-09-13)
 
 * feat: schema registry serializer, and serializers may be asynchronous by Pedro Rogério [View](https://github.com/pinceladasdaweb/kafka-harbor/commit/a4a73673eb0cf999b366887b2d84040c70830011)
