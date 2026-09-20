@@ -12,6 +12,7 @@ import { schemaRegistrySerializer } from 'kafka-harbor/schema-registry'
 import { KafkaConsumer, KafkaListener, bindListeners } from 'kafka-harbor/decorators'
 import { KafkaHarborModule } from 'kafka-harbor/nestjs'
 import { confluentAdapter } from 'kafka-harbor/adapters/confluent'
+import { platformaticAdapter } from 'kafka-harbor/adapters/platformatic'
 import { AvroDeserializer, AvroSerializer, MockClient, SerdeType } from '@confluentinc/schemaregistry'
 import { Idempotency } from 'quayside'
 import { MemoryStorage } from 'quayside/memory'
@@ -22,6 +23,8 @@ interface Order { id: string, total: number }
 
 const useMemory: boolean = false
 const adapter: ClientAdapter = useMemory ? memoryAdapter() : confluentAdapter()
+// The pure TypeScript client behind the same contract; the options it takes are the client's own.
+export const portable: ClientAdapter = platformaticAdapter({ consumer: { sessionTimeout: 30_000 }, producer: { compression: 'gzip' } })
 
 export const harbor = createHarbor({ clientId: 'consumer-check', brokers: ['localhost:9092'], adapter })
 

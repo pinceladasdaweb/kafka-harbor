@@ -24,9 +24,9 @@
  *     back as null or is left out.
  *
  * In this repository the suite runs against the in-memory adapter in the
- * unit run and against the Confluent adapter on a Testcontainers broker in
- * the integration run. The second adapter is what proves the contract did
- * not leak the client.
+ * unit run and against the Confluent and platformatic adapters on a
+ * Testcontainers broker in the integration run. Two clients behind the same
+ * suite is what proves the contract did not leak either of them.
  */
 import assert from 'node:assert/strict'
 import { after, before, describe, test } from 'node:test'

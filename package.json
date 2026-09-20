@@ -12,6 +12,7 @@
     "graceful-shutdown",
     "confluent",
     "librdkafka",
+    "platformatic",
     "typescript",
     "prometheus",
     "opentelemetry"
@@ -50,6 +51,16 @@
       "require": {
         "types": "./dist/adapters/confluent.d.cts",
         "default": "./dist/adapters/confluent.cjs"
+      }
+    },
+    "./adapters/platformatic": {
+      "import": {
+        "types": "./dist/adapters/platformatic.d.ts",
+        "default": "./dist/adapters/platformatic.mjs"
+      },
+      "require": {
+        "types": "./dist/adapters/platformatic.d.cts",
+        "default": "./dist/adapters/platformatic.cjs"
       }
     },
     "./testing": {
@@ -157,6 +168,7 @@
     "@nestjs/common": ">=10",
     "@nestjs/core": ">=10",
     "@opentelemetry/api": "^1.9.0",
+    "@platformatic/kafka": "^2.11.0",
     "prom-client": "^15.0.0"
   },
   "peerDependenciesMeta": {
@@ -173,6 +185,9 @@
       "optional": true
     },
     "@opentelemetry/api": {
+      "optional": true
+    },
+    "@platformatic/kafka": {
       "optional": true
     },
     "prom-client": {
@@ -193,6 +208,7 @@
     "@opentelemetry/core": "^2.11.0",
     "@opentelemetry/sdk-metrics": "^2.11.0",
     "@opentelemetry/sdk-trace-base": "^2.11.0",
+    "@platformatic/kafka": "^2.11.0",
     "@rollup/plugin-typescript": "^12.3.0",
     "@stryker-mutator/core": "^10.0.0",
     "@stryker-mutator/tap-runner": "^10.0.0",
