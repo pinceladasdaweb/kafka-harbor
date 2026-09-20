@@ -61,7 +61,7 @@ harbor.enableSignalHandlers()        // SIGTERM -> finish in-flight handlers, co
 
 ## Why another Kafka library?
 
-It is not a client. kafka-harbor runs **on top of** a client through a small `ClientAdapter` interface (connect, produce, consume, commit, pause, resume, admin). The default adapter wraps [`@confluentinc/kafka-javascript`](https://github.com/confluentinc/confluent-kafka-javascript), Confluent's supported client with librdkafka underneath, and the interface is designed so that the core never sees a client type.
+It is not a client. kafka-harbor runs **on top of** a client through a small `ClientAdapter` interface (connect, produce, consume, commit, pause, resume, admin). Two adapters ship with it: the default wraps [`@confluentinc/kafka-javascript`](https://github.com/confluentinc/confluent-kafka-javascript), Confluent's supported client with librdkafka underneath, and `kafka-harbor/adapters/platformatic` wraps [`@platformatic/kafka`](https://github.com/platformatic/kafka), a pure TypeScript client with no native binding. The interface is designed so that the core never sees a client type, and the same contract suite runs against both.
 
 Every Node.js team using Kafka ends up writing the same application layer on top of whichever client they picked, because the clients stop at the protocol. The comparison below is against the clients themselves, which is the honest one: kafka-harbor is not a replacement for them, it runs on top of one.
 
@@ -81,7 +81,7 @@ Every Node.js team using Kafka ends up writing the same application layer on top
 | Idempotent producer and `acks=all` on by default | ✅ set by the adapter, cannot be overridden by accident | ➖ opt-in | ➖ opt-in | ➖ opt-in |
 | Runtime dependencies | breakwater + the client you choose | native librdkafka | none (pure JS) | none (pure TS) |
 
-The rows are not a knock on the clients: transactions, exactly-once, the schema registry client itself, fetch tuning and wire performance are theirs, and the Confluent client is the one kafka-harbor recommends underneath. The rows are the layer every project rebuilds by hand, done once, with the ordering guarantees tested against a real broker.
+The rows are not a knock on the clients: transactions, exactly-once, the schema registry client itself, fetch tuning and wire performance are theirs, and the Confluent client is the default underneath and the platformatic client the pure TypeScript alternative, both behind the same adapter contract. The rows are the layer every project rebuilds by hand, done once, with the ordering guarantees tested against a real broker.
 
 The design principle behind every decision: **losing a message is never the default.** Every failure ends in a retry topic, in the DLQ, or in an explicit stop of the consumer. There is no silent path.
 
@@ -91,7 +91,7 @@ The design principle behind every decision: **losing a message is never the defa
 - **A retry delay must fit under the poll interval** (`maxProcessingTime`, default 5 minutes), because the retry consumer waits the delay before the handler runs. The Confluent adapter sets the client's `max.poll.interval.ms` from it; a longer ladder needs a longer `maxProcessingTime`.
 - **Retry breaks ordering.** A message that goes through a retry topic is processed after later messages on the original topic. The alternative, blocking the partition until it succeeds, is what `harbor.abort()` gives you.
 - **Durations top out at about 24.8 days** (`2147483647` ms), the longest a timer can hold. A longer shutdown timeout or retry delay is a `ConfigError`, not a wait that ends after a millisecond.
-- **The default adapter has a native dependency.** `@confluentinc/kafka-javascript` ships prebuilt binaries for Node 18 to 24 on Linux (glibc and musl, x64 and arm64), macOS and Windows; on Node 26 it compiles librdkafka at install and needs a build toolchain in the image. [Docker images](#docker-images) lists what was verified. Any other client can be plugged in through `ClientAdapter`.
+- **The default adapter has a native dependency.** `@confluentinc/kafka-javascript` ships prebuilt binaries for Node 18 to 24 on Linux (glibc and musl, x64 and arm64), macOS and Windows; on Node 26 it compiles librdkafka at install and needs a build toolchain in the image. [Docker images](#docker-images) lists what was verified. `kafka-harbor/adapters/platformatic` needs no binary at all, and any other client can be plugged in through `ClientAdapter`.
 - **No transactions.** The producer is idempotent and the consumer commits after the handler; there is no `sendOffsetsToTransaction`, so a handler that produces and consumes is at-least-once on both sides.
 
 ## Install
@@ -100,7 +100,13 @@ The design principle behind every decision: **losing a message is never the defa
 npm install kafka-harbor @confluentinc/kafka-javascript
 ```
 
-The Confluent client is a peer dependency: install it when you use `kafka-harbor/adapters/confluent`. Node.js >= 22 is required by kafka-harbor itself.
+or, with the pure TypeScript client:
+
+```bash
+npm install kafka-harbor @platformatic/kafka
+```
+
+The clients are optional peer dependencies: install the one behind the adapter you use (`kafka-harbor/adapters/confluent` or `kafka-harbor/adapters/platformatic`). Node.js >= 22 is required by kafka-harbor itself.
 
 ### Docker images
 
@@ -147,7 +153,7 @@ RUN npm ci
 
 The runtime image then needs the shared library the binding was linked against (`librdkafka1` from the Confluent repository on Debian, `librdkafka` on Alpine), not the compiler; a multi-stage build copies `node_modules` from the build stage. `librdkafka-dev` from Debian's own repository is older than what the client bundles; the Confluent repository carries the matching one. On Node 22 and 24 none of this is needed: the prebuilt binary is downloaded and the official images work as they are.
 
-The default static build, the one `npm install` attempts on its own when no binary exists, cannot complete on Linux from an npm install: librdkafka merges its static dependencies with a GNU `ar` MRI script (`ADDLIB /path/to/lib.a`), and GNU `ar` (binutils 2.40 verified) cuts such a path at an `@`, which every scoped package path (`node_modules/@confluentinc/...`) contains. The same script with the `@` removed from the path succeeds. macOS builds from source because Apple's `libtool` is used there instead of `ar`, which is why a Node 26 install works on a Mac with Xcode's command line tools and fails in a Linux container with the same toolchain. Any other client can be plugged in through `ClientAdapter`, without a native dependency.
+The default static build, the one `npm install` attempts on its own when no binary exists, cannot complete on Linux from an npm install: librdkafka merges its static dependencies with a GNU `ar` MRI script (`ADDLIB /path/to/lib.a`), and GNU `ar` (binutils 2.40 verified) cuts such a path at an `@`, which every scoped package path (`node_modules/@confluentinc/...`) contains. The same script with the `@` removed from the path succeeds. macOS builds from source because Apple's `libtool` is used there instead of `ar`, which is why a Node 26 install works on a Mac with Xcode's command line tools and fails in a Linux container with the same toolchain. None of this applies to `kafka-harbor/adapters/platformatic`: `@platformatic/kafka` is TypeScript all the way down and installs on every image Node runs on.
 
 ## Core concepts
 
@@ -543,6 +549,20 @@ confluentAdapter({
 ```
 
 The Confluent adapter sets `acks=all` and `enable.idempotence=true` on the producer, `enable.auto.commit=false` on consumers, and loads the client module on first connect, so importing the adapter never touches the native binding. The three properties the offset policy depends on (`enable.auto.commit`, `enable.auto.offset.store`, `auto.offset.reset`) cannot be overridden through the passthrough; `fromBeginning` drives the reset policy. Client failures are retryable unless their code is definitive (authorization, oversized record, invalid argument), regardless of the client's own `retriable` flag, which only describes transactions.
+
+```ts
+import { platformaticAdapter } from 'kafka-harbor/adapters/platformatic'
+
+platformaticAdapter({
+  global: { connectTimeout: 5_000 },                  // options of every client the adapter opens
+  producer: { compression: 'gzip' },
+  consumer: { sessionTimeout: 30_000, maxWaitTime: 500 },
+  bufferedMessages: 1000,                             // messages held per consumption before the stream is left alone
+  reconnectDelayMs: 1000                              // the wait before a stream the client gave up on is opened again
+})
+```
+
+The platformatic adapter runs on [`@platformatic/kafka`](https://github.com/platformatic/kafka), pure TypeScript, no binary to download or compile. It pins `acks=-1` and an idempotent producer with a bounded number of client retries (the client would retry forever on its own), and `autocommit=false` with `mode: 'committed'` on consumers, `fromBeginning` choosing the fallback. The client delivers every partition of a consumption through one stream; the adapter queues per partition and runs one handler per partition up to `concurrency`, reading the stream only while fewer than `bufferedMessages` are waiting. Heartbeats run on the client's own timer, so a long handler never gets the member kicked out, and `maxProcessingTime` only bounds the harbor's own wait. Partitions are assigned among the members that subscribed to each topic (`partitionAssignerBySubscription`, replaceable through `consumer.partitionAssigner`): the client's own assigner spreads every topic over every member, which strands partitions when members of a group subscribe to different topics, and one member per retry level is how the harbor lays a group out. Each worker slot takes one message and moves to the next partition in line, so a partition with a long queue never starves the others. Two differences from the Confluent adapter are worth knowing. A rebalance cannot be held back: a handler still running on a partition this member lost finishes and commits, and the new owner may already be past that offset, which costs a duplicate and never a message; what was queued for a lost partition is dropped, and a partition that comes back is read from a fresh stream, never from what the old one had fetched. Client answers Kafka marks as not retriable, authentication failures, refused arguments and a codec or API the client lacks are definitive; transport failures and timeouts are retryable.
 
 Writing your own adapter means implementing `ClientAdapter` and running `runAdapterContract` from `kafka-harbor/testing` against your backend. The contract is small on purpose: connect, disconnect, produce with acknowledgment, consume with per-partition ordering and a settled-promise gate, commit, stop, optional pause/resume, two admin calls, and two optional offset calls that `lag()` is computed from. Everything else lives in the core.
 

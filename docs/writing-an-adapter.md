@@ -6,7 +6,12 @@ serialization, offset policy and shutdown are the core's job, and an adapter
 that starts doing any of them is a bug.
 
 The Confluent adapter (`src/adapters/confluent/index.ts`) is the reference:
-about 150 lines, no logic beyond translation.
+no logic beyond translation, because that client already delivers per
+partition with a callback. The platformatic adapter
+(`src/adapters/platformatic/index.ts`) shows the other shape: a client that
+hands out one stream with every partition interleaved, and the queue per
+partition the adapter builds in front of `eachMessage` to give the core the
+gate it relies on.
 
 ## The contract
 

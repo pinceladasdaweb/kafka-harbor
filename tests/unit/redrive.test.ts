@@ -151,6 +151,29 @@ describe('harbor.redrive', () => {
     await h.harbor.shutdown()
   })
 
+  test('a blank original-topic header is as good as none', async () => {
+    const h = harness()
+    await deadLetter(h, [{ value: 1, original: '   ' }])
+    await assert.rejects(h.harbor.redrive({ from: 'orders-dlq' }), (error: unknown) => {
+      assert.equal((error as { code: string }).code, ERROR_CODES.CONFIG_INVALID)
+      assert.match((error as Error).message, /x-original-topic/)
+      return true
+    })
+    assert.equal(h.adapter.messages('orders').length, 0)
+    assert.equal(h.adapter.committed('orders-dlq-redrive', 'orders-dlq', 0), undefined)
+    await h.harbor.shutdown()
+  })
+
+  test('max counts the skipped messages as well as the re-injected ones', async () => {
+    const h = harness()
+    await deadLetter(h, [{ value: 1, original: 'orders' }, { value: 2, original: 'orders' }, { value: 3, original: 'orders' }])
+    const result = await h.harbor.redrive({ from: 'orders-dlq', max: 2, filter: (message) => message.value !== 1 })
+    assert.deepEqual(result, { from: 'orders-dlq', reprocessed: 1, skipped: 1 })
+    assert.deepEqual(h.adapter.messages('orders').map((m) => json(m.value)), [2])
+    assert.equal(h.adapter.committed('orders-dlq-redrive', 'orders-dlq', 0), '2')
+    await h.harbor.shutdown()
+  })
+
   test('a destination equal to the source is refused, whether explicit or read from the header', async () => {
     const h = harness()
     await deadLetter(h, [{ value: 1, original: 'orders-dlq' }])

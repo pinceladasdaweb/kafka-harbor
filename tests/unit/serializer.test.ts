@@ -48,10 +48,26 @@ describe('jsonSerializer', () => {
     }
   })
 
-  test('rejects cycles', () => {
+  test('rejects cycles, naming the cycle', () => {
     const value: { self?: unknown } = {}
     value.self = value
-    assert.throws(() => codec.serialize(value, 't'), { code: ERROR_CODES.SERIALIZATION })
+    assert.throws(() => codec.serialize(value, 't'), (error: unknown) => {
+      assert.equal((error as { code: string }).code, ERROR_CODES.SERIALIZATION)
+      assert.match((error as Error).message, /closes a cycle/)
+      return true
+    })
+    const deep: { items: Array<{ back?: unknown }> } = { items: [{}] }
+    deep.items[0]!.back = deep
+    assert.throws(() => codec.serialize(deep, 't'), /items\[0\]\.back.*closes a cycle/)
+  })
+
+  test('a getter that throws inside a nested object surfaces its own error as the cause', () => {
+    const value = { order: { get boom (): number { throw new Error('nested exploded') } } }
+    assert.throws(() => codec.serialize(value, 'orders'), (error: unknown) => {
+      assert.ok(isSerializationError(error))
+      assert.equal(((error as { cause: Error }).cause).message, 'nested exploded')
+      return true
+    })
   })
 
   test('a getter that throws while encoding surfaces as a SerializationError with the cause', () => {

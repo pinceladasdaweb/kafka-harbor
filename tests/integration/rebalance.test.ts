@@ -2,14 +2,16 @@
  * Basic rebalancing on a real broker: a second member joins the group while
  * the first is processing, partitions move, and every message is still
  * processed at least once with nothing lost. Then the redrive utility is
- * exercised end to end against real dead letters.
+ * exercised end to end against real dead letters. Both suites run once per
+ * adapter: the rebalance is where the two clients differ most.
  */
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
 import { after, before, describe, test } from 'node:test'
 
 import { confluentAdapter } from '../../src/adapters/confluent/index'
-import { createHarbor, type Harbor } from '../../src/index'
+import { platformaticAdapter } from '../../src/adapters/platformatic/index'
+import { createHarbor, type ClientAdapter, type Harbor } from '../../src/index'
 import { silentLogger } from '../helpers/harness'
 import { startKafka, type KafkaFixture } from '../helpers/kafka'
 
@@ -31,8 +33,8 @@ const waitFor = async (condition: () => boolean, timeoutMs: number, what: string
   }
 }
 
-const openHarbor = (clientId: string) => {
-  const adapter = confluentAdapter()
+const openHarbor = (build: () => ClientAdapter, clientId: string) => {
+  const adapter = build()
   const harbor = createHarbor({ clientId, brokers: kafka!.brokers, adapter, logger: silentLogger })
   return { harbor, adapter }
 }
@@ -45,14 +47,14 @@ const withHarbors = async (harbors: Harbor[], run: () => Promise<void>): Promise
   }
 }
 
-describe('rebalancing and redrive on a real broker', () => {
+const suite = (name: string, build: () => ClientAdapter): Promise<void> => describe(`rebalancing and redrive on a real broker (${name})`, () => {
   test('a member joining mid-stream takes over partitions and every message is processed at least once', async (t) => {
     if (kafka === undefined) return t.skip('no Kafka container')
     const run = randomUUID().slice(0, 8)
     const topic = `rebalance-${run}`
     const groupId = `rebalance-${run}`
-    const first = openHarbor(`rb1-${run}`)
-    const second = openHarbor(`rb2-${run}`)
+    const first = openHarbor(build, `rb1-${run}`)
+    const second = openHarbor(build, `rb2-${run}`)
 
     await withHarbors([first.harbor, second.harbor], async () => {
       await first.harbor.connect()
@@ -94,7 +96,7 @@ describe('rebalancing and redrive on a real broker', () => {
     if (kafka === undefined) return t.skip('no Kafka container')
     const run = randomUUID().slice(0, 8)
     const topic = `redrive-${run}`
-    const { harbor, adapter } = openHarbor(`rd-${run}`)
+    const { harbor, adapter } = openHarbor(build, `rd-${run}`)
 
     await withHarbors([harbor], async () => {
       await harbor.connect()
@@ -127,3 +129,7 @@ describe('rebalancing and redrive on a real broker', () => {
     })
   })
 })
+
+suite('confluent', () => confluentAdapter())
+// Group timing short enough for the suite: the client's defaults are sized for production.
+suite('platformatic', () => platformaticAdapter({ consumer: { sessionTimeout: 10_000, heartbeatInterval: 1_000, rebalanceTimeout: 30_000 } }))

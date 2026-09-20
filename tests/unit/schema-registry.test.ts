@@ -128,9 +128,28 @@ describe('kafka-harbor/schema-registry', () => {
     assert.equal(isRegistryUnavailable(Object.assign(new Error('x'), { code: 'ECONNREFUSED', status: 400 })), false, 'an answer with a status is an answer')
     assert.equal(isRegistryUnavailable(Object.assign(new Error('x'), { code: 'ERR_INVALID_ARG' })), false)
     assert.equal(isRegistryUnavailable(new Error('Failed to get token from server: ECONNREFUSED')), true, 'the OAuth layer reports a token it could not obtain as a plain Error')
+    assert.equal(isRegistryUnavailable(new Error('schema rejected: Failed to get token from server')), false, 'only a message that starts with the token failure is one')
     assert.equal(isRegistryUnavailable(new Error('Unknown magic byte')), false)
     assert.equal(isRegistryUnavailable(null), false)
     assert.equal(isRegistryUnavailable('ECONNREFUSED'), false)
+  })
+
+  test('a classified failure keeps the client error as its cause and says whether to retry', async () => {
+    const flaky = schemaRegistrySerializer<Order>({
+      serializer: { serialize: async () => { throw Object.assign(new Error('connect ECONNREFUSED'), { code: 'ECONNREFUSED' }) } },
+      deserializer: { deserialize: async () => { throw new Error('Unknown magic byte') } }
+    })
+    await assert.rejects(Promise.resolve(flaky.serialize({ id: 'a', total: 1 }, 'orders')), (error: unknown) => {
+      assert.equal((error as { code: string }).code, ERROR_CODES.ADAPTER)
+      assert.equal((error as { retryable: boolean }).retryable, true)
+      assert.equal(((error as { cause: Error }).cause).message, 'connect ECONNREFUSED')
+      return true
+    })
+    await assert.rejects(Promise.resolve(flaky.deserialize(Buffer.from('x'), 'orders')), (error: unknown) => {
+      assert.equal((error as { code: string }).code, ERROR_CODES.SERIALIZATION)
+      assert.equal(((error as { cause: Error }).cause).message, 'Unknown magic byte')
+      return true
+    })
   })
 
   test('one side only: a consumer-only serializer refuses to produce and a producer-only one refuses to consume, both as ConfigError', async () => {

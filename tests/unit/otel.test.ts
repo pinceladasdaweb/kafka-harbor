@@ -7,7 +7,7 @@ import { CompositePropagator, W3CBaggagePropagator, W3CTraceContextPropagator } 
 import { InMemoryMetricExporter, MeterProvider, PeriodicExportingMetricReader, AggregationTemporality, type DataPoint } from '@opentelemetry/sdk-metrics'
 import { BasicTracerProvider, InMemorySpanExporter, SimpleSpanProcessor } from '@opentelemetry/sdk-trace-base'
 
-import { ERROR_CODES } from '../../src/index'
+import { AdapterError, ERROR_CODES, type IdempotencyEngine } from '../../src/index'
 import { otelMetrics, otelTracing } from '../../src/otel/index'
 import { captureErrors, captureEvents, gate, harness, silentLogger } from '../helpers/harness'
 import { until } from '../helpers/manual-clock'
@@ -190,6 +190,60 @@ describe('kafka-harbor/otel metrics', () => {
     await custom.shutdown()
   })
 
+  test('a failed message records its duration in seconds; the messages of a failed batch record none of their own', async () => {
+    const h = harness()
+    const m = metering()
+    otelMetrics(h.harbor, { meterProvider: m.provider, lag: false })
+    const failed = captureEvents(h.harbor, 'messageFailed')
+    const consumer = h.harbor.consumer({ groupId: 'g', fromBeginning: true, autoCreateTopics: true, retry: { levels: [{ delay: '1m' }] } })
+    consumer.subscribe('orders', () => { h.clock.advance(300); throw new Error('no') })
+    consumer.subscribeBatch('bulk', () => { h.clock.advance(400); throw new Error('no') }, { size: 2 })
+    await consumer.start()
+    await h.harbor.producer().send('orders', { value: 1 })
+    await h.harbor.producer().sendBatch('bulk', [{ value: 1 }, { value: 2 }])
+    await until(() => failed.length === 3)
+    const durations = (await m.points('kafka_harbor.message.processing.duration')) as unknown as Array<{ attributes: Record<string, unknown>, value: { sum: number, count: number } }>
+    assert.deepEqual(durations.map((point) => [point.attributes['kafka_harbor.topic'], point.attributes['kafka_harbor.outcome'], point.value.count, point.value.sum]), [['orders', 'retry', 1, 0.3]])
+    assert.equal(await m.point('kafka_harbor.messages.failed', { 'kafka_harbor.topic': 'bulk', 'kafka_harbor.outcome': 'retry' }), 2)
+    await h.harbor.shutdown()
+    await m.shutdown()
+  })
+
+  test('every instrument carries a description once exercised, and lag is not registered when it is off', async () => {
+    const h = harness()
+    const m = metering()
+    otelMetrics(h.harbor, { meterProvider: m.provider, lag: false })
+    const deadLettered = captureEvents(h.harbor, 'messageDeadLettered')
+    const processed = captureEvents(h.harbor, 'messageProcessed')
+    const consumer = h.harbor.consumer({ groupId: 'g', fromBeginning: true, autoCreateTopics: true, retry: { levels: [{ delay: 0 }] } })
+    consumer.subscribe('orders', () => { throw new Error('always') })
+    consumer.subscribeBatch('bulk', () => {}, { size: 1 })
+    const replaying = { executeWithMetadata: async () => ({ value: undefined, replayed: true }) } as unknown as IdempotencyEngine
+    consumer.subscribe('seen', () => {}, { idempotency: { engine: replaying } })
+    await consumer.start()
+    const producer = h.harbor.producer()
+    await producer.send('orders', { value: 1 })
+    await producer.send('bulk', { value: 1 })
+    await producer.send('seen', { value: 1 })
+    await until(() => deadLettered.length === 1 && processed.length === 2)
+    await h.harbor.redrive({ from: 'orders-dlq', to: 'parking', max: 1 })
+    h.adapter.failNextProduce(new AdapterError('down', { retryable: false }))
+    await assert.rejects(producer.send('orders', { value: 2 }), { code: ERROR_CODES.ADAPTER })
+    const running = (await m.descriptors()).map((d) => d.name)
+    assert.equal(running.includes('kafka_harbor.consumer.lag'), false, 'no lag gauge with lag off')
+    await h.harbor.shutdown()
+    const described = await m.descriptors()
+    const names = described.map((d) => d.name)
+    for (const expected of ['kafka_harbor.messages.replayed', 'kafka_harbor.batches.processed', 'kafka_harbor.batch.processing.duration', 'kafka_harbor.messages.failed', 'kafka_harbor.messages.retried', 'kafka_harbor.messages.dead_lettered', 'kafka_harbor.messages.redriven', 'kafka_harbor.errors', 'kafka_harbor.consumer.stops']) {
+      assert.ok(names.includes(expected), `${expected} recorded`)
+    }
+    for (const { name, description, unit } of described) {
+      assert.ok(description.length > 20, `${name} has a description`)
+      assert.ok(unit.length > 0, `${name} has a unit`)
+    }
+    await m.shutdown()
+  })
+
   test('producer failures count as errors with the producer scope', async () => {
     const h = harness()
     const m = metering()
@@ -357,6 +411,23 @@ describe('kafka-harbor/otel tracing', () => {
     assert.equal(process.attributes['messaging.batch.message_count'], 2)
     assert.equal(process.attributes['messaging.consumer.group.name'], 'g')
     assert.equal(process.attributes['messaging.destination.partition.id'], '0')
+    await h.harbor.shutdown()
+  })
+
+  test('a message without a trace context adds no link to the batch span', async () => {
+    const { exporter, instrumentation } = tracing()
+    const h = harness({ instrumentation })
+    const processed = captureEvents(h.harbor, 'messageProcessed')
+    const consumer = h.harbor.consumer({ groupId: 'g', fromBeginning: true, autoCreateTopics: true })
+    consumer.subscribeBatch('orders', () => {}, { size: 2 })
+    await consumer.start()
+    await h.harbor.producer().send('orders', { value: 1 })
+    await h.adapter.produce([{ topic: 'orders', key: null, value: Buffer.from('2'), headers: {} }])
+    await until(() => processed.length === 2)
+    const process = exporter.getFinishedSpans().find((span) => span.name === 'orders process')
+    assert.ok(process !== undefined)
+    assert.equal(process.links.length, 1)
+    assert.equal(process.attributes['messaging.batch.message_count'], 2)
     await h.harbor.shutdown()
   })
 
