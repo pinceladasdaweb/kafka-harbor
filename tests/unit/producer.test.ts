@@ -130,6 +130,15 @@ describe('Producer', () => {
     assert.equal(adapter.calls.filter((call) => call.method === 'produce').length, 3)
   })
 
+  test('with no retry policy given, a transient failure is retried after the default backoff and the send recovers', async () => {
+    const { adapter, harbor } = harness()
+    const producer = harbor.producer()
+    adapter.failNextProduce(new AdapterError('broker hiccup'))
+    await producer.send('orders', { value: 1 })
+    assert.equal(adapter.calls.filter((call) => call.method === 'produce').length, 2)
+    assert.equal(adapter.messages('orders').length, 1)
+  })
+
   test('exhausting the retries surfaces breakwater\'s RETRY_EXHAUSTED with the last failure as cause', async () => {
     const { adapter, harbor } = harness()
     const producer = harbor.producer({ retry: { attempts: 2, backoff: fixed(0) } })

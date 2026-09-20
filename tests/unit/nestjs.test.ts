@@ -120,6 +120,39 @@ describe('kafka-harbor/decorators with NestJS', () => {
     assert.deepEqual(moduleRef.get(KafkaListenersExplorer).consumers.map((consumer) => consumer.status), ['stopped', 'stopped'])
   })
 
+  test('the module is global unless told otherwise', () => {
+    const adapter = memoryAdapter()
+    assert.equal(KafkaHarborModule.forRoot({ clientId: 'x', brokers: ['memory:9092'], adapter }).global, true)
+    assert.equal(KafkaHarborModule.forRoot({ clientId: 'x', brokers: ['memory:9092'], adapter, global: false }).global, false)
+    assert.equal(KafkaHarborModule.forRootAsync({ useFactory: () => ({ clientId: 'x', brokers: ['memory:9092'], adapter }) }).global, true)
+    assert.equal(KafkaHarborModule.forRootAsync({ useFactory: () => ({ clientId: 'x', brokers: ['memory:9092'], adapter }), global: false }).global, false)
+  })
+
+  test('providers without listeners are left alone whatever their scope, and a symbol without a description marks nothing', async () => {
+    const adapter = memoryAdapter()
+
+    @Injectable({ scope: Scope.TRANSIENT })
+    class Transient {
+      nothing (): void {}
+    }
+
+    // Scoped too, so its class is what gets inspected for listener markers.
+    @Injectable({ scope: Scope.REQUEST })
+    class Marked {
+      nothing (): void {}
+    }
+    // eslint-disable-next-line symbol-description -- a symbol with no description is the case under test
+    Object.defineProperty(Marked.prototype, Symbol(), { value: 1 })
+
+    const moduleRef = await Test.createTestingModule({
+      imports: [KafkaHarborModule.forRoot({ clientId: 'nest-app', brokers: ['memory:9092'], adapter })],
+      providers: [Transient, Marked]
+    }).compile()
+    const app = await moduleRef.init()
+    assert.deepEqual(app.get(KafkaListenersExplorer).consumers, [])
+    await app.close()
+  })
+
   test('a decorated provider that is not a singleton is refused: a consumer needs one instance', async () => {
     const adapter = memoryAdapter()
 

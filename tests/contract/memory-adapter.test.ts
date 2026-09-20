@@ -33,6 +33,42 @@ describe('memoryAdapter specifics', () => {
     await adapter.disconnect()
   })
 
+  test('a negative or fractional partition is refused like one past the end', async () => {
+    const adapter = memoryAdapter({ partitions: 2 })
+    await adapter.connect({ clientId: 'c', brokers: ['memory'] })
+    for (const partition of [-1, 0.5]) {
+      await assert.rejects(adapter.produce([{ topic: 't', key: null, value: Buffer.from('x'), headers: {}, partition }]), { code: 'ADAPTER', retryable: false })
+    }
+    assert.equal(adapter.messages('t').length, 0)
+    await adapter.disconnect()
+  })
+
+  test('concurrency bounds the partitions in flight, and offset lookups are recorded as calls', async () => {
+    const adapter = memoryAdapter({ partitions: 3 })
+    await adapter.connect({ clientId: 'c', brokers: ['memory'] })
+    await adapter.produce([0, 1, 2].map((partition) => ({ topic: 't', key: null, value: Buffer.from(String(partition)), headers: {}, partition })))
+    let inFlight = 0
+    let maxInFlight = 0
+    const handle = await adapter.consume({
+      groupId: 'g',
+      topics: ['t'],
+      fromBeginning: true,
+      concurrency: 1,
+      eachMessage: async () => {
+        inFlight++
+        maxInFlight = Math.max(maxInFlight, inFlight)
+        await new Promise((resolve) => setTimeout(resolve, 10))
+        inFlight--
+      }
+    })
+    await adapter.whenDrained('g', 't')
+    assert.equal(maxInFlight, 1)
+    await handle.stop()
+    await adapter.admin.fetchCommittedOffsets?.('g', ['t'])
+    assert.ok(adapter.calls.some((call) => call.method === 'fetchCommittedOffsets'))
+    await adapter.disconnect()
+  })
+
   test('a batch with an invalid partition writes nothing at all', async () => {
     const adapter = memoryAdapter({ partitions: 2 })
     await adapter.connect({ clientId: 'c', brokers: ['memory'] })

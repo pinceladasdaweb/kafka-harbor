@@ -181,7 +181,7 @@ describe('consumer.subscribeBatch()', () => {
 
   test('harbor.abort() from a batch stops the consumer with nothing committed', async () => {
     const h = harness()
-    const { failed } = events(h)
+    const { failed, batches: runs } = events(h)
     const errors = captureErrors(h.harbor)
     const stopped: string[] = []
     h.harbor.on('consumerStopped', (event) => { stopped.push(event.reason) })
@@ -192,14 +192,16 @@ describe('consumer.subscribeBatch()', () => {
     await until(() => stopped.length === 1)
     assert.deepEqual(stopped, ['abort'])
     assert.deepEqual(failed.map((event) => event.outcome), ['abort', 'abort'])
+    assert.deepEqual(runs.map((run) => [run.topic, run.partition, run.groupId, run.size, run.outcome]), [['orders', 0, 'g', 2, 'abort']])
     assert.equal(errors.length, 1)
+    assert.deepEqual([errors[0]?.scope, errors[0]?.groupId, errors[0]?.topic, (errors[0]?.error as { code: string }).code], ['consumer', 'g', 'orders', ERROR_CODES.ABORT_PROCESSING])
     assert.equal(h.adapter.committed('g', 'orders', 0), undefined)
     await h.harbor.shutdown()
   })
 
   test('without a retry level and without a DLQ, a failing batch crashes the consumer, uncommitted', async () => {
     const h = harness()
-    const { failed } = events(h)
+    const { failed, batches: runs } = events(h)
     const stopped: string[] = []
     h.harbor.on('consumerStopped', (event) => { stopped.push(event.reason) })
     const consumer = h.harbor.consumer({ groupId: 'g', fromBeginning: true, autoCreateTopics: true, dlq: { enabled: false } })
@@ -209,6 +211,7 @@ describe('consumer.subscribeBatch()', () => {
     await until(() => stopped.length === 1)
     assert.deepEqual(stopped, ['crash'])
     assert.deepEqual(failed.map((event) => event.outcome), ['crash'])
+    assert.deepEqual(runs.map((run) => [run.topic, run.partition, run.groupId, run.size, run.outcome]), [['orders', 0, 'g', 2, 'crash']])
     assert.equal(h.adapter.committed('g', 'orders', 0), undefined)
     await h.harbor.shutdown()
   })
@@ -320,6 +323,41 @@ describe('consumer.subscribeBatch()', () => {
     assert.equal(h.adapter.committed('g', 'orders', 0), '3')
     assert.deepEqual(runs.map((run) => run.outcome), ['processed'])
     await h.harbor.shutdown()
+  })
+
+  test('a BatchFailedError without a cause fails its messages with itself, and the batch still counts as processed', async () => {
+    const h = harness()
+    const { processed, failed, batches: runs } = events(h)
+    const consumer = h.harbor.consumer({ groupId: 'g', fromBeginning: true, autoCreateTopics: true })
+    consumer.subscribeBatch<Order>('orders', (messages) => {
+      throw new BatchFailedError(messages.filter((message) => message.value.id === 'b'), undefined)
+    }, { size: 2 })
+    await consumer.start()
+    await h.harbor.producer<Order>().sendBatch('orders', orders('a', 'b'))
+    await until(() => processed.length === 1 && failed.length === 1)
+    assert.equal(failed[0]?.outcome, 'dead-letter')
+    assert.equal((failed[0]?.error as { code: string }).code, ERROR_CODES.BATCH_FAILED)
+    assert.deepEqual(runs.map((run) => run.outcome), ['processed'])
+    await h.harbor.shutdown()
+  })
+
+  test('a BatchFailedError naming a message of another topic or partition is a bug as well', async () => {
+    for (const [elsewhere, named] of [[{ topic: 'payments' }, 'payments[0]@0'], [{ partition: 7 }, 'orders[7]@0']] as const) {
+      const h = harness()
+      const stopped = captureEvents(h.harbor, 'consumerStopped')
+      const errors = captureErrors(h.harbor)
+      const consumer = h.harbor.consumer({ groupId: 'g', fromBeginning: true, autoCreateTopics: true })
+      consumer.subscribeBatch<Order>('orders', (messages) => {
+        throw new BatchFailedError([{ ...(messages[0] as Message<Order>), ...elsewhere }], new Error('elsewhere'))
+      }, { size: 2 })
+      await consumer.start()
+      await h.harbor.producer<Order>().sendBatch('orders', orders('a', 'b'))
+      await until(() => stopped.length === 1)
+      assert.equal(stopped[0]?.reason, 'crash')
+      assert.ok((errors[0]?.error as Error).message.includes(`names ${named}, which is not in the batch of orders[0] 0..1`), (errors[0]?.error as Error).message)
+      assert.equal(h.adapter.committed('g', 'orders', 0), undefined)
+      await h.harbor.shutdown()
+    }
   })
 
   test('a BatchFailedError naming a message outside the batch is a bug: the consumer stops, uncommitted', async () => {

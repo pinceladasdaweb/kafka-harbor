@@ -154,6 +154,24 @@ describe('kafka-harbor/decorators without a framework', () => {
     assert.equal(listenersOf(new Sealed()).length, 1)
   })
 
+  test('a consumer with the DLQ off binds its ordinary listeners; only a @DLQHandler is refused', () => {
+    const h = harness()
+    @KafkaConsumer({ groupId: 'g', dlq: { enabled: false } })
+    class Quiet {
+      @KafkaListener('orders')
+      onOrder (): void {}
+    }
+    assert.doesNotThrow(() => bindListeners(h.harbor, new Quiet()))
+    @KafkaConsumer({ groupId: 'g', dlq: { enabled: false } })
+    class Dead {
+      @DLQHandler('orders')
+      onDead (): void {}
+    }
+    assert.throws(() => bindListeners(h.harbor, new Dead()), /Dead.onDead handles the DLQ of "orders", but the consumer has the DLQ disabled/)
+    assert.equal(hasListeners(42), false)
+    assert.equal(hasListeners('Quiet'), false)
+  })
+
   test('the decorators also accept the legacy signature NestJS applications compile with', async () => {
     class Legacy {
       readonly seen: unknown[] = []

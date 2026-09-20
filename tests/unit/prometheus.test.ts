@@ -77,6 +77,26 @@ describe('kafka-harbor/prometheus', () => {
     await h.harbor.shutdown()
   })
 
+  test('a failed message records its duration in seconds; the messages of a failed batch record none of their own', async () => {
+    const h = harness()
+    const registry = new Registry()
+    prometheusMetrics(h.harbor, { registry, lag: false })
+    const failed = captureEvents(h.harbor, 'messageFailed')
+    const consumer = h.harbor.consumer({ groupId: 'g', fromBeginning: true, autoCreateTopics: true, retry: { levels: [{ delay: '1m' }] } })
+    consumer.subscribe('orders', () => { h.clock.advance(300); throw new Error('no') })
+    consumer.subscribeBatch('bulk', () => { h.clock.advance(400); throw new Error('no') }, { size: 2 })
+    await consumer.start()
+    await h.harbor.producer().send('orders', { value: 1 })
+    await h.harbor.producer().sendBatch('bulk', [{ value: 1 }, { value: 2 }])
+    await until(() => failed.length === 3)
+    assert.equal(await value(registry, 'kafka_harbor_message_processing_duration_seconds_count', { topic: 'orders', outcome: 'retry' }), 1)
+    assert.equal(await value(registry, 'kafka_harbor_message_processing_duration_seconds_sum', { topic: 'orders', outcome: 'retry' }), 0.3)
+    assert.equal(await value(registry, 'kafka_harbor_messages_failed_total', { topic: 'bulk', outcome: 'retry' }), 2)
+    assert.equal(await value(registry, 'kafka_harbor_message_processing_duration_seconds_count', { topic: 'bulk', outcome: 'retry' }), 0)
+    assert.equal(await value(registry, 'kafka_harbor_batch_processing_duration_seconds_sum', { topic: 'bulk', outcome: 'retry' }), 0.4)
+    await h.harbor.shutdown()
+  })
+
   test('a replay counts as processed and as replayed', async () => {
     const h = harness()
     const registry = new Registry()

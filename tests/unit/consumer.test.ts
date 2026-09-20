@@ -1018,6 +1018,26 @@ describe('Consumer: review regressions', () => {
     await h.harbor.shutdown()
   })
 
+  test('a partition revoked and assigned back is served again, batches included', async () => {
+    const h = harness({}, { partitions: 2 })
+    let revoke: ((partitions: Array<{ topic: string, partition: number }>) => Promise<void>) | undefined
+    const original = h.adapter.consume
+    h.adapter.consume = async (options) => {
+      revoke = options.onPartitionsRevoked as typeof revoke
+      return await original(options)
+    }
+    const consumer = h.harbor.consumer({ groupId: 'g', fromBeginning: true, autoCreateTopics: true })
+    consumer.subscribeBatch<string>('orders', () => {}, { size: 1 })
+    await consumer.start()
+    const producer = h.harbor.producer<string>()
+    await producer.send('orders', { value: 'before', partition: 0 })
+    await until(() => h.adapter.committed('g', 'orders', 0) === '1')
+    await (revoke as NonNullable<typeof revoke>)([{ topic: 'orders', partition: 0 }])
+    await producer.send('orders', { value: 'after', partition: 0 })
+    await until(() => h.adapter.committed('g', 'orders', 0) === '2')
+    await h.harbor.shutdown()
+  })
+
   test('the existence checks of the derived topics run at the same time, not one after the other', async () => {
     const h = harness()
     let releaseFirst!: () => void

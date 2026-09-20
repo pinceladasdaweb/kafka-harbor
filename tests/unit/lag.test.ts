@@ -175,14 +175,17 @@ describe('consumer.lag() and harbor.lag()', () => {
   })
 
   test('an adapter without offsets makes lag() a ConfigError naming the capability', async () => {
-    const h = harness()
-    delete (h.adapter.admin as { fetchTopicOffsets?: unknown }).fetchTopicOffsets
-    const consumer = h.harbor.consumer({ groupId: 'g', autoCreateTopics: true })
-    consumer.subscribe('orders', () => {})
-    await assert.rejects(consumer.lag(), (error: unknown) => {
-      assert.equal((error as { code: string }).code, ERROR_CODES.CONFIG_INVALID)
-      assert.match((error as Error).message, /adapter "memory" does not report offsets/)
-      return true
-    })
+    for (const missing of ['fetchTopicOffsets', 'fetchCommittedOffsets'] as const) {
+      const h = harness()
+      delete (h.adapter.admin as { fetchTopicOffsets?: unknown, fetchCommittedOffsets?: unknown })[missing]
+      const consumer = h.harbor.consumer({ groupId: 'g', autoCreateTopics: true })
+      consumer.subscribe('orders', () => {})
+      await assert.rejects(consumer.lag(), (error: unknown) => {
+        assert.equal((error as { code: string }).code, ERROR_CODES.CONFIG_INVALID)
+        assert.match((error as Error).message, /adapter "memory" does not report offsets/)
+        return true
+      })
+      assert.equal(h.adapter.calls.filter((call) => call.method === 'fetchTopicOffsets' || call.method === 'fetchCommittedOffsets').length, 0, `nothing asked with ${missing} missing`)
+    }
   })
 })

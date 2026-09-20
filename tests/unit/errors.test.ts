@@ -13,6 +13,8 @@ import {
   TopicMissingError,
   describeError,
   isAbortProcessingError,
+  isBatchFailedError,
+  isDeclaredRetryable,
   isHarborError,
   isSerializationError,
   isShutdownTimeoutError,
@@ -66,6 +68,23 @@ describe('type guards', () => {
       assert.equal(isSerializationError(value), false)
     }
     assert.equal(isHarborError({ code: 'CLOSED' }), true)
+  })
+})
+
+describe('shape guards', () => {
+  test('isBatchFailedError needs both the code and the list of failed messages', () => {
+    assert.equal(isBatchFailedError({ code: 'BATCH_FAILED' }), false)
+    assert.equal(isBatchFailedError({ failed: [] }), false)
+    assert.equal(isBatchFailedError({ code: 'BATCH_FAILED', failed: [] }), true)
+  })
+
+  test('isDeclaredRetryable is true only for an object that says retryable: true', () => {
+    for (const value of [null, undefined, 'retryable', 42, {}, { retryable: false }, { retryable: 'yes' }]) {
+      assert.equal(isDeclaredRetryable(value), false, `isDeclaredRetryable(${String(value)})`)
+    }
+    assert.equal(isDeclaredRetryable({ retryable: true }), true)
+    assert.equal(isDeclaredRetryable(new AdapterError('x', { retryable: true })), true)
+    assert.equal(isDeclaredRetryable(new AdapterError('x', { retryable: false })), false)
   })
 })
 
