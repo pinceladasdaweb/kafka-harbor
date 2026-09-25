@@ -97,6 +97,29 @@ describe('kafka-harbor/prometheus', () => {
     await h.harbor.shutdown()
   })
 
+  test('circuit breaker transitions are counted per topic by the state entered', async () => {
+    const h = harness()
+    const registry = new Registry()
+    prometheusMetrics(h.harbor, { registry, lag: false })
+    let listener: ((change: { from: string, to: string }) => void) | undefined
+    const policy = {
+      execute: async <T>(fn: () => Promise<T>) => await fn(),
+      stats: () => ({}),
+      on: (_event: string, handler: typeof listener) => { listener = handler },
+      off: () => {},
+      dispose: () => {}
+    } as unknown as import('breakwater').CircuitBreakerPolicy
+    const consumer = h.harbor.consumer({ groupId: 'g', fromBeginning: true, autoCreateTopics: true, breaker: { policy } })
+    consumer.subscribe('orders', () => {})
+    await consumer.start()
+    listener?.({ from: 'closed', to: 'open' })
+    listener?.({ from: 'open', to: 'half-open' })
+    listener?.({ from: 'half-open', to: 'open' })
+    assert.equal(await value(registry, 'kafka_harbor_circuit_state_changes_total', { group: 'g', topic: 'orders', to: 'open' }), 2)
+    assert.equal(await value(registry, 'kafka_harbor_circuit_state_changes_total', { group: 'g', topic: 'orders', to: 'half-open' }), 1)
+    await h.harbor.shutdown()
+  })
+
   test('a replay counts as processed and as replayed', async () => {
     const h = harness()
     const registry = new Registry()

@@ -4,6 +4,7 @@ import {
   ConfigError,
   ShutdownTimeoutError,
   TopicMissingError,
+  HoldExpiredError,
   describeError,
   isAbortProcessingError,
   isBatchFailedError,
@@ -31,6 +32,9 @@ import { OFFSET_PATTERN, commitAfter, offsetDistance } from './commit'
 import type { Duration, MessageHeaders, Logger, Message } from './types'
 import { decodeHeaders, readRetryInfo, writeRetryInfo } from './headers'
 import { defaultIdempotencyKey, type IdempotencyOptions } from './idempotency'
+import type { BreakerState } from 'breakwater'
+
+import { isCircuitRejection, resolveBreaker, type Breaker, type CircuitStateChange, type ConsumerBreakerOptions } from './breaker'
 import type { ConsumerHandle, RawMessage, TopicPartition, TopicSpec } from './adapter'
 import { firstRejection, requireNonEmptyString, requirePositiveInteger } from './validate'
 
@@ -80,11 +84,15 @@ export interface SubscribeOptions<T = unknown> {
   serializer?: Serializer<T>
   /** Overrides the consumer's idempotency for this topic; the key function sees the topic's message type. */
   idempotency?: IdempotencyOptions<T>
+  /** Overrides the consumer's circuit breaker for this topic; `false` runs this topic without one. */
+  breaker?: ConsumerBreakerOptions | false
 }
 
 export interface SubscribeBatchOptions<T = unknown> {
   /** Overrides the consumer's serializer for this topic. */
   serializer?: Serializer<T>
+  /** Overrides the consumer's circuit breaker for this topic; `false` runs this topic without one. */
+  breaker?: ConsumerBreakerOptions | false
   /** The most messages a batch carries. Default: 100. */
   size?: number
   /** How long a partial batch waits for more messages before it runs, counted from its first message. Default: '1s'. */
@@ -138,6 +146,13 @@ export interface ConsumerOptions {
    */
   idempotency?: IdempotencyOptions
   /**
+   * A circuit breaker per topic, in front of the handler: once the failures
+   * cross the threshold the partition is held, nothing committed and
+   * nothing sent down the ladder, until the breaker lets a probe through
+   * or `hold` runs out. See `ConsumerBreakerOptions`.
+   */
+  breaker?: ConsumerBreakerOptions
+  /**
    * The longest a message may sit in the pipeline (retry delay included)
    * before the group would consider the consumer dead. Default: '5m',
    * Kafka's `max.poll.interval.ms`. Every retry delay must fit under it.
@@ -154,6 +169,8 @@ export interface ConsumerEvents extends ProduceEvents {
   /** One batch handler run that ended: `outcome` is `processed` when the handler resolved (messages it named as failed notwithstanding), the failure outcome otherwise. */
   batchProcessed: { topic: string, partition: number, groupId: string, size: number, durationMs: number, outcome: 'processed' | FailureOutcome }
   consumerStopped: { groupId: string, reason: StopReason }
+  /** The circuit breaker of a topic changed state; `open` means the partitions of that topic are being held. */
+  circuitStateChanged: { groupId: string, topic: string, from: BreakerState, to: BreakerState }
   error: HarborErrorEvent
 }
 
@@ -197,6 +214,7 @@ interface Subscription {
   readonly plan: TopicPlan
   readonly serializer: Serializer
   readonly idempotency: IdempotencyOptions | undefined
+  readonly breaker: Breaker | undefined
   readonly run: { readonly kind: 'each', readonly handler: Handler } | BatchRun
 }
 
@@ -207,7 +225,15 @@ interface Pending {
   readonly retry: Message['retry']
   readonly attempt: number
   readonly correlationId: string | undefined
+  /** When the adapter delivered it: what a hold is counted from. */
+  readonly receivedAt: number
 }
+
+/** Thrown out of a hold when the consumer began stopping or the partition is being taken away: the message is left uncommitted, not failed. */
+const HELD_UNTIL_RELEASED = Symbol('held until released')
+
+/** How often a held delivery asks the breaker again while the circuit is open. */
+const HOLD_POLL_MS = 1_000
 
 /**
  * The messages of one partition waiting to run as a batch. The adapter has
@@ -276,6 +302,8 @@ export class Consumer {
    * and only ever waits for handlers.
    */
   private readonly deliveries = new Map<Promise<void>, Delivery>()
+  /** The breakers of the guarded topics, with the listener that reports their state changes, released on stop. */
+  private readonly breakers: Array<{ breaker: Breaker, listener: (change: CircuitStateChange) => void }> = []
   /** The batch being collected on each partition of a batch subscription, keyed by `partitionKey`. */
   private readonly batches = new Map<string, Batch>()
   /**
@@ -336,11 +364,18 @@ export class Consumer {
   /** Registers a handler for a topic. Its retry ladder is consumed as well. */
   subscribe<T = unknown> (topic: string, handler: Handler<T>, options: SubscribeOptions<T> = {}): this {
     this.assertSubscribable(topic, handler, 'subscribe')
-    return this.route(topic, {
-      run: { kind: 'each', handler: handler as Handler },
-      serializer: (options.serializer ?? this.options.serializer ?? this.context.serializer) as Serializer,
-      idempotency: (options.idempotency as IdempotencyOptions | undefined) ?? this.options.idempotency
-    })
+    const breaker = this.guard(topic, options.breaker)
+    try {
+      return this.route(topic, {
+        run: { kind: 'each', handler: handler as Handler },
+        serializer: (options.serializer ?? this.options.serializer ?? this.context.serializer) as Serializer,
+        idempotency: (options.idempotency as IdempotencyOptions | undefined) ?? this.options.idempotency,
+        breaker
+      })
+    } catch (error) {
+      this.releaseBreaker(breaker)
+      throw error
+    }
   }
 
   /**
@@ -358,16 +393,53 @@ export class Consumer {
     if (this.options.idempotency !== undefined) {
       throw new ConfigError(`subscribeBatch("${topic}"): idempotency applies to single-message handlers; deduplicate inside the batch handler, or use another consumer`)
     }
-    return this.route(topic, {
-      run: {
-        kind: 'batch',
-        handler: handler as BatchHandler,
-        size: requirePositiveInteger(options.size ?? 100, 'size'),
-        maxWaitMs: parseDuration(options.maxWait ?? 1_000, 'maxWait')
-      },
-      serializer: (options.serializer ?? this.options.serializer ?? this.context.serializer) as Serializer,
-      idempotency: undefined
-    })
+    const breaker = this.guard(topic, options.breaker)
+    try {
+      return this.route(topic, {
+        run: {
+          kind: 'batch',
+          handler: handler as BatchHandler,
+          size: requirePositiveInteger(options.size ?? 100, 'size'),
+          maxWaitMs: parseDuration(options.maxWait ?? 1_000, 'maxWait')
+        },
+        serializer: (options.serializer ?? this.options.serializer ?? this.context.serializer) as Serializer,
+        idempotency: undefined,
+        breaker
+      })
+    } catch (error) {
+      this.releaseBreaker(breaker)
+      throw error
+    }
+  }
+
+  /** The topic's breaker, from its own options or the consumer's, reporting its state changes as events. */
+  private guard (topic: string, override: ConsumerBreakerOptions | false | undefined): Breaker | undefined {
+    const breaker = resolveBreaker(override ?? this.options.breaker, this.groupId, topic, this.maxProcessingTimeMs)
+    if (breaker === undefined) return undefined
+    const listener = ({ from, to }: CircuitStateChange): void => {
+      const line = `[kafka-harbor] group "${this.groupId}": circuit for "${topic}" ${from} -> ${to}`
+      if (to === 'open' || to === 'isolated') this.context.logger.warn(line)
+      else this.context.logger.info(line)
+      this.context.emit('circuitStateChanged', { groupId: this.groupId, topic, from, to })
+    }
+    breaker.policy.on('stateChange', listener)
+    this.breakers.push({ breaker, listener })
+    return breaker
+  }
+
+  /** Stops listening to a breaker; one built here is released as well. */
+  private releaseBreaker (breaker: Breaker | undefined): void {
+    const index = this.breakers.findIndex((entry) => entry.breaker === breaker)
+    if (index < 0) return
+    const [{ listener }] = this.breakers.splice(index, 1) as [{ breaker: Breaker, listener: (change: CircuitStateChange) => void }]
+    breaker?.policy.off('stateChange', listener)
+    if (breaker?.owned === true) breaker.policy.dispose()
+  }
+
+  /** The last state, from every path that ends a consumer: the breakers go with it. */
+  private finish (): void {
+    this.state = 'stopped'
+    for (const { breaker } of [...this.breakers]) this.releaseBreaker(breaker)
   }
 
   private assertSubscribable (topic: string, handler: unknown, method: string): void {
@@ -472,7 +544,7 @@ export class Consumer {
       this.assertNotStopping()
       await this.join()
     } catch (error) {
-      this.state = 'stopped'
+      this.finish()
       this.markReady()
       // A start that fails after the stop gave up on it failed because the
       // client is gone (or about to be); the caller asked for a closed
@@ -613,14 +685,14 @@ export class Consumer {
       if (!await this.settledInTime(this.ready, timeoutMs)) {
         this.context.logger.warn(`[kafka-harbor] group "${this.groupId}": start() did not finish within ${timeoutMs}ms; stopping without waiting for it`)
         this.startAbandoned = true
-        this.state = 'stopped'
+        this.finish()
         this.stopReason = reason
         this.context.emit('consumerStopped', { groupId: this.groupId, reason })
         return
       }
     }
     if (this.state === 'idle' || this.state === 'stopped') {
-      this.state = 'stopped'
+      this.finish()
       return
     }
     this.state = 'stopping'
@@ -647,7 +719,7 @@ export class Consumer {
     try {
       await this.leave()
     } finally {
-      this.state = 'stopped'
+      this.finish()
       this.context.emit('consumerStopped', { groupId: this.groupId, reason })
     }
     if (abandoned.length > 0 && reason === 'shutdown') {
@@ -726,6 +798,7 @@ export class Consumer {
   }
 
   private async process (raw: RawMessage, entry: Delivery): Promise<void> {
+    const receivedAt = this.context.clock.now()
     const route = this.routes.get(raw.topic)
     if (route === undefined) {
       throw new ConfigError(`received a message on "${raw.topic}", a topic this consumer never subscribed to`)
@@ -755,7 +828,7 @@ export class Consumer {
     // in between would snapshot the handler as not running and then find it
     // running. A stop aborts the drain signal and leaves 'running' together.
     if (this.state !== 'running') return
-    const item: Pending = { raw, headers, retry, attempt, correlationId }
+    const item: Pending = { raw, headers, retry, attempt, correlationId, receivedAt }
     if (subscription.run.kind === 'batch') {
       await this.collect(item, entry, subscription, subscription.run, level)
       return
@@ -778,11 +851,13 @@ export class Consumer {
         attempt
       }
       const { handler } = subscription.run
-      const { idempotency } = subscription
+      const { idempotency, breaker } = subscription
       const wrapHandler = this.context.instrumentation?.wrapHandler
-      if (wrapHandler === undefined && idempotency === undefined) {
-        await handler(message, handlerContext)
-      } else {
+      const runHandler = async (): Promise<void> => {
+        if (wrapHandler === undefined && idempotency === undefined) {
+          await handler(message, handlerContext)
+          return
+        }
         // The engine runs inside the instrumentation, so a span covers the
         // lookup as well as the handler, and a replay shows as a short span.
         const work = async (): Promise<void> => {
@@ -796,9 +871,14 @@ export class Consumer {
         }
         await wrapped(wrapHandler === undefined ? undefined : (run) => wrapHandler(message, handlerContext, run), work, this.context.logger)
       }
+      if (breaker === undefined) await runHandler()
+      else await this.guarded(breaker, item, runHandler)
     } catch (thrown) {
       error = thrown
     }
+    // Held by the breaker until the consumer began stopping: neither a
+    // verdict nor a failure. Left uncommitted for the next member.
+    if (error === HELD_UNTIL_RELEASED) return
     const durationMs = this.context.clock.now() - startedAt
     const at = this.locate(item)
 
@@ -826,6 +906,47 @@ export class Consumer {
     }
     if (!await this.commit(raw)) return
     this.emitFailure(item, verdict, error, durationMs)
+  }
+
+  /**
+   * Runs the handler through the topic's circuit breaker. While the circuit
+   * is open the delivery is held instead of failed: the partition waits
+   * (the adapter delivers nothing else on it), nothing is committed and
+   * nothing goes down the ladder, until the breaker lets a probe through
+   * or the hold runs out. The hold is counted from the moment the handler
+   * would have run and never reaches past what the client tolerates for
+   * the delivery as a whole (`maxProcessingTime` from when it was received,
+   * retry delay included). A hold that runs out fails the message with a
+   * retryable HoldExpiredError, so it walks the ladder and comes back when
+   * the dependency may be up. A stop, or a rebalance taking the partition
+   * away, ends the hold with the message uncommitted.
+   */
+  private async guarded (breaker: Breaker, item: Pending, run: () => Promise<void>): Promise<void> {
+    const key = partitionKey(item.raw.topic, item.raw.partition)
+    const tolerated = item.receivedAt + this.maxProcessingTimeMs
+    const deadline = breaker.holdMs === undefined ? tolerated : Math.min(this.context.clock.now() + breaker.holdMs, tolerated)
+    let heldSince: number | undefined
+    for (;;) {
+      // Only a rejection WITHOUT a run is a hold. A handler that threw the
+      // same code (its own inner breaker, say) ran and failed: that is its
+      // verdict, counted by the breaker, and the ladder gets it.
+      let entered = false
+      try {
+        await breaker.policy.execute(async () => {
+          entered = true
+          await run()
+        }, { signal: this.shutdownController.signal })
+        return
+      } catch (error) {
+        if (entered || !isCircuitRejection(error)) throw error
+        const now = this.context.clock.now()
+        heldSince ??= now
+        if (this.drainController.signal.aborted || this.revoking.has(key)) throw HELD_UNTIL_RELEASED
+        if (now >= deadline) throw new HoldExpiredError(breaker.topic, now - heldSince, { cause: error })
+        await this.context.clock.sleep(Math.min(deadline - now, HOLD_POLL_MS), this.drainController.signal)
+        if (this.drainController.signal.aborted || this.revoking.has(key)) throw HELD_UNTIL_RELEASED
+      }
+    }
   }
 
   /**
@@ -980,12 +1101,18 @@ export class Consumer {
     let error: unknown
     if (messages.length > 0) {
       const wrapBatch = this.context.instrumentation?.wrapBatchHandler
-      try {
+      const runHandler = async (): Promise<void> => {
         await wrapped(wrapBatch === undefined ? undefined : (wrappedRun) => wrapBatch(messages, context, wrappedRun), async () => { await run.handler(messages, context) }, this.context.logger)
+      }
+      try {
+        const { breaker } = subscription
+        if (breaker === undefined) await runHandler()
+        else await this.guarded(breaker, first, runHandler)
       } catch (thrown) {
         error = thrown
       }
     }
+    if (error === HELD_UNTIL_RELEASED) return
     const durationMs = this.context.clock.now() - startedAt
     if (this.shutdownController.signal.aborted) return
     const size = items.length

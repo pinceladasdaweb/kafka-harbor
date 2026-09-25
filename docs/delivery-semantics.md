@@ -120,6 +120,26 @@ Three consequences:
   `orders` or `orders-retry-1` is waiting for, whatever `concurrency` is;
   the original partition keeps flowing while retries wait.
 
+## Holding a partition
+
+With `breaker` on a consumer or a subscription, a topic whose circuit is
+open holds its partitions: the message in front of each one is neither
+committed nor forwarded, and nothing behind it is delivered until the
+circuit lets a probe through. Nothing is lost by a hold; the offset does
+not move. A hold ends in one of three ways. The probe succeeds and the
+circuit closes: the held message runs, commits, and the partition flows
+again. `hold` runs out (default: what is left of `maxProcessingTime`): the
+message fails with `HoldExpiredError`, retryable, so it takes the next hop
+of the ladder like any transient failure, and its retry copy meets the same
+circuit later. The consumer stops, or a rebalance takes the partition away: the message
+stays uncommitted and the next member gets it. `hold` is counted from the
+moment the handler would have run, and never reaches past what the client
+tolerates for the delivery as a whole (`maxProcessingTime` from when the
+message was delivered, retry delay included), so deeper on the ladder the
+hold is what the delay left. The probe itself is the next message of any held
+partition of that topic; a probe that fails walks the ladder with its own
+error and reopens the circuit.
+
 ## Shared retry topics
 
 A retry topic serves every subscription whose naming function produced its

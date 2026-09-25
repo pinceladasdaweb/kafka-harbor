@@ -168,13 +168,18 @@ export function runAdapterContract (name: string, setup: () => Promise<AdapterCo
 
     test('6. partitions are processed concurrently up to the concurrency option', async () => {
       const topic = await ctx.topic('concurrent', 2)
+      // Enough work per partition that the second partition's first fetch
+      // lands while the first is still busy, whatever the client's fetch
+      // timing: ten messages at 60ms is a 600ms window per partition.
+      const first = Array.from({ length: 10 }, (_, i) => `a${i}`)
+      const second = Array.from({ length: 10 }, (_, i) => `x${i}`)
       await ctx.adapter.produce([
-        ...['a', 'b', 'c'].map((value) => ({ topic, key: null, value: bytes(value), headers: {}, partition: 0 })),
-        ...['x', 'y', 'z'].map((value) => ({ topic, key: null, value: bytes(value), headers: {}, partition: 1 }))
+        ...first.map((value) => ({ topic, key: null, value: bytes(value), headers: {}, partition: 0 })),
+        ...second.map((value) => ({ topic, key: null, value: bytes(value), headers: {}, partition: 1 }))
       ])
       let inFlight = 0
       let maxInFlight = 0
-      const { received, handle } = await consumeAll(topic, ctx.group('concurrent'), 6, {
+      const { received, handle } = await consumeAll(topic, ctx.group('concurrent'), 20, {
         concurrency: 2,
         hold: async () => {
           inFlight++
@@ -184,10 +189,10 @@ export function runAdapterContract (name: string, setup: () => Promise<AdapterCo
         }
       })
       await handle.stop()
-      assert.equal(received.length, 6)
+      assert.equal(received.length, 20)
       assert.equal(maxInFlight, 2)
-      assert.deepEqual(received.filter((m) => m.partition === 0).map(valueOf), ['a', 'b', 'c'])
-      assert.deepEqual(received.filter((m) => m.partition === 1).map(valueOf), ['x', 'y', 'z'])
+      assert.deepEqual(received.filter((m) => m.partition === 0).map(valueOf), first)
+      assert.deepEqual(received.filter((m) => m.partition === 1).map(valueOf), second)
     })
 
     test('7. createTopics is idempotent and topicExists tells the truth', async () => {

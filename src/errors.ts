@@ -27,7 +27,9 @@ export const ERROR_CODES = {
   /** Handlers were still running when the shutdown timeout elapsed. */
   SHUTDOWN_TIMEOUT: 'SHUTDOWN_TIMEOUT',
   /** A batch handler named the messages of its batch that failed (`BatchFailedError`). */
-  BATCH_FAILED: 'BATCH_FAILED'
+  BATCH_FAILED: 'BATCH_FAILED',
+  /** A message waited its `breaker.hold` for the topic's circuit and it stayed open; it goes down the ladder. */
+  HOLD_EXPIRED: 'HOLD_EXPIRED'
 } as const
 
 export type HarborErrorCode = (typeof ERROR_CODES)[keyof typeof ERROR_CODES]
@@ -62,6 +64,25 @@ export class SerializationError extends HarborError {
     // A value that cannot be encoded will not encode on the next attempt
     // either: this is a deterministic failure, hence DLQ, never retry.
     super(ERROR_CODES.SERIALIZATION, message, { ...options, retryable: false })
+  }
+}
+
+/**
+ * The failure a message gets when the circuit breaker of its topic stayed
+ * open for the whole `breaker.hold`. Retryable: the dependency was down,
+ * not the message, so the ladder brings it back later. `cause` is the
+ * breaker's own rejection (breakwater's `CircuitOpenError` or
+ * `IsolatedError`), which never reaches a handler's ladder by itself.
+ */
+export class HoldExpiredError extends HarborError {
+  readonly topic: string
+  /** How long the message was held before giving up, ms. */
+  readonly heldMs: number
+
+  constructor (topic: string, heldMs: number, options?: ErrorOptions) {
+    super(ERROR_CODES.HOLD_EXPIRED, `circuit for "${topic}" stayed open for ${heldMs}ms; the message goes down the ladder`, { ...options, retryable: true })
+    this.topic = topic
+    this.heldMs = heldMs
   }
 }
 
@@ -142,6 +163,9 @@ export const isTopicMissingError = (error: unknown): error is TopicMissingError 
 
 export const isShutdownTimeoutError = (error: unknown): error is ShutdownTimeoutError =>
   hasCode(error, ERROR_CODES.SHUTDOWN_TIMEOUT)
+
+export const isHoldExpiredError = (error: unknown): error is HoldExpiredError =>
+  hasCode(error, ERROR_CODES.HOLD_EXPIRED)
 
 export const isBatchFailedError = (error: unknown): error is BatchFailedError =>
   hasCode(error, ERROR_CODES.BATCH_FAILED) && Array.isArray((error as { failed?: unknown }).failed)

@@ -84,6 +84,31 @@ describe('kafka-harbor/otel metrics', () => {
     await m.shutdown()
   })
 
+  test('circuit breaker transitions are counted per topic by the state entered', async () => {
+    const h = harness()
+    const m = metering()
+    otelMetrics(h.harbor, { meterProvider: m.provider, lag: false })
+    let listener: ((change: { from: string, to: string }) => void) | undefined
+    const policy = {
+      execute: async <T>(fn: () => Promise<T>) => await fn(),
+      stats: () => ({}),
+      on: (_event: string, handler: typeof listener) => { listener = handler },
+      off: () => {},
+      dispose: () => {}
+    } as unknown as import('breakwater').CircuitBreakerPolicy
+    const consumer = h.harbor.consumer({ groupId: 'g', fromBeginning: true, autoCreateTopics: true, breaker: { policy } })
+    consumer.subscribe('orders', () => {})
+    await consumer.start()
+    listener?.({ from: 'closed', to: 'open' })
+    listener?.({ from: 'open', to: 'closed' })
+    assert.equal(await m.point('kafka_harbor.circuit.state_changes', { 'kafka_harbor.group': 'g', 'kafka_harbor.topic': 'orders', 'kafka_harbor.state': 'open' }), 1)
+    assert.equal(await m.point('kafka_harbor.circuit.state_changes', { 'kafka_harbor.topic': 'orders', 'kafka_harbor.state': 'closed' }), 1)
+    const described = (await m.descriptors()).find((d) => d.name === 'kafka_harbor.circuit.state_changes')
+    assert.ok(described !== undefined && described.description.length > 20 && described.unit.length > 0)
+    await h.harbor.shutdown()
+    await m.shutdown()
+  })
+
   test('a replay counts as processed and as replayed', async () => {
     const h = harness()
     const m = metering()

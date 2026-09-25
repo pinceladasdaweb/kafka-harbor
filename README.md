@@ -267,6 +267,26 @@ What happens next depends on how the handler ends, and nothing else. There is no
 
 The retry or DLQ produce is acknowledged by the broker **before** the source offset is committed. If it is not acknowledged, the consumer stops and the message stays where it is: it will be redelivered. A commit that fails after the work is safe (a rebalance in progress, for instance) is reported through the `error` event and the consumer carries on; that message is redelivered too.
 
+### Circuit breaker
+
+```ts
+const consumer = harbor.consumer({
+  groupId: 'orders-workers',
+  retry: { levels: [{ delay: '1m' }] },
+  breaker: {
+    consecutiveFailures: 5,   // breakwater's circuit breaker options; one circuit per topic
+    halfOpenAfter: 30_000,
+    hold: '2m'                // how long a message waits for the circuit; default: what is left of maxProcessingTime
+  }
+})
+consumer.subscribe('orders', handleOrder)
+consumer.subscribe('audit', () => {}, { breaker: false })   // this topic runs without one
+```
+
+When the dependency behind a handler goes down, every message fails and every failure walks the retry ladder: the retry topics fill with work that will fail again, and the delays turn a five-minute outage into an hour of catching up. With `breaker`, each topic gets a [breakwater](https://github.com/pinceladasdaweb/breakwater) circuit breaker in front of its handler. While the circuit is closed nothing changes. Once the failures cross the threshold (`consecutiveFailures`, or `failureThreshold` over a `window`) the circuit opens and the partitions of that topic are **held**: the message in front of each one is neither committed nor forwarded, it waits, and since a partition delivers one message at a time, so does everything behind it. The consumer asks the breaker again every second; once `halfOpenAfter` has passed the next message runs as the probe, and a success closes the circuit and the partitions flow again. Only a message that waited the whole `hold` gives up: it fails with `HoldExpiredError` (retryable, so it walks the ladder and comes back when the dependency may be up) and the partition moves on. `hold` is counted from the moment the handler would have run, and never reaches past what the client tolerates for the delivery as a whole: `maxProcessingTime` from when the message was delivered, retry delay included, which is also the default; deeper on the ladder, where the delay took most of that, the hold is what is left. A stop, or a rebalance taking the partition away, ends a hold with the message uncommitted. A circuit isolated by hand (`policy.isolate()`) holds the same way.
+
+What counts as a failure is `failureIf`: by default a failure the handler declared deterministic (`retryable: false`) is the message's fault and does not count, and neither does `harbor.abort()` nor a `BatchFailedError`. A handler that throws a breaker rejection of its own (an inner circuit around one call) ran and failed: that is its verdict, never a hold. The retry topics of a subscription share its circuit, so a message coming back down the ladder meets the same breaker. Pass `policy` (a `circuitBreaker()` you built, with a shared state store if the circuit is to be shared across instances) to share one circuit across topics or with other code that calls the same dependency; the consumer then only listens to it. Every transition is a `circuitStateChanged` event, a log line, and a count in `kafka_harbor_circuit_state_changes_total` or `kafka_harbor.circuit.state_changes`. Batch handlers are guarded the same way, one execution per batch.
+
 ### Batches
 
 ```ts
@@ -413,6 +433,7 @@ metrics.detach()
 | `kafka_harbor_produce_duration_seconds` | `topic`, `kind` | produce call to acknowledgment, histogram |
 | `kafka_harbor_errors_total` | `scope` | `error` events: `consumer`, `producer`, `adapter` |
 | `kafka_harbor_consumer_stops_total` | `group`, `reason` | `shutdown`, `abort` or `crash` |
+| `kafka_harbor_circuit_state_changes_total` | `group`, `topic`, `to` | circuit breaker transitions by the state entered; `open` means the topic's partitions are held |
 | `kafka_harbor_consumer_lag` | `group`, `topic`, `partition` | gauge collected on scrape through `harbor.lag()` |
 
 Options: `registry` (default: prom-client's global one), `prefix` (default `kafka_harbor_`, `''` for none), `buckets` for the histograms in seconds (default 5ms to 10s), and `lag: false` to skip the gauge, which is required for an adapter that does not report offsets (otherwise a `ConfigError` at construction). A lag collection that fails leaves the gauge without series for that scrape and is reported through the harbor's `error` event; the scrape itself succeeds. `detach()` unsubscribes and removes the lag gauge; the counters and histograms stay registered until `registry.clear()`. Labels are deliberately low-cardinality: never an offset or a correlation id.
@@ -429,7 +450,7 @@ const harbor = createHarbor({ clientId: 'orders-service', brokers, adapter: myAd
 const metrics = otelMetrics(harbor)   // instruments under kafka_harbor.*, the same signals as the Prometheus entry point
 ```
 
-`otelMetrics` records the same signals as instruments named `kafka_harbor.messages.processed`, `kafka_harbor.messages.replayed`, `kafka_harbor.message.processing.duration`, `kafka_harbor.batches.processed`, `kafka_harbor.batch.processing.duration`, `kafka_harbor.messages.failed`, `kafka_harbor.messages.retried`, `kafka_harbor.messages.dead_lettered`, `kafka_harbor.messages.redriven`, `kafka_harbor.messages.produced`, `kafka_harbor.produce.duration`, `kafka_harbor.errors`, `kafka_harbor.consumer.stops` and the observable gauge `kafka_harbor.consumer.lag`, with `kafka_harbor.group`, `kafka_harbor.topic`, `kafka_harbor.outcome`, `kafka_harbor.level`, `kafka_harbor.kind`, `kafka_harbor.scope`, `kafka_harbor.reason`, `kafka_harbor.from`, `kafka_harbor.to` and `kafka_harbor.partition` attributes. Options: `meterProvider`, `boundaries` for the histograms in seconds (default 5ms to 10s) and `lag: false`, required for an adapter that does not report offsets. Start your SDK, or pass `meterProvider`, before calling it: the metrics API has no late-binding proxy. A lag collection that fails is reported through the harbor's `error` event.
+`otelMetrics` records the same signals as instruments named `kafka_harbor.messages.processed`, `kafka_harbor.messages.replayed`, `kafka_harbor.message.processing.duration`, `kafka_harbor.batches.processed`, `kafka_harbor.batch.processing.duration`, `kafka_harbor.messages.failed`, `kafka_harbor.messages.retried`, `kafka_harbor.messages.dead_lettered`, `kafka_harbor.messages.redriven`, `kafka_harbor.messages.produced`, `kafka_harbor.produce.duration`, `kafka_harbor.errors`, `kafka_harbor.consumer.stops`, `kafka_harbor.circuit.state_changes` and the observable gauge `kafka_harbor.consumer.lag`, with `kafka_harbor.group`, `kafka_harbor.topic`, `kafka_harbor.outcome`, `kafka_harbor.level`, `kafka_harbor.kind`, `kafka_harbor.scope`, `kafka_harbor.reason`, `kafka_harbor.state`, `kafka_harbor.from`, `kafka_harbor.to` and `kafka_harbor.partition` attributes. Options: `meterProvider`, `boundaries` for the histograms in seconds (default 5ms to 10s) and `lag: false`, required for an adapter that does not report offsets. Start your SDK, or pass `meterProvider`, before calling it: the metrics API has no late-binding proxy. A lag collection that fails is reported through the harbor's `error` event.
 
 `otelTracing` returns the `instrumentation` hooks the harbor calls around produce calls and handlers. Every produce call runs inside a `PRODUCER` span named `<topic> send` with a `kafka_harbor.kind` attribute (`send`, `retry`, `dead-letter` or `redrive`), and the span's context is written into each record's headers by the configured propagator (W3C `traceparent` and `tracestate` with the SDK's default) unless the record already carries one. Every handler runs inside a `CONSUMER` span named `<topic> process`, parented to the context read from the message headers (a batch handler gets one span, linked to every message's context, with `messaging.batch.message_count`), with the OpenTelemetry messaging attributes (`messaging.system`, `messaging.destination.name`, `messaging.consumer.group.name`, `messaging.destination.partition.id`, `messaging.kafka.offset`) plus `kafka_harbor.attempt`, `kafka_harbor.correlation_id` and `kafka_harbor.original_topic`. The handler runs under the extracted context, so baggage the producer propagated is active there too. A retry, DLQ or redrive hop is a `PRODUCER` span parented to the context the forwarded message carries, and the hop copies that message's headers, so the first attempt, every retry, the dead-lettering and the redrive of one message belong to the trace that produced it. A handler that throws marks its span with the exception and an error status.
 
@@ -513,6 +534,7 @@ harbor
   .on('messageRedriven', ({ from, to, offset }) => {})
   .on('messageProduced', ({ topic, kind, records, durationMs }) => {}) // one produce call acknowledged; kind: 'send' | 'retry' | 'dead-letter' | 'redrive'
   .on('consumerStopped', ({ groupId, reason }) => {})               // reason: 'shutdown' | 'abort' | 'crash'
+  .on('circuitStateChanged', ({ groupId, topic, from, to }) => {}) // a topic's circuit breaker moved; 'open' means its partitions are held
   .on('error', ({ error, scope, groupId, topic }) => {})            // scope: 'consumer' | 'producer' | 'adapter'
 ```
 
@@ -532,6 +554,7 @@ Every error carries a stable `code`; message text is documentation, not contract
 | `ClosedError` | `CLOSED` | the harbor is shutting down or closed |
 | `ShutdownTimeoutError` | `SHUTDOWN_TIMEOUT` | handlers were abandoned by shutdown; `inFlight` says how many |
 | `BatchFailedError` | `BATCH_FAILED` | thrown by a batch handler to fail only the messages it names; `cause` decides retry or DLQ for them |
+| `HoldExpiredError` | `HOLD_EXPIRED` | the topic's circuit stayed open for the whole `breaker.hold`; retryable, so the message walks the ladder; `topic` and `heldMs` say which and how long |
 
 Every error has `retryable`. Throw any error with `retryable: false` from a handler and it goes straight to the DLQ; breakwater's errors and the RabbitMQ sibling's `RetryableError` follow the same convention.
 
