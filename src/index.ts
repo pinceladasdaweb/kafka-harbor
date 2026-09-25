@@ -19,6 +19,9 @@ export type { CoreContext, HarborErrorEvent } from './context'
 
 export type { Instrumentation, OutgoingRecord, ProduceBatch, ProduceKind } from './instrumentation'
 export { defaultIdempotencyKey } from './idempotency'
+
+export { defaultFailureIf } from './breaker'
+export type { ConsumerBreakerOptions } from './breaker'
 export type { IdempotencyEngine, IdempotencyInput, IdempotencyOptions } from './idempotency'
 export type { ProduceEvents, ProducedEvent } from './produce'
 
@@ -52,6 +55,7 @@ export type { Clock, Duration, MessageHeaders, Logger, Message, OutgoingMessage,
 export {
   AbortProcessingError,
   BatchFailedError,
+  HoldExpiredError,
   AdapterError,
   ClosedError,
   ConfigError,
@@ -63,6 +67,7 @@ export {
   describeError,
   isAbortProcessingError,
   isBatchFailedError,
+  isHoldExpiredError,
   isDeclaredRetryable,
   isHarborError,
   isRetryable,

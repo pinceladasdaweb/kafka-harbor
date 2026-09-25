@@ -5,6 +5,9 @@
 ```ts
 
 import { Backoff } from 'breakwater';
+import { BreakerState } from 'breakwater';
+import { CircuitBreakerOptions } from 'breakwater';
+import { CircuitBreakerPolicy } from 'breakwater';
 import { RetryPolicy } from 'breakwater';
 
 // Warning: (ae-missing-release-tag) "abortProcessing" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
@@ -159,6 +162,14 @@ export class Consumer {
     subscribeBatch<T = unknown>(topic: string, handler: BatchHandler<T>, options?: SubscribeBatchOptions<T>): this;
 }
 
+// Warning: (ae-missing-release-tag) "ConsumerBreakerOptions" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
+//
+// @public
+export interface ConsumerBreakerOptions extends CircuitBreakerOptions {
+    hold?: Duration;
+    policy?: CircuitBreakerPolicy;
+}
+
 // Warning: (ae-missing-release-tag) "ConsumerContext" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
 //
 // @public
@@ -184,6 +195,12 @@ export interface ConsumerEvents extends ProduceEvents {
         size: number;
         durationMs: number;
         outcome: 'processed' | FailureOutcome;
+    };
+    circuitStateChanged: {
+        groupId: string;
+        topic: string;
+        from: BreakerState;
+        to: BreakerState;
     };
     // (undocumented)
     consumerStopped: {
@@ -266,6 +283,7 @@ export interface ConsumerHealth {
 // @public (undocumented)
 export interface ConsumerOptions {
     autoCreateTopics?: boolean;
+    breaker?: ConsumerBreakerOptions;
     concurrency?: number;
     // (undocumented)
     dlq?: ConsumerDlqOptions;
@@ -343,6 +361,11 @@ export const DEFAULT_DURATION_BUCKETS: readonly number[];
 // @public (undocumented)
 export const defaultDlqTopicNaming: DlqTopicNaming;
 
+// Warning: (ae-missing-release-tag) "defaultFailureIf" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
+//
+// @public
+export const defaultFailureIf: (error: unknown) => boolean;
+
 // Warning: (ae-missing-release-tag) "defaultIdempotencyKey" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
 //
 // @public
@@ -380,6 +403,7 @@ export const ERROR_CODES: {
     readonly CLOSED: "CLOSED";
     readonly SHUTDOWN_TIMEOUT: "SHUTDOWN_TIMEOUT";
     readonly BATCH_FAILED: "BATCH_FAILED";
+    readonly HOLD_EXPIRED: "HOLD_EXPIRED";
 };
 
 // Warning: (ae-missing-release-tag) "EventMap" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
@@ -561,6 +585,16 @@ export interface HeaderOptions {
     prefix?: string;
 }
 
+// Warning: (ae-missing-release-tag) "HoldExpiredError" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
+//
+// @public
+export class HoldExpiredError extends HarborError {
+    constructor(topic: string, heldMs: number, options?: ErrorOptions);
+    readonly heldMs: number;
+    // (undocumented)
+    readonly topic: string;
+}
+
 // Warning: (ae-missing-release-tag) "IdempotencyEngine" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
 //
 // @public
@@ -620,6 +654,11 @@ export const isDeclaredRetryable: (error: unknown) => boolean;
 //
 // @public (undocumented)
 export const isHarborError: (error: unknown) => error is HarborError;
+
+// Warning: (ae-missing-release-tag) "isHoldExpiredError" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
+//
+// @public (undocumented)
+export const isHoldExpiredError: (error: unknown) => error is HoldExpiredError;
 
 // Warning: (ae-missing-release-tag) "isRetryable" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
 //
@@ -1059,6 +1098,7 @@ export function subscribe<E extends EventMap>(target: Observable<E>, listeners: 
 //
 // @public (undocumented)
 export interface SubscribeBatchOptions<T = unknown> {
+    breaker?: ConsumerBreakerOptions | false;
     maxWait?: Duration;
     serializer?: Serializer<T>;
     size?: number;
@@ -1068,6 +1108,7 @@ export interface SubscribeBatchOptions<T = unknown> {
 //
 // @public (undocumented)
 export interface SubscribeOptions<T = unknown> {
+    breaker?: ConsumerBreakerOptions | false;
     idempotency?: IdempotencyOptions<T>;
     serializer?: Serializer<T>;
 }

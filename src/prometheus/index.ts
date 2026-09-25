@@ -119,6 +119,12 @@ export function prometheusMetrics (harbor: Harbor, options: PrometheusMetricsOpt
     labelNames: ['group', 'topic'],
     registers
   })
+  const circuitChanges = new Counter({
+    name: `${prefix}circuit_state_changes_total`,
+    help: 'Circuit breaker transitions per topic, by the state entered: open means the partitions of that topic are being held.',
+    labelNames: ['group', 'topic', 'to'],
+    registers
+  })
   const redriven = new Counter({
     name: `${prefix}messages_redriven_total`,
     help: 'Dead letters re-injected by harbor.redrive(), by source and destination topic.',
@@ -192,7 +198,8 @@ export function prometheusMetrics (harbor: Harbor, options: PrometheusMetricsOpt
       produceDuration.observe({ topic: event.topic, kind: event.kind }, event.durationMs / 1_000)
     },
     error: (event) => { errors.inc({ scope: event.scope }) },
-    consumerStopped: (event) => { stops.inc({ group: event.groupId, reason: event.reason }) }
+    consumerStopped: (event) => { stops.inc({ group: event.groupId, reason: event.reason }) },
+    circuitStateChanged: (event) => { circuitChanges.inc({ group: event.groupId, topic: event.topic, to: event.to }) }
   }
   const unsubscribe = subscribe(harbor, listeners)
 
