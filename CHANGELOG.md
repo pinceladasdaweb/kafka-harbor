@@ -1,5 +1,11 @@
 # CHANGELOG
 
+## 0.8.0 (2026-09-25)
+
+* feat: circuit breaker per topic that holds the partition instead of failing every message by Pedro Rogério [View](https://github.com/pinceladasdaweb/kafka-harbor/commit/adf0bda5d49fb2fa1345ef021cd94eb481006e29)
+* test: give the concurrency invariant enough work per partition to hold whatever the fetch timing by Pedro Rogério [View](https://github.com/pinceladasdaweb/kafka-harbor/commit/c07bdedd4d3c0519e521bfd79780351d3358a701)
+
+
 ## 0.7.0 (2026-09-20)
 
 * chore(deps-dev): bump @nestjs/common from 12.0.1 to 12.0.3 by dependabot[bot] [View](https://github.com/pinceladasdaweb/kafka-harbor/commit/e77bb06876ef2418bf260549697051cb183afacc)
