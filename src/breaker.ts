@@ -18,7 +18,7 @@ export interface ConsumerBreakerOptions extends CircuitBreakerOptions {
   /**
    * The longest a message waits for the circuit to admit it, counted from
    * when it was received, retry delay included; then it fails with a
-   * `CircuitOpenError` (retryable) and walks the ladder. Must fit under
+   * `HoldExpiredError` (retryable) and walks the ladder. Must fit under
    * `maxProcessingTime`, the longest a delivery may take anyway. Default:
    * what is left of `maxProcessingTime`.
    */

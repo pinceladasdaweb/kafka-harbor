@@ -644,7 +644,7 @@ adapter.committed('g', 'orders', 0)   // '1'
 adapter.calls                         // every adapter call, in order
 ```
 
-No Docker, no broker, real pipeline: the same core code that runs in production drives an in-memory broker with topics, partitions, consumer groups and committed offsets. [examples/testing-handlers.ts](examples/testing-handlers.ts) is a complete handler test written this way; [examples/retry-dlq-flow.ts](examples/retry-dlq-flow.ts) runs the whole retry and DLQ flow against the broker from `docker-compose.yml`.
+No Docker, no broker, real pipeline: the same core code that runs in production drives an in-memory broker with topics, partitions, consumer groups and committed offsets. [examples/testing-handlers.ts](examples/testing-handlers.ts) is a complete handler test written this way; [examples/retry-dlq-flow.ts](examples/retry-dlq-flow.ts) runs the whole retry and DLQ flow against the broker from `docker-compose.yml`. [examples/express.ts](examples/express.ts) is a web application around the harbor: an Express route produces, a consumer works in the background, `/health` answers probes from `harbor.health()`, `/metrics` serves the Prometheus registry, and SIGTERM drains the HTTP server and then the harbor; [examples/nestjs.ts](examples/nestjs.ts) is the same shape as a NestJS application context.
 
 ## Development
 
