@@ -125,6 +125,12 @@ export function prometheusMetrics (harbor: Harbor, options: PrometheusMetricsOpt
     labelNames: ['group', 'topic', 'to'],
     registers
   })
+  const transactions = new Counter({
+    name: `${prefix}transactions_total`,
+    help: 'Transactions ended, by outcome: committed or aborted.',
+    labelNames: ['outcome'],
+    registers
+  })
   const redriven = new Counter({
     name: `${prefix}messages_redriven_total`,
     help: 'Dead letters re-injected by harbor.redrive(), by source and destination topic.',
@@ -133,7 +139,7 @@ export function prometheusMetrics (harbor: Harbor, options: PrometheusMetricsOpt
   })
   const produced = new Counter({
     name: `${prefix}messages_produced_total`,
-    help: 'Records acknowledged by the broker, by destination topic and kind: send (harbor.producer()), retry, dead-letter or redrive.',
+    help: 'Records acknowledged by the broker, by destination topic and kind: send (harbor.producer()), retry, dead-letter, redrive or transaction.',
     labelNames: ['topic', 'kind'],
     registers
   })
@@ -199,7 +205,8 @@ export function prometheusMetrics (harbor: Harbor, options: PrometheusMetricsOpt
     },
     error: (event) => { errors.inc({ scope: event.scope }) },
     consumerStopped: (event) => { stops.inc({ group: event.groupId, reason: event.reason }) },
-    circuitStateChanged: (event) => { circuitChanges.inc({ group: event.groupId, topic: event.topic, to: event.to }) }
+    circuitStateChanged: (event) => { circuitChanges.inc({ group: event.groupId, topic: event.topic, to: event.to }) },
+    transactionCompleted: (event) => { transactions.inc({ outcome: event.outcome }) }
   }
   const unsubscribe = subscribe(harbor, listeners)
 

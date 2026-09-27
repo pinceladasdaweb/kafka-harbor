@@ -17,6 +17,7 @@ declare global {
   const harbor: Harbor
   const consumer: Consumer
   const brokers: string[]
+  const adapter: ClientAdapter
   const run: string
   const order: Order
   const orderA: Order
@@ -24,6 +25,7 @@ declare global {
   const schema: unknown
 
   function fulfill (order: Order): Promise<void>
+  function ship (order: Order): { shipped: string }
   function bulkInsert (orders: Order[]): Promise<void>
   const failedMessages: Array<import('kafka-harbor').Message>
   const cause: Error

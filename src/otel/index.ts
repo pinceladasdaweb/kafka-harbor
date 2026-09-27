@@ -99,6 +99,7 @@ export function otelMetrics (harbor: Harbor, options: OtelMetricsOptions = {}): 
   const errors = meter.createCounter('kafka_harbor.errors', { description: 'Errors reported through the error event, by scope.', unit: '{error}' })
   const stops = meter.createCounter('kafka_harbor.consumer.stops', { description: 'Consumers that stopped, by reason.', unit: '{stop}' })
   const circuitChanges = meter.createCounter('kafka_harbor.circuit.state_changes', { description: 'Circuit breaker transitions per topic, by the state entered: open means the partitions of that topic are being held.', unit: '{transition}' })
+  const transactions = meter.createCounter('kafka_harbor.transactions', { description: 'Transactions ended, by outcome: committed or aborted.', unit: '{transaction}' })
 
   const at = (event: { groupId: string, topic: string }): Attributes => ({ 'kafka_harbor.group': event.groupId, 'kafka_harbor.topic': event.topic })
   const listeners: Listeners<HarborEvents> = {
@@ -128,7 +129,8 @@ export function otelMetrics (harbor: Harbor, options: OtelMetricsOptions = {}): 
     },
     error: (event) => { errors.add(1, { 'kafka_harbor.scope': event.scope }) },
     consumerStopped: (event) => { stops.add(1, { 'kafka_harbor.group': event.groupId, 'kafka_harbor.reason': event.reason }) },
-    circuitStateChanged: (event) => { circuitChanges.add(1, { 'kafka_harbor.group': event.groupId, 'kafka_harbor.topic': event.topic, 'kafka_harbor.state': event.to }) }
+    circuitStateChanged: (event) => { circuitChanges.add(1, { 'kafka_harbor.group': event.groupId, 'kafka_harbor.topic': event.topic, 'kafka_harbor.state': event.to }) },
+    transactionCompleted: (event) => { transactions.add(1, { 'kafka_harbor.outcome': event.outcome }) }
   }
   const disposers = [subscribe(harbor, listeners)]
 

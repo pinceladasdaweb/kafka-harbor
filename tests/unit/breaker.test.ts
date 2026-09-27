@@ -4,7 +4,7 @@ import { describe, test } from 'node:test'
 import { circuitBreaker, type BreakerState, type CircuitBreakerPolicy } from 'breakwater'
 
 import { AbortProcessingError, BatchFailedError, ERROR_CODES, defaultFailureIf, isHoldExpiredError, type HoldExpiredError, type HarborEvents } from '../../src/index'
-import { captureEvents, harness, text } from '../helpers/harness'
+import { captureEvents, harness, text, withoutPause } from '../helpers/harness'
 import { settle, until } from '../helpers/manual-clock'
 
 interface StateChange { from: BreakerState, to: BreakerState }
@@ -252,7 +252,7 @@ describe('consumer circuit breaker', () => {
     assert.deepEqual(changesOf(changes), ['orders:closed->open'])
 
     await producer.send('orders', { value: { fail: false } })
-    await until(() => h.clock.waiting === 1, 2_000)
+    await until(() => h.clock.sleeps.includes(1_000), 2_000)
     assert.deepEqual(seen, [], 'held, not run')
     await new Promise((resolve) => setTimeout(resolve, 350))
     h.clock.advance(1_000)
@@ -362,7 +362,7 @@ describe('consumer circuit breaker', () => {
     await h.harbor.shutdown()
   })
 
-  test('deeper on the ladder the hold is what the delivery tolerates: the retry delay already spent counts against it', async () => {
+  test('a parked retry is a fresh delivery: the hold starts over on every level; without pause/resume the delay already spent counts against it', async () => {
     const h = harness()
     const { policy, setOpen } = fakeBreaker()
     const failed = captureEvents(h.harbor, 'messageFailed')
@@ -380,10 +380,32 @@ describe('consumer circuit breaker', () => {
     assert.deepEqual(failed.map((event) => [event.topic, event.outcome, (event.error as HoldExpiredError).heldMs]), [
       ['orders', 'retry', 2_000],
       ['orders-retry-1', 'retry', 2_000],
+      ['orders-retry-2', 'dead-letter', 2_000]
+    ])
+    await h.harbor.shutdown()
+
+    const plain = harness()
+    withoutPause(plain)
+    const held = fakeBreaker()
+    const plainFailed = captureEvents(plain.harbor, 'messageFailed')
+    const plainConsumer = plain.harbor.consumer({ groupId: 'g', fromBeginning: true, autoCreateTopics: true, maxProcessingTime: '5s', retry: { levels: [{ delay: '1s' }, { delay: '4s' }] }, breaker: { policy: held.policy, hold: '2s' } })
+    plainConsumer.subscribe('orders', () => {})
+    await plainConsumer.start()
+    held.setOpen(true)
+    await plain.harbor.producer().send('orders', { value: 'a' })
+    for (let step = 0; step < 20 && plainFailed.length < 3; step++) {
+      await until(() => plain.clock.waiting === 1)
+      plain.clock.advance(1_000)
+      await settle()
+    }
+    await until(() => plainFailed.length === 3)
+    assert.deepEqual(plainFailed.map((event) => [event.topic, event.outcome, (event.error as HoldExpiredError).heldMs]), [
+      ['orders', 'retry', 2_000],
+      ['orders-retry-1', 'retry', 2_000],
       // Four of the five tolerated seconds went to the delay: one second of hold is what is left.
       ['orders-retry-2', 'dead-letter', 1_000]
     ])
-    await h.harbor.shutdown()
+    await plain.harbor.shutdown()
   })
 
   test('a breaker is released when start() fails or when the subscription is refused, not only on a stop', async () => {

@@ -10,6 +10,7 @@
  */
 import {
   AdapterError,
+  ConfigError,
   partitionForKey,
   partitionKey,
   splitPartitionKey,
@@ -43,7 +44,7 @@ export interface MemoryAdapterOptions {
 }
 
 export interface RecordedCall {
-  readonly method: 'connect' | 'disconnect' | 'produce' | 'consume' | 'commit' | 'stop' | 'pause' | 'resume' | 'createTopics' | 'topicExists' | 'fetchTopicOffsets' | 'fetchCommittedOffsets'
+  readonly method: 'connect' | 'disconnect' | 'produce' | 'consume' | 'commit' | 'stop' | 'pause' | 'resume' | 'createTopics' | 'topicExists' | 'fetchTopicOffsets' | 'fetchCommittedOffsets' | 'transaction' | 'transactionProduce' | 'transactionOffsets' | 'transactionCommit' | 'transactionAbort'
   readonly args: readonly unknown[]
 }
 
@@ -63,9 +64,11 @@ export interface MemoryAdapter extends ClientAdapter {
   failNextProduce: (error: unknown) => void
   /**
    * Resolves once every message currently on the topic has been delivered to
-   * the group. Rejects instead of waiting forever when the group's last
-   * member stopped before that happened (a consumer that aborted or
-   * crashed): nothing would ever deliver the rest.
+   * the group and none of its partitions is paused (a retry message the core
+   * parked is still to run; the partition resumes once it did). Rejects
+   * instead of waiting forever when the group's last member stopped before
+   * that happened (a consumer that aborted or crashed): nothing would ever
+   * deliver the rest.
    */
   whenDrained: (groupId: string, topic: string) => Promise<void>
   /** Currently paused partitions of a group. */
@@ -100,6 +103,10 @@ export function memoryAdapter (options: MemoryAdapterOptions = {}): MemoryAdapte
   const calls: RecordedCall[] = []
   const wakeups = new Set<() => void>()
   let connected = false
+  let transactionalId: string | undefined
+  /** The group each consumption belongs to, for the offsets a transaction commits. */
+  const groupOfHandle = new WeakMap<ConsumerHandle, string>()
+  let transactionOpen = false
   let nextProduceError: { error: unknown } | undefined
 
   const record = (method: RecordedCall['method'], ...args: unknown[]): void => {
@@ -129,6 +136,49 @@ export function memoryAdapter (options: MemoryAdapterOptions = {}): MemoryAdapte
     return entry
   }
 
+  /** Every record checked before the first append: a batch is all or nothing. */
+  const validate = (records: readonly RawRecord[]): void => {
+    for (const item of records) {
+      if (typeof item.topic !== 'string' || item.topic === '') {
+        throw new AdapterError(`invalid topic name ${JSON.stringify(item.topic)}`, { retryable: false })
+      }
+      if (!autoCreate && !topics.has(item.topic)) {
+        throw new AdapterError(`unknown topic "${item.topic}"`, { retryable: false })
+      }
+      const count = topics.get(item.topic)?.partitions.length ?? defaultPartitions
+      if (item.partition !== undefined && (!Number.isInteger(item.partition) || item.partition < 0 || item.partition >= count)) {
+        throw new AdapterError(`partition ${item.partition} does not exist on "${item.topic}"`, { retryable: false })
+      }
+    }
+  }
+  const append = (records: readonly RawRecord[]): void => {
+    for (const item of records) {
+      const topic = ensureTopic(item.topic)
+      const count = topic.partitions.length
+      let partition: number
+      if (item.partition !== undefined) {
+        partition = item.partition
+      } else if (item.key !== null) {
+        partition = partitionForKey(item.key, count)
+      } else {
+        partition = topic.roundRobin++ % count
+      }
+      const log = topic.partitions[partition] as RawMessage[]
+      const message: RawMessage = {
+        topic: item.topic,
+        partition,
+        offset: String(log.length),
+        key: item.key,
+        value: item.value,
+        headers: { ...item.headers },
+        timestamp: now()
+      }
+      log.push(message)
+      topic.appended.push(message)
+    }
+    wake()
+  }
+
   const adapter: MemoryAdapter = {
     name: 'memory',
     calls,
@@ -155,8 +205,11 @@ export function memoryAdapter (options: MemoryAdapterOptions = {}): MemoryAdapte
       for (;;) {
         const topic = topics.get(topicName)
         const entry = groups.get(groupId)
+        // A paused partition holds a message the core parked and will run
+        // later; the topic is drained once that ran too, which is when the
+        // core resumes the partition.
         const drained = topic !== undefined && entry !== undefined &&
-          topic.partitions.every((messages, partition) => (entry.positions.get(partitionKey(topicName, partition)) ?? 0) >= messages.length)
+          topic.partitions.every((messages, partition) => (entry.positions.get(partitionKey(topicName, partition)) ?? 0) >= messages.length && !entry.paused.has(partitionKey(topicName, partition)))
         if (drained) return
         if (entry !== undefined && entry.members === 0 && entry.stopped) {
           throw new Error(`whenDrained("${groupId}", "${topicName}"): the group has no member left; its last consumption stopped before the topic was drained`)
@@ -168,6 +221,7 @@ export function memoryAdapter (options: MemoryAdapterOptions = {}): MemoryAdapte
     async connect (config: BrokerConfig) {
       record('connect', config)
       connected = true
+      transactionalId = config.transactionalId
     },
     async disconnect () {
       record('disconnect')
@@ -183,44 +237,57 @@ export function memoryAdapter (options: MemoryAdapterOptions = {}): MemoryAdapte
         throw error
       }
       if (!connected) throw new AdapterError('memory adapter is not connected')
-      // Validate everything before the first append: a batch is all or nothing.
-      for (const item of records) {
-        if (typeof item.topic !== 'string' || item.topic === '') {
-          throw new AdapterError(`invalid topic name ${JSON.stringify(item.topic)}`, { retryable: false })
-        }
-        if (!autoCreate && !topics.has(item.topic)) {
-          throw new AdapterError(`unknown topic "${item.topic}"`, { retryable: false })
-        }
-        const count = topics.get(item.topic)?.partitions.length ?? defaultPartitions
-        if (item.partition !== undefined && (!Number.isInteger(item.partition) || item.partition < 0 || item.partition >= count)) {
-          throw new AdapterError(`partition ${item.partition} does not exist on "${item.topic}"`, { retryable: false })
+      validate(records)
+      append(records)
+    },
+
+    async transaction () {
+      record('transaction')
+      if (!connected) throw new AdapterError('memory adapter is not connected')
+      if (transactionalId === undefined) throw new ConfigError('memory adapter: transactions need transactionalId on the harbor configuration')
+      if (transactionOpen) throw new AdapterError('memory adapter: a transaction is already open; one at a time', { retryable: false })
+      transactionOpen = true
+      const buffered: RawRecord[] = []
+      const offsets: Array<{ groupId: string, offset: TopicPartitionOffset }> = []
+      let completed = false
+      const requireOpen = (): void => {
+        if (completed) throw new AdapterError('memory adapter: the transaction already ended', { retryable: false })
+      }
+      return {
+        async produce (records: readonly RawRecord[]) {
+          record('transactionProduce', records)
+          requireOpen()
+          if (nextProduceError !== undefined) {
+            const { error } = nextProduceError
+            nextProduceError = undefined
+            throw error
+          }
+          validate(records)
+          buffered.push(...records)
+        },
+        async sendOffsets (consumption: ConsumerHandle, sent: readonly TopicPartitionOffset[]) {
+          record('transactionOffsets', sent)
+          requireOpen()
+          const groupId = groupOfHandle.get(consumption)
+          if (groupId === undefined) throw new ConfigError('memory adapter: the consumption is not one this adapter opened')
+          for (const offset of sent) offsets.push({ groupId, offset })
+        },
+        async commit () {
+          record('transactionCommit')
+          requireOpen()
+          completed = true
+          transactionOpen = false
+          // Everything lands together: a consumer never sees part of it.
+          append(buffered)
+          for (const { groupId, offset } of offsets) group(groupId).committed.set(partitionKey(offset.topic, offset.partition), offset.offset)
+        },
+        async abort () {
+          record('transactionAbort')
+          requireOpen()
+          completed = true
+          transactionOpen = false
         }
       }
-      for (const item of records) {
-        const topic = ensureTopic(item.topic)
-        const count = topic.partitions.length
-        let partition: number
-        if (item.partition !== undefined) {
-          partition = item.partition
-        } else if (item.key !== null) {
-          partition = partitionForKey(item.key, count)
-        } else {
-          partition = topic.roundRobin++ % count
-        }
-        const log = topic.partitions[partition] as RawMessage[]
-        const message: RawMessage = {
-          topic: item.topic,
-          partition,
-          offset: String(log.length),
-          key: item.key,
-          value: item.value,
-          headers: { ...item.headers },
-          timestamp: now()
-        }
-        log.push(message)
-        topic.appended.push(message)
-      }
-      wake()
     },
 
     async consume (consumeOptions: ConsumeOptions): Promise<ConsumerHandle> {
@@ -337,6 +404,7 @@ export function memoryAdapter (options: MemoryAdapterOptions = {}): MemoryAdapte
           wake()
         }
       }
+      groupOfHandle.set(handle, consumeOptions.groupId)
       return handle
     },
 

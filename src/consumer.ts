@@ -25,18 +25,19 @@ import { toMessage } from './message'
 import { parseDuration } from './duration'
 import { wrapped } from './instrumentation'
 import type { Serializer } from './serializer'
+import type { BreakerState } from 'breakwater'
 import { partitionKey } from './topic-partition'
 import { produceHop, type ProduceEvents } from './produce'
 import type { CoreContext, HarborErrorEvent } from './context'
-import { OFFSET_PATTERN, commitAfter, offsetDistance } from './commit'
+import type { Transaction, TransactionOptions } from './transaction'
 import type { Duration, MessageHeaders, Logger, Message } from './types'
 import { decodeHeaders, readRetryInfo, writeRetryInfo } from './headers'
 import { defaultIdempotencyKey, type IdempotencyOptions } from './idempotency'
-import type { BreakerState } from 'breakwater'
+import { OFFSET_PATTERN, commitAfter, offsetAfter, offsetDistance } from './commit'
 
-import { isCircuitRejection, resolveBreaker, type Breaker, type CircuitStateChange, type ConsumerBreakerOptions } from './breaker'
 import type { ConsumerHandle, RawMessage, TopicPartition, TopicSpec } from './adapter'
 import { firstRejection, requireNonEmptyString, requirePositiveInteger } from './validate'
+import { isCircuitRejection, resolveBreaker, type Breaker, type CircuitStateChange, type ConsumerBreakerOptions } from './breaker'
 
 /** What a handler receives besides the message. */
 export interface HandlerContext {
@@ -53,6 +54,15 @@ export interface HandlerContext {
   readonly signal: AbortSignal
   /** 1 on the first delivery; the retry count plus one on a retry topic. */
   readonly attempt: number
+  /**
+   * Runs `fn` inside a transaction that commits this message's offset
+   * along with what `tx.send()` produced: Kafka's exactly-once from the
+   * consumed topic to the produced ones. Needs `transactionalId` on the
+   * harbor. Make it the last thing the handler does: a handler that throws
+   * after its transaction committed sends the message down the ladder, and
+   * the retry produces again.
+   */
+  readonly transaction: <T>(fn: (tx: Transaction) => Promise<T>, options?: TransactionOptions) => Promise<T>
 }
 
 export type Handler<T = unknown> = (message: Message<T>, context: HandlerContext) => Promise<void> | void
@@ -67,6 +77,8 @@ export interface BatchContext {
   readonly logger: Logger
   /** Aborts when the harbor gave up waiting for this handler during shutdown; see `HandlerContext.signal`. */
   readonly signal: AbortSignal
+  /** Like `HandlerContext.transaction`, committing the offset after the batch's last message along with what was produced. */
+  readonly transaction: <T>(fn: (tx: Transaction) => Promise<T>, options?: TransactionOptions) => Promise<T>
 }
 
 /**
@@ -229,6 +241,18 @@ interface Pending {
   readonly receivedAt: number
 }
 
+/** A consumption whose adapter can hold a partition back, which is what lets a retry delay outgrow the poll interval. */
+type PausableHandle = ConsumerHandle & Required<Pick<ConsumerHandle, 'pause' | 'resume'>>
+
+/** A retry message waiting in memory for its due time, its partition paused meanwhile. */
+interface Parked {
+  readonly timer: AbortController
+  readonly handle: PausableHandle
+  readonly partition: TopicPartition
+  /** Settles once the message ran, or once the wait was cancelled. */
+  readonly done: Promise<void>
+}
+
 /** Thrown out of a hold when the consumer began stopping or the partition is being taken away: the message is left uncommitted, not failed. */
 const HELD_UNTIL_RELEASED = Symbol('held until released')
 
@@ -302,6 +326,14 @@ export class Consumer {
    * and only ever waits for handlers.
    */
   private readonly deliveries = new Map<Promise<void>, Delivery>()
+  /** Retry messages not due yet, keyed by `partitionKey`: one per paused partition, the head of its queue. */
+  private readonly parked = new Map<string, Parked>()
+  /**
+   * Parked messages come back outside the adapter's gate, so they take a
+   * slot of their own per consumption: at most `concurrency` of them run
+   * at a time, the same bound the adapter keeps for its deliveries.
+   */
+  private readonly reentries = new Map<ConsumerHandle, { active: number, waiting: Array<() => void> }>()
   /** The breakers of the guarded topics, with the listener that reports their state changes, released on stop. */
   private readonly breakers: Array<{ breaker: Breaker, listener: (change: CircuitStateChange) => void }> = []
   /** The batch being collected on each partition of a batch subscription, keyed by `partitionKey`. */
@@ -342,7 +374,7 @@ export class Consumer {
     this.context = context
     this.options = options
     this.maxProcessingTimeMs = parseDuration(options.maxProcessingTime ?? DEFAULT_MAX_PROCESSING_TIME_MS, 'maxProcessingTime')
-    this.levels = resolveRetryLevels(options.retry?.levels ?? [], this.maxProcessingTimeMs)
+    this.levels = resolveRetryLevels(options.retry?.levels ?? [])
     this.retryIf = options.retry?.retryIf ?? isRetryable
     this.retryNaming = options.retry?.topicNaming ?? defaultRetryTopicNaming
     this.dlqNaming = (options.dlq?.enabled ?? true) ? (options.dlq?.topicNaming ?? defaultDlqTopicNaming) : undefined
@@ -603,9 +635,21 @@ export class Consumer {
     }))
     const failed = firstRejection(results)
     const opened = results.filter((result): result is PromiseFulfilledResult<{ topics: string[], handle: ConsumerHandle }> => result.status === 'fulfilled')
-    if (failed !== undefined) {
+    // A retry delay longer than the poll interval is only safe when the
+    // message can wait outside the delivery: the adapter has to pause the
+    // partition. Without that, the delivery would wait, and the group would
+    // evict the member before the handler ran.
+    const longestDelay = this.levels.reduce((longest, level) => Math.max(longest, level.delayMs), 0)
+    const cannotPark = longestDelay > this.maxProcessingTimeMs && opened.some(({ value }) => value.handle.pause === undefined || value.handle.resume === undefined)
+    if (failed !== undefined || cannotPark) {
+      // What the opened consumptions delivered meanwhile is queued behind
+      // readiness; released now, on a consumer already stopped, it unwinds
+      // uncommitted instead of holding the clients' stop.
+      this.finish()
+      this.markReady()
       await Promise.allSettled(opened.map((result) => result.value.handle.stop()))
-      throw failed.reason
+      if (failed !== undefined) throw failed.reason
+      throw new ConfigError(`a retry delay of ${longestDelay}ms exceeds maxProcessingTime (${this.maxProcessingTimeMs}ms) and adapter "${this.context.adapter.name}" has no pause/resume, so the delivery would have to wait it out and the group would evict the member; raise maxProcessingTime or use an adapter that pauses partitions`)
     }
     for (const { value } of opened) {
       for (const topic of value.topics) this.handles.set(topic, value.handle)
@@ -637,6 +681,9 @@ export class Consumer {
       const batch = this.batches.get(key)
       if (batch !== undefined) this.flushBatch(key, batch)
     }
+    // A parked retry message is the next owner's now; the pause must not
+    // outlive the assignment, in case the partition comes back.
+    this.discardParked(revoked, true)
     const running = [...this.deliveries].filter(([, entry]) => entry.active && revoked.has(partitionKey(entry.raw.topic, entry.raw.partition)))
     try {
       await this.settledInTime(Promise.all(running.map(([work]) => work)), this.maxProcessingTimeMs)
@@ -704,6 +751,7 @@ export class Consumer {
     // running handlers get what is left of the timeout.
     this.drainController.abort()
     this.discardBatches([...this.batches.keys()])
+    this.discardParked([...this.parked.keys()], false)
     await this.settledInTime(
       Promise.all([...this.deliveries].filter(([, entry]) => entry.active).map(([work]) => work)),
       Math.max(0, deadline - this.context.clock.now())
@@ -779,7 +827,7 @@ export class Consumer {
    * commit or an explicit stop, and the adapter only learns that the
    * message is done.
    */
-  private receive (raw: RawMessage): Promise<void> {
+  private receive (raw: RawMessage, due = false): Promise<void> {
     return new Promise<void>((resolve) => {
       const entry: Delivery = { raw, active: false, release: resolve }
       // An adapter may deliver before start() has finished wiring the
@@ -787,7 +835,7 @@ export class Consumer {
       // a way to commit it. A delivery that lands while the consumer is
       // stopping (or stopped) is neither processed nor committed: the next
       // member of the group picks it up.
-      const work: Promise<void> = (this.state === 'running' ? this.process(raw, entry) : this.ready.then(() => this.process(raw, entry)))
+      const work: Promise<void> = (this.state === 'running' ? this.process(raw, entry, due) : this.ready.then(() => this.process(raw, entry, due)))
         .catch((error: unknown) => this.crash(error, raw))
       this.deliveries.set(work, entry)
       work.finally(() => {
@@ -797,7 +845,82 @@ export class Consumer {
     })
   }
 
-  private async process (raw: RawMessage, entry: Delivery): Promise<void> {
+  /**
+   * A retry message that is not due yet: the partition is paused and the
+   * message waits in memory, its delivery reported settled, so the client
+   * keeps polling. A wait inside the delivery would count against the poll
+   * interval; this one does not, which is what lets a delay outgrow
+   * maxProcessingTime. When it is due the message goes through the
+   * pipeline as a delivery of its own, and the partition resumes once it is
+   * done, so the next message, due later, follows. Nothing is committed
+   * while parked: a crash, a stop or a revocation leaves the message where
+   * it is, for the next member.
+   */
+  private park (raw: RawMessage, handle: PausableHandle, waitMs: number): boolean {
+    const key = partitionKey(raw.topic, raw.partition)
+    const partition: TopicPartition = { topic: raw.topic, partition: raw.partition }
+    try {
+      handle.pause([partition])
+    } catch (error) {
+      this.context.logger.warn(`[kafka-harbor] group "${this.groupId}": pausing ${raw.topic}[${raw.partition}] failed, waiting in the delivery instead: ${describeError(error)}`)
+      return false
+    }
+    const timer = new AbortController()
+    let finish!: () => void
+    const done = new Promise<void>((resolve) => { finish = resolve })
+    this.parked.set(key, { timer, handle, partition, done })
+    this.context.clock.sleep(waitMs, timer.signal).then(async () => {
+      if (timer.signal.aborted) return
+      this.parked.delete(key)
+      await this.takeSlot(handle)
+      try {
+        await this.receive(raw, true)
+      } finally {
+        this.freeSlot(handle)
+        this.resumeQuietly(handle, partition)
+      }
+    }).catch(() => undefined).finally(finish)
+    return true
+  }
+
+  private async takeSlot (handle: ConsumerHandle): Promise<void> {
+    let slots = this.reentries.get(handle)
+    if (slots === undefined) {
+      slots = { active: 0, waiting: [] }
+      this.reentries.set(handle, slots)
+    }
+    if (slots.active >= this.concurrency) await new Promise<void>((resolve) => slots.waiting.push(resolve))
+    slots.active++
+  }
+
+  private freeSlot (handle: ConsumerHandle): void {
+    const slots = this.reentries.get(handle)
+    if (slots === undefined) return
+    slots.active--
+    slots.waiting.shift()?.()
+  }
+
+  /** Forgets the parked messages of these partitions; `resume` lets the partition flow again when it is still this member's. */
+  private discardParked (keys: Iterable<string>, resume: boolean): void {
+    for (const key of keys) {
+      const entry = this.parked.get(key)
+      if (entry === undefined) continue
+      entry.timer.abort()
+      this.parked.delete(key)
+      if (resume) this.resumeQuietly(entry.handle, entry.partition)
+    }
+  }
+
+  private resumeQuietly (handle: PausableHandle, partition: TopicPartition): void {
+    try {
+      handle.resume([partition])
+    } catch (error) {
+      this.context.logger.warn(`[kafka-harbor] group "${this.groupId}": resuming ${partition.topic}[${partition.partition}] failed: ${describeError(error)}`)
+    }
+  }
+
+  /** `due`: a parked message whose time came; its wait is over whatever its timestamp says next to a skewed clock. */
+  private async process (raw: RawMessage, entry: Delivery, due = false): Promise<void> {
     const receivedAt = this.context.clock.now()
     const route = this.routes.get(raw.topic)
     if (route === undefined) {
@@ -822,8 +945,30 @@ export class Consumer {
     // level's delay: the timestamp comes from another process's clock, and
     // one ahead of ours would otherwise stretch the wait by the skew. With a
     // delay of zero, which is what the original topic has, nothing sleeps.
-    const wait = Math.min(route.delayMs, raw.timestamp + route.delayMs - this.context.clock.now())
-    if (wait > 0) await this.context.clock.sleep(wait, this.drainController.signal)
+    // A delivery released on a consumer that is not running (a start that
+    // failed, a stop) is neither waited for nor processed.
+    if (this.state !== 'running') return
+    const wait = due ? 0 : Math.min(route.delayMs, raw.timestamp + route.delayMs - this.context.clock.now())
+    if (wait > 0) {
+      const handle = this.handles.get(raw.topic)
+      if (handle?.pause !== undefined && handle.resume !== undefined) {
+        const ahead = this.parked.get(partitionKey(raw.topic, raw.partition))
+        if (ahead === undefined) {
+          if (this.park(raw, handle as PausableHandle, wait)) return
+        } else {
+          // A second message on a partition that is meant to be paused: the
+          // adapter delivered through its pause. This one waits in its
+          // delivery, behind the parked one, so the order holds.
+          this.context.logger.warn(`[kafka-harbor] group "${this.groupId}": adapter "${this.context.adapter.name}" delivered ${raw.topic}[${raw.partition}]@${raw.offset} on a paused partition; waiting in the delivery instead`)
+          await ahead.done
+          if (this.state !== 'running') return
+        }
+      }
+      // Without pause/resume the delivery itself waits; start() made sure
+      // the delay fits under the poll interval then.
+      const remaining = Math.min(route.delayMs, raw.timestamp + route.delayMs - this.context.clock.now())
+      if (remaining > 0) await this.context.clock.sleep(remaining, this.drainController.signal)
+    }
     // The check and the flag are one synchronous step: a stop that begins
     // in between would snapshot the handler as not running and then find it
     // running. A stop aborts the drain signal and leaves 'running' together.
@@ -848,7 +993,8 @@ export class Consumer {
         correlationId,
         logger: this.context.logger,
         signal: this.shutdownController.signal,
-        attempt
+        attempt,
+        transaction: (fn, options) => this.transactionFor(raw, fn, options)
       }
       const { handler } = subscription.run
       const { idempotency, breaker } = subscription
@@ -906,6 +1052,13 @@ export class Consumer {
     }
     if (!await this.commit(raw)) return
     this.emitFailure(item, verdict, error, durationMs)
+  }
+
+  /** A handler's transaction: what it produces and the offset after `raw` commit together, on this group's behalf. */
+  private async transactionFor<T> (raw: RawMessage, fn: (tx: Transaction) => Promise<T>, options?: TransactionOptions): Promise<T> {
+    const consumption = this.handles.get(raw.topic)
+    if (consumption === undefined) throw new ClosedError('consumer')
+    return await this.context.transaction(fn, options, { consumption, offsets: [offsetAfter(raw)] })
   }
 
   /**
@@ -1080,7 +1233,8 @@ export class Consumer {
       topic: first.raw.topic,
       partition: first.raw.partition,
       logger: this.context.logger,
-      signal: this.shutdownController.signal
+      signal: this.shutdownController.signal,
+      transaction: (fn, options) => this.transactionFor(last.raw, fn, options)
     }
     // A message that does not decode is failed on its own, before the
     // handler runs; the rest of the batch is what the handler gets.
@@ -1098,6 +1252,26 @@ export class Consumer {
       }
     }
     if (this.shutdownController.signal.aborted) return
+    const size = items.length
+    const verdicts = new Map<Pending, Exclude<Verdict, { outcome: 'crash' }>>()
+    const forward = async (item: Pending, failure: unknown): Promise<Exclude<Verdict, { outcome: 'crash' }>> => {
+      const verdict = await this.forwardFailed(item, subscription, level, failure)
+      if (verdict.outcome === 'crash') {
+        const durationMs = this.context.clock.now() - startedAt
+        this.context.emit('messageFailed', { ...this.locate(item), error: failure, durationMs, outcome: 'crash', batch: size })
+        this.context.emit('batchProcessed', { topic: first.raw.topic, partition: first.raw.partition, groupId: this.groupId, size, durationMs, outcome: 'crash' })
+        throw failure
+      }
+      verdicts.set(item, verdict)
+      return verdict
+    }
+    // What did not decode goes down its ladder BEFORE the handler runs: a
+    // transaction the handler commits, whose offset reaches past these
+    // messages, must not be able to leave them behind uncommitted-for.
+    for (const item of items) {
+      const failure = failures.get(item)
+      if (failure !== undefined) await forward(item, failure)
+    }
     let error: unknown
     if (messages.length > 0) {
       const wrapBatch = this.context.instrumentation?.wrapBatchHandler
@@ -1115,7 +1289,6 @@ export class Consumer {
     if (error === HELD_UNTIL_RELEASED) return
     const durationMs = this.context.clock.now() - startedAt
     if (this.shutdownController.signal.aborted) return
-    const size = items.length
     const batchAt = { topic: first.raw.topic, partition: first.raw.partition, groupId: this.groupId, size, durationMs }
     // The handler's own failure, when it failed the whole batch: what the
     // batch's outcome follows. A BatchFailedError is a handler that resolved
@@ -1146,17 +1319,10 @@ export class Consumer {
     }
     // Forward in offset order, then one commit for the whole batch: a
     // failure to forward leaves everything uncommitted, as for one message.
-    const verdicts = new Map<Pending, Exclude<Verdict, { outcome: 'crash' }>>()
     for (const item of items) {
       const failure = failures.get(item)
-      if (failure === undefined) continue
-      const verdict = await this.forwardFailed(item, subscription, level, failure)
-      if (verdict.outcome === 'crash') {
-        this.context.emit('messageFailed', { ...this.locate(item), error: failure, durationMs, outcome: 'crash', batch: size })
-        this.context.emit('batchProcessed', { ...batchAt, outcome: 'crash' })
-        throw failure
-      }
-      verdicts.set(item, verdict)
+      if (failure === undefined || verdicts.has(item)) continue
+      const verdict = await forward(item, failure)
       if (failure === handlerFailure) outcome = verdict.outcome
     }
     if (!await this.commit(last.raw)) return

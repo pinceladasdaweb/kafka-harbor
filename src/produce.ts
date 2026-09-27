@@ -32,8 +32,8 @@ export interface ProduceEvents {
  * is reported as `messageProduced`. A failure is thrown to the caller, which
  * knows what the batch was for and reports it accordingly.
  */
-export async function produceRecords<E extends ProduceEvents> (context: CoreContext<E>, batch: Omit<ProduceBatch, 'records'>, records: readonly RawRecord[], policy: RetryPolicy = context.producePolicy): Promise<void> {
-  const { instrumentation, adapter, logger, clock } = context
+export async function produceRecords<E extends ProduceEvents> (context: CoreContext<E>, batch: Omit<ProduceBatch, 'records'>, records: readonly RawRecord[], policy: RetryPolicy | null = context.producePolicy, produce: (records: readonly RawRecord[]) => Promise<void> = context.adapter.produce): Promise<void> {
+  const { instrumentation, logger, clock } = context
   const onProduce = instrumentation?.onProduce
   const wrapProduce = instrumentation?.wrapProduce
   const startedAt = clock.now()
@@ -42,7 +42,9 @@ export async function produceRecords<E extends ProduceEvents> (context: CoreCont
     const outgoing = onProduce === undefined
       ? records
       : records.map((record) => ({ ...record, headers: { ...observe(() => onProduce(record), logger), ...record.headers } }))
-    await policy.execute(() => adapter.produce(outgoing))
+    // `null`: no retry, the caller's own ladder decides (a transaction aborts on the first failure).
+    if (policy === null) await produce(outgoing)
+    else await policy.execute(async () => { await produce(outgoing) })
   }
   const full: ProduceBatch = { ...batch, records: records.length }
   await wrapped(wrapProduce === undefined ? undefined : (run) => wrapProduce(full, run), send, logger)

@@ -36,6 +36,7 @@ import {
   ConfigError,
   describeError,
   partitionKey,
+  splitPartitionKey,
   type BrokerConfig,
   type ClientAdapter,
   type CommittedOffset,
@@ -46,7 +47,8 @@ import {
   type RawRecord,
   type TopicPartition,
   type TopicPartitionOffset,
-  type TopicSpec
+  type TopicSpec,
+  type TransactionHandle
 } from '../../index'
 
 type Bytes = Buffer
@@ -91,8 +93,11 @@ export interface PlatformaticAdapterOptions {
   adminTimeoutMs?: number
   /**
    * Messages one consumption holds, all partitions together, before the
-   * adapter stops reading the client's stream. A paused partition fills its
-   * share and the rest keep flowing until the total is reached. Default: 1000.
+   * adapter stops reading the client's stream. A paused partition (a retry
+   * message parked by the core, say) keeps filling its share, and once the
+   * total is reached the stream is left alone for every partition of the
+   * consumption until the paused one drains; a retry level with a long
+   * delay and a backlog behind it may need a larger value. Default: 1000.
    */
   bufferedMessages?: number
   /** The wait before a consumption whose stream failed opens a new one, ms. Default: 1000. */
@@ -114,6 +119,13 @@ const SASL_MECHANISMS = {
 const RESERVED_CONSUMER_KEYS = ['autocommit', 'deserializers', 'registry', 'beforeDeserialization', 'groupId']
 const RESERVED_PRODUCER_KEYS = ['acks', 'idempotent', 'serializers', 'registry', 'beforeSerialization', 'transactionalId']
 const RESERVED_CLIENT_KEYS = ['clientId', 'bootstrapBrokers']
+
+/**
+ * The client registers its request timeout as the transaction timeout, and
+ * its default of five seconds aborts a transaction whose handler takes
+ * longer; a minute is what the Confluent client defaults to.
+ */
+const DEFAULT_TRANSACTION_TIMEOUT_MS = 60_000
 
 /** The retries the producer makes on its own before the adapter reports the batch; the client would retry forever with idempotence on. */
 const DEFAULT_PRODUCER_RETRIES = 3
@@ -277,6 +289,11 @@ interface ConsumptionSettings {
  * per-partition gate in front of `eachMessage`.
  */
 class Consumption {
+  /** The client consumer behind this consumption: what a transaction commits offsets through. */
+  get client (): ClientConsumer {
+    return this.consumer
+  }
+
   private readonly queues = new Map<string, ClientMessage[]>()
   /**
    * Partitions with a message waiting for a worker slot, in the order they
@@ -478,12 +495,19 @@ class Consumption {
    */
   private joined (): void {
     const now = this.assignedNow()
-    const held = new Set([...this.assigned, ...this.queues.keys(), ...this.lastQueued.keys(), ...this.epochs.keys()])
+    const held = new Set([...this.assigned, ...this.queues.keys(), ...this.lastQueued.keys(), ...this.epochs.keys(), ...this.paused])
+    const lostNow: TopicPartition[] = []
     for (const key of held) {
       if (now.has(key)) continue
       this.lost.add(key)
       this.discard(key, true)
+      lostNow.push(splitPartitionKey(key))
     }
+    // The client released these already, so the core cannot be given time
+    // to finish on them; it is told after the fact, which lets it drop what
+    // it holds for them (a retry message parked in memory, for one) instead
+    // of finishing it on the next owner's partition.
+    if (lostNow.length > 0) this.options.onPartitionsRevoked?.(lostNow).catch((error: unknown) => this.report(error, 'revocation failed'))
     let regained = false
     for (const key of this.lost) {
       if (!now.has(key)) continue
@@ -530,6 +554,8 @@ class Consumption {
     if (forget) {
       this.lastQueued.delete(key)
       this.epochs.delete(key)
+      // A pause belongs to the assignment: the partition comes back unpaused.
+      this.paused.delete(key)
     }
   }
 
@@ -626,8 +652,10 @@ export function platformaticAdapter (options: PlatformaticAdapterOptions = {}): 
   for (const [name, value] of Object.entries({ adminTimeoutMs: adminTimeout, ...settings })) {
     if (!Number.isInteger(value) || value < 1) throw new ConfigError(`platformaticAdapter: ${name} must be a positive integer, got ${String(value)}`)
   }
-  let state: { module: PlatformaticClientModule, config: BrokerConfig, producer: ClientProducer, admin: Admin } | undefined
+  let state: { module: PlatformaticClientModule, config: BrokerConfig, producer: ClientProducer, transactional: ClientProducer | undefined, admin: Admin } | undefined
   const consumptions = new Set<Consumption>()
+  /** The consumption behind each handle, which a transaction needs to commit its offsets. */
+  const consumptionsByHandle = new WeakMap<ConsumerHandle, Consumption>()
 
   const loadClient = async (): Promise<PlatformaticClientModule> => {
     try {
@@ -691,6 +719,11 @@ export function platformaticAdapter (options: PlatformaticAdapterOptions = {}): 
         idempotent: true
       })
 
+      // Transactions need a producer of their own: a transactional producer
+      // holds one open transaction and every send on it is part of it.
+      const transactional = config.transactionalId === undefined
+        ? undefined
+        : new module.Producer({ ...base, retries: DEFAULT_PRODUCER_RETRIES, timeout: DEFAULT_TRANSACTION_TIMEOUT_MS, ...options.global, ...options.producer, acks: -1, idempotent: true, transactionalId: config.transactionalId })
       const admin = new module.Admin({ ...base, ...options.global, ...options.admin })
 
       try {
@@ -699,19 +732,20 @@ export function platformaticAdapter (options: PlatformaticAdapterOptions = {}): 
         // produce.
         await admin.connectToBrokers()
         await producer.connectToBrokers()
+        await transactional?.connectToBrokers()
       } catch (error) {
-        await Promise.allSettled([producer.close(), admin.close()])
+        await Promise.allSettled([producer.close(), transactional?.close(), admin.close()])
         throw wrap(error, 'connect failed')
       }
 
-      state = { module, config, producer, admin }
+      state = { module, config, producer, transactional, admin }
     },
 
     async disconnect () {
       const pending: Array<Promise<unknown>> = []
       for (const consumption of consumptions) pending.push(consumption.stop())
       consumptions.clear()
-      if (state !== undefined) pending.push(state.producer.close(), state.admin.close())
+      if (state !== undefined) pending.push(state.producer.close(), state.admin.close(), ...(state.transactional === undefined ? [] : [state.transactional.close()]))
       state = undefined
       const results = await Promise.allSettled(pending)
       const failed = results.find((result): result is PromiseRejectedResult => result.status === 'rejected')
@@ -726,6 +760,65 @@ export function platformaticAdapter (options: PlatformaticAdapterOptions = {}): 
         await producer.send({ messages: records.map(toClientMessage) })
       } catch (error) {
         throw wrap(error, 'produce failed')
+      }
+    },
+
+    async transaction (): Promise<TransactionHandle> {
+      const { transactional } = requireConnected()
+      if (transactional === undefined) throw new ConfigError('platformaticAdapter: transactions need transactionalId on the harbor configuration')
+      let tx: Awaited<ReturnType<ClientProducer['beginTransaction']>>
+      try {
+        tx = await transactional.beginTransaction()
+      } catch (error) {
+        throw wrap(error, 'transaction begin failed')
+      }
+      return {
+        async produce (records) {
+          try {
+            await tx.send({ messages: records.map(toClientMessage) })
+          } catch (error) {
+            throw wrap(error, 'produce failed')
+          }
+        },
+        async sendOffsets (consumption, offsets) {
+          const owner = consumptionsByHandle.get(consumption)
+          if (owner === undefined) throw new ConfigError('platformaticAdapter: the offsets belong to a consumption this adapter did not open')
+          const consumer = owner.client
+          try {
+            // The client commits the offset AFTER a consumed message, from
+            // the message and the group metadata it carries; the contract
+            // hands the next offset to read, so the message stands one back.
+            await tx.addConsumer(consumer)
+            for (const { topic, partition, offset } of offsets) {
+              await tx.addOffset({
+                topic,
+                partition,
+                offset: BigInt(offset) - 1n,
+                metadata: { consumer: { groupId: consumer.groupId, generationId: consumer.generationId, memberId: consumer.memberId, coordinatorId: consumer.coordinatorId } }
+              } as unknown as ClientMessage)
+            }
+          } catch (error) {
+            throw wrap(error, 'sendOffsets failed')
+          }
+        },
+        async commit () {
+          try {
+            await tx.commit()
+          } catch (error) {
+            throw wrap(error, 'transaction commit failed')
+          }
+        },
+        async abort () {
+          try {
+            await tx.abort()
+          } catch (error) {
+            // The client keeps the transaction as the producer's active one
+            // after a failed abort and would refuse every transaction from
+            // then on; cancelling forgets it on the client's side.
+            if (!tx.completed) await tx.cancel().catch(() => undefined)
+            throw wrap(error, 'transaction abort failed')
+          }
+        }
       }
     },
 
@@ -760,7 +853,7 @@ export function platformaticAdapter (options: PlatformaticAdapterOptions = {}): 
 
       consumptions.add(consumption)
 
-      return {
+      const handle: ConsumerHandle = {
         commit: async (offsets) => await consumption.commit(offsets),
         stop: async () => {
           consumptions.delete(consumption)
@@ -769,6 +862,8 @@ export function platformaticAdapter (options: PlatformaticAdapterOptions = {}): 
         pause: (partitions) => consumption.pause(partitions),
         resume: (partitions) => consumption.resume(partitions)
       }
+      consumptionsByHandle.set(handle, consumption)
+      return handle
     },
 
     admin: {

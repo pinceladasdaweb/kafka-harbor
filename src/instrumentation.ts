@@ -7,7 +7,7 @@ import type { Logger, Message, MessageHeaders } from './types'
  * of a failed message to a retry topic or to the DLQ, or a redrive back into
  * service.
  */
-export type ProduceKind = 'send' | 'retry' | 'dead-letter' | 'redrive'
+export type ProduceKind = 'send' | 'retry' | 'dead-letter' | 'redrive' | 'transaction'
 
 /** One produce call about to reach the client. */
 export interface ProduceBatch {

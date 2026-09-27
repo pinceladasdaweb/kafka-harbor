@@ -61,6 +61,25 @@ export interface BrokerConfig {
   readonly brokers: readonly string[]
   readonly ssl?: boolean
   readonly sasl?: SaslConfig
+  /**
+   * Turns on the transactional producer under this id. Kafka fences the
+   * previous holder of an id when a new one starts, so give each process
+   * one of its own and keep it across restarts.
+   */
+  readonly transactionalId?: string
+}
+
+/**
+ * One open transaction. `produce` and `sendOffsets` add to it; `commit`
+ * makes everything visible together (read-committed consumers see none of
+ * it before), `abort` drops everything. The core calls one at a time.
+ */
+export interface TransactionHandle {
+  produce: (records: readonly RawRecord[]) => Promise<void>
+  /** Adds offsets to commit with the transaction, for the group of the consumption that delivered them. */
+  sendOffsets: (consumption: ConsumerHandle, offsets: readonly TopicPartitionOffset[]) => Promise<void>
+  commit: () => Promise<void>
+  abort: () => Promise<void>
 }
 
 export interface ConsumeOptions {
@@ -111,9 +130,11 @@ export interface ConsumerHandle {
   stop: () => Promise<void>
   /**
    * Stops fetching from these partitions without leaving the group, until
-   * `resume`. Optional: the core does not call either today; an application
-   * holding the handle may. A pause belongs to this consumption and must not
-   * survive its `stop()`.
+   * `resume`. Optional, and worth having: the core parks a retry message
+   * that is not due yet by pausing its partition, which is what lets a
+   * retry delay outgrow the poll interval; without the pair the delivery
+   * waits instead and every delay must fit under `maxProcessingTimeMs`. A
+   * pause belongs to this consumption and must not survive its `stop()`.
    */
   pause?: (partitions: readonly TopicPartition[]) => void
   resume?: (partitions: readonly TopicPartition[]) => void
@@ -185,6 +206,14 @@ export interface ClientAdapter {
   produce: (records: readonly RawRecord[]) => Promise<void>
 
   consume: (options: ConsumeOptions) => Promise<ConsumerHandle>
+
+  /**
+   * Optional: begins a transaction on the transactional producer that
+   * `transactionalId` at connect turned on; without the id, rejects with a
+   * ConfigError. An adapter without the member makes `harbor.transaction()`
+   * reject with a ConfigError naming the capability.
+   */
+  transaction?: () => Promise<TransactionHandle>
 
   readonly admin: AdminApi
 }

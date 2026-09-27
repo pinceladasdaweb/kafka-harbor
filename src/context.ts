@@ -1,4 +1,5 @@
 import type { RetryPolicy } from 'breakwater'
+import type { Transaction, TransactionOffsets, TransactionOptions } from './transaction'
 
 import type { HeaderNames } from './headers'
 import type { Clock, Logger } from './types'
@@ -35,4 +36,6 @@ export interface CoreContext<E extends object> {
   readonly ensureConnected: () => Promise<void>
   /** The tracing hooks configured on the harbor, if any. */
   readonly instrumentation?: Instrumentation
+  /** Runs a transaction on the harbor's transactional producer; a consumer hands it the offsets to commit along. */
+  readonly transaction: <T>(fn: (tx: Transaction) => Promise<T>, options?: TransactionOptions, offsets?: TransactionOffsets) => Promise<T>
 }

@@ -1,18 +1,19 @@
 import { systemClock } from './clock'
 import { randomUUID } from 'node:crypto'
 import { parseDuration } from './duration'
+import { firstRejection } from './validate'
 import type { CoreContext } from './context'
 import type { RetryPolicy } from 'breakwater'
 import { requireNonEmptyString } from './validate'
 import type { Clock, Duration, Logger } from './types'
 import type { Instrumentation } from './instrumentation'
 import { createEmitter, type Observable } from './events'
-import { firstRejection } from './validate'
 import { headerNames, type HeaderNames } from './headers'
 import { jsonSerializer, type Serializer } from './serializer'
 import type { BrokerConfig, ClientAdapter, SaslConfig } from './adapter'
 import { AbortProcessingError, ClosedError, ConfigError, describeError } from './errors'
 import { redrive, type RedriveEvents, type RedriveOptions, type RedriveResult } from './redrive'
+import { TransactionRunner, type Transaction, type TransactionEvents, type TransactionOptions } from './transaction'
 import { Producer, buildProducerRetry, type ProducerEvents, type ProducerOptions, type ProducerRetryOptions } from './producer'
 import { Consumer, type ConsumerEvents, type ConsumerOptions, type ConsumerState, type PartitionLag, type StopReason } from './consumer'
 
@@ -35,6 +36,13 @@ export interface HarborConfig {
   adapter: ClientAdapter
   ssl?: boolean
   sasl?: SaslConfig
+  /**
+   * Turns on `harbor.transaction()` and `ctx.transaction()`: the id of this
+   * process's transactional producer. Kafka fences the previous holder of
+   * an id when a new one starts, so give each process its own and keep it
+   * across restarts (`orders-service-1`, not a random one).
+   */
+  transactionalId?: string
   /** Harbor-wide serializer, overridable per producer, consumer and topic. Default: strict JSON. */
   serializer?: Serializer
   headers?: HeaderOptions
@@ -74,7 +82,7 @@ export interface HarborHealth {
   readonly consumers: readonly ConsumerHealth[]
 }
 
-export interface HarborEvents extends ConsumerEvents, RedriveEvents, ProducerEvents {
+export interface HarborEvents extends ConsumerEvents, RedriveEvents, ProducerEvents, TransactionEvents {
   connected: { adapter: string }
   disconnected: { adapter: string }
 }
@@ -114,6 +122,7 @@ export class Harbor implements Observable<HarborEvents> {
   })
 
   private readonly producePolicy: RetryPolicy
+  private readonly transactions: TransactionRunner
   private readonly consumers = new Set<Consumer>()
   private state: HarborState = 'idle'
   /** Whether the adapter holds an open connection that shutdown must release. */
@@ -143,6 +152,21 @@ export class Harbor implements Observable<HarborEvents> {
     this.logger = config.logger ?? defaultLogger
     this.clock = config.clock ?? systemClock
     this.producePolicy = buildProducerRetry(config.produceRetry)
+    if (config.transactionalId !== undefined) requireNonEmptyString(config.transactionalId, 'transactionalId')
+    this.transactions = new TransactionRunner(this.pipelineContext())
+  }
+
+  /**
+   * Runs `fn` inside a transaction on the harbor's transactional producer
+   * (`transactionalId` in the configuration): what `tx.send()` produced
+   * becomes visible to read-committed consumers when `fn` resolves and
+   * the commit lands, and not at all when `fn` throws (the transaction is
+   * aborted and the error rethrown). One transaction at a time; calls
+   * queue. Inside a handler, `ctx.transaction()` is the same with the
+   * consumed offset committed along.
+   */
+  async transaction<T> (fn: (tx: Transaction) => Promise<T>, options?: TransactionOptions): Promise<T> {
+    return await this.transactions.run(fn, options)
   }
 
   get status (): HarborState {
@@ -211,7 +235,8 @@ export class Harbor implements Observable<HarborEvents> {
       emit: (event, payload) => this.emitter.emit(event as keyof HarborEvents, payload as HarborEvents[keyof HarborEvents]),
       isClosed: () => this.isClosed(),
       ensureConnected: () => this.connect(),
-      instrumentation: this.fullConfig.instrumentation
+      instrumentation: this.fullConfig.instrumentation,
+      transaction: (fn, options, offsets) => this.transactions.run(fn, options, offsets)
     }
   }
 
@@ -267,7 +292,8 @@ export class Harbor implements Observable<HarborEvents> {
         clientId: this.fullConfig.clientId,
         brokers: this.fullConfig.brokers,
         ...(this.fullConfig.ssl !== undefined && { ssl: this.fullConfig.ssl }),
-        ...(this.fullConfig.sasl !== undefined && { sasl: this.fullConfig.sasl })
+        ...(this.fullConfig.sasl !== undefined && { sasl: this.fullConfig.sasl }),
+        ...(this.fullConfig.transactionalId !== undefined && { transactionalId: this.fullConfig.transactionalId })
       }
       // The transitions are guarded: a shutdown that began while the connect
       // was in flight owns the state from then on, and a connect that lands

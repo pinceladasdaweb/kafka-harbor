@@ -23,6 +23,9 @@ interface FakeCalls {
   resumed: unknown[]
   disconnected: string[]
   offsetQueries: unknown[]
+  producerConfigs: unknown[]
+  transactions: string[]
+  offsetsSent: unknown[]
 }
 
 const fakeClient = (behavior: {
@@ -33,22 +36,48 @@ const fakeClient = (behavior: {
   topicOffsets?: Array<{ partition: number, offset: string, high: string, low: string }> | (() => Array<{ partition: number, offset: string, high: string, low: string }>)
   committedOffsets?: Array<{ topic: string, partitions: Array<{ partition: number, offset: string }> }>
   offsetsError?: unknown
+  transactionError?: unknown
+  commitError?: unknown
+  abortError?: unknown
+  sendOffsetsError?: unknown
+  producerConnectError?: unknown
 } = {}): { module: ConfluentClientModule, calls: FakeCalls } => {
-  const calls: FakeCalls = { kafkaConfig: undefined, producerConfig: undefined, consumerConfigs: [], sent: [], committed: [], created: [], runConfig: undefined, paused: [], resumed: [], disconnected: [], offsetQueries: [] }
+  const calls: FakeCalls = { kafkaConfig: undefined, producerConfig: undefined, consumerConfigs: [], sent: [], committed: [], created: [], runConfig: undefined, paused: [], resumed: [], disconnected: [], offsetQueries: [], producerConfigs: [], transactions: [], offsetsSent: [] }
   class Kafka {
     constructor (config: unknown) {
       calls.kafkaConfig = config
     }
 
     producer (config: unknown): KafkaJS.Producer {
-      calls.producerConfig = config
+      calls.producerConfig ??= config
+      calls.producerConfigs.push(config)
+      const sendBatch = async (batch: KafkaJS.ProducerBatch): Promise<KafkaJS.RecordMetadata[]> => {
+        calls.sent.push(batch)
+        if (behavior.sendError !== undefined) throw behavior.sendError
+        return behavior.sendResult ?? [{ topicName: 't', partition: 0, errorCode: 0 }]
+      }
       return {
-        connect: async () => {},
+        connect: async () => { if (behavior.producerConnectError !== undefined) throw behavior.producerConnectError },
         disconnect: async () => { calls.disconnected.push('producer') },
-        sendBatch: async (batch: KafkaJS.ProducerBatch) => {
-          calls.sent.push(batch)
-          if (behavior.sendError !== undefined) throw behavior.sendError
-          return behavior.sendResult ?? [{ topicName: 't', partition: 0, errorCode: 0 }]
+        sendBatch,
+        transaction: async () => {
+          calls.transactions.push('begin')
+          if (behavior.transactionError !== undefined) throw behavior.transactionError
+          return {
+            sendBatch,
+            sendOffsets: async (args: unknown) => {
+              calls.offsetsSent.push(args)
+              if (behavior.sendOffsetsError !== undefined) throw behavior.sendOffsetsError
+            },
+            commit: async () => {
+              calls.transactions.push('commit')
+              if (behavior.commitError !== undefined) throw behavior.commitError
+            },
+            abort: async () => {
+              calls.transactions.push('abort')
+              if (behavior.abortError !== undefined) throw behavior.abortError
+            }
+          }
         }
       } as unknown as KafkaJS.Producer
     }
@@ -304,6 +333,86 @@ describe('confluentAdapter', () => {
     const adapter3 = confluentAdapter({ client: failingList.module })
     await adapter3.connect(broker)
     await assert.rejects(adapter3.admin.createTopics([{ topic: 't' }]), /metadata timeout/)
+  })
+})
+
+describe('confluentAdapter: transactions', () => {
+  test('a transactionalId opens a second producer, and a transaction produces, sends the consumption\'s offsets through its consumer, and commits', async () => {
+    const { module, calls } = fakeClient()
+    const adapter = confluentAdapter({ client: module, producer: { 'linger.ms': 5 } })
+    await adapter.connect({ ...broker, transactionalId: 'orders-service-1' })
+    assert.equal(calls.producerConfigs.length, 2)
+    assert.deepEqual(calls.producerConfigs[1], { kafkaJS: { acks: -1, idempotent: true, transactionalId: 'orders-service-1' }, 'linger.ms': 5 })
+    const handle = await adapter.consume({ groupId: 'g', topics: ['t'], eachMessage: async () => {} })
+    const tx = await adapter.transaction!()
+    await tx.produce([{ topic: 'out', key: null, value: Buffer.from('v'), headers: {} }])
+    await tx.sendOffsets(handle, [{ topic: 't', partition: 0, offset: '5' }, { topic: 't', partition: 1, offset: '2' }, { topic: 'u', partition: 0, offset: '9' }])
+    await tx.commit()
+    assert.deepEqual(calls.transactions, ['begin', 'commit'])
+    assert.equal((calls.sent[0] as KafkaJS.ProducerBatch).topicMessages?.[0]?.topic, 'out')
+    const [sent] = calls.offsetsSent as [{ consumer: unknown, topics: unknown }]
+    assert.ok(sent.consumer !== undefined, 'the client wants the consumer itself')
+    assert.deepEqual(sent.topics, [{ topic: 't', partitions: [{ partition: 0, offset: '5' }, { partition: 1, offset: '2' }] }, { topic: 'u', partitions: [{ partition: 0, offset: '9' }] }])
+    const aborted = await adapter.transaction!()
+    await aborted.abort()
+    assert.deepEqual(calls.transactions, ['begin', 'commit', 'begin', 'abort'])
+    await adapter.disconnect()
+    assert.equal(calls.disconnected.filter((what) => what === 'producer').length, 2)
+  })
+
+  test('refused without a transactionalId, for a consumption this adapter did not open, and the passthrough may not set transactional.id', async () => {
+    const { module } = fakeClient()
+    const adapter = confluentAdapter({ client: module })
+    await adapter.connect(broker)
+    await assert.rejects(adapter.transaction!(), { code: ERROR_CODES.CONFIG_INVALID, message: /transactionalId/ })
+    await adapter.disconnect()
+    await adapter.connect({ ...broker, transactionalId: 'x' })
+    const tx = await adapter.transaction!()
+    await assert.rejects(tx.sendOffsets({ commit: async () => {}, stop: async () => {} }, [{ topic: 't', partition: 0, offset: '1' }]), { code: ERROR_CODES.CONFIG_INVALID, message: /did not open/ })
+    await adapter.disconnect()
+    assert.throws(() => confluentAdapter({ producer: { 'transactional.id': 'x' } }), { code: ERROR_CODES.CONFIG_INVALID })
+  })
+
+  test('a transaction that could be neither committed nor aborted leaves the producer stuck in the client: the adapter drops it and opens a new one for the next transaction', async () => {
+    const behavior: { commitError?: unknown, abortError?: unknown, producerConnectError?: unknown } = { commitError: new Error('fenced'), abortError: new Error('nothing to abort') }
+    const { module, calls } = fakeClient(behavior)
+    const adapter = confluentAdapter({ client: module })
+    await adapter.connect({ ...broker, transactionalId: 'x' })
+    const tx = await adapter.transaction!()
+    await assert.rejects(tx.commit(), { message: /transaction commit failed: fenced/ })
+    await assert.rejects(tx.abort(), { message: /transaction abort failed: nothing to abort/ })
+    assert.equal(calls.disconnected.filter((what) => what === 'producer').length, 1, 'the stuck producer was released')
+    // The broker is still out of reach: the reopen fails, is released, and is tried again on the next call.
+    behavior.producerConnectError = new Error('coordinator unavailable')
+    await assert.rejects(adapter.transaction!(), { message: /transaction begin failed: coordinator unavailable/ })
+    assert.equal(calls.disconnected.filter((what) => what === 'producer').length, 2)
+    delete behavior.producerConnectError
+    delete behavior.commitError
+    delete behavior.abortError
+    const next = await adapter.transaction!()
+    await next.commit()
+    assert.equal(calls.producerConfigs.length, 4, 'a fresh transactional producer after the failed reopen')
+    assert.deepEqual(calls.producerConfigs[3], calls.producerConfigs[1])
+    await adapter.disconnect()
+    assert.equal(calls.disconnected.filter((what) => what === 'producer').length, 4)
+  })
+
+  test('client failures on begin, offsets, commit and abort are wrapped with the original as cause', async () => {
+    const failing = fakeClient({ transactionError: new Error('coordinator gone') })
+    const adapter = confluentAdapter({ client: failing.module })
+    await adapter.connect({ ...broker, transactionalId: 'x' })
+    await assert.rejects(adapter.transaction!(), { message: /transaction begin failed: coordinator gone/ })
+    await adapter.disconnect()
+
+    const later = fakeClient({ sendOffsetsError: new Error('no group'), commitError: Object.assign(new Error('fenced'), { code: -144 }), abortError: new Error('too late') })
+    const second = confluentAdapter({ client: later.module })
+    await second.connect({ ...broker, transactionalId: 'x' })
+    const handle = await second.consume({ groupId: 'g', topics: ['t'], eachMessage: async () => {} })
+    const tx = await second.transaction!()
+    await assert.rejects(tx.sendOffsets(handle, [{ topic: 't', partition: 0, offset: '1' }]), { message: /sendOffsets failed: no group/ })
+    await assert.rejects(tx.commit(), { message: /transaction commit failed: fenced/ })
+    await assert.rejects(tx.abort(), { message: /transaction abort failed: too late/ })
+    await second.disconnect()
   })
 })
 

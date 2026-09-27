@@ -27,21 +27,14 @@ export interface ResolvedRetryLevel {
 }
 
 /**
- * Validates the retry ladder once, at construction. Every delay must be a
- * valid duration and no delay may exceed `maxDelayMs`: a retry topic
- * consumer waits the level's delay before running the handler, and a wait
- * longer than the poll interval would get the consumer kicked out of the
- * group. The error names the option the caller passed.
+ * Validates the retry ladder once, at construction: every delay must be a
+ * valid duration. The error names the option the caller passed. Whether a
+ * delay fits under the client's poll interval depends on the adapter (one
+ * with pause/resume parks the message instead of waiting inside the
+ * delivery), so that check belongs to `start()`.
  */
-export function resolveRetryLevels (levels: readonly RetryLevel[], maxDelayMs: number): ResolvedRetryLevel[] {
-  return levels.map((level, index) => {
-    const name = `retry.levels[${index}].delay`
-    const delayMs = parseDuration(level.delay, name)
-    if (delayMs > maxDelayMs) {
-      throw new ConfigError(`${name} (${delayMs}ms) exceeds maxProcessingTime (${maxDelayMs}ms); a retry consumer waits the delay before the handler runs, and a wait longer than the poll interval leaves the group`)
-    }
-    return { level: index + 1, delayMs }
-  })
+export function resolveRetryLevels (levels: readonly RetryLevel[]): ResolvedRetryLevel[] {
+  return levels.map((level, index) => ({ level: index + 1, delayMs: parseDuration(level.delay, `retry.levels[${index}].delay`) }))
 }
 
 /**

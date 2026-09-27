@@ -42,6 +42,24 @@ export function buildProducerRetry (options: ProducerRetryOptions | undefined): 
   })
 }
 
+/**
+ * The records a batch of outgoing messages becomes, serialized before any
+ * byte leaves: one unencodable value means no record at all, a serializer
+ * that is asynchronous (a schema registry) is awaited, and every record
+ * carries the same produced-at instant and the automatic headers.
+ */
+export async function toRecords<T> (context: Pick<CoreContext<ProduceEvents>, 'clientId' | 'clock' | 'correlationId' | 'headerNames'>, serializer: Serializer<T>, topic: string, messages: readonly OutgoingMessage<T>[]): Promise<RawRecord[]> {
+  requireNonEmptyString(topic, 'topic')
+  const stamp = { clientId: context.clientId, at: new Date(context.clock.now()), correlationId: context.correlationId }
+  return await Promise.all(messages.map(async (message): Promise<RawRecord> => ({
+    topic,
+    key: message.key === undefined || message.key === null ? null : Buffer.from(message.key, 'utf8'),
+    value: message.value === null ? null : await serializer.serialize(message.value, topic),
+    headers: stampProducer(message.headers ?? {}, context.headerNames, stamp),
+    partition: message.partition
+  })))
+}
+
 export class Producer<T = unknown> {
   private readonly context: ProducerContext
   private readonly serializer: Serializer<T>
@@ -72,19 +90,7 @@ export class Producer<T = unknown> {
    * rejects the send without a producer error.
    */
   async sendBatch (topic: string, messages: readonly OutgoingMessage<T>[]): Promise<void> {
-    requireNonEmptyString(topic, 'topic')
-    // One instant for the whole batch: the records leave together.
-    const stamp = { clientId: this.context.clientId, at: new Date(this.context.clock.now()), correlationId: this.context.correlationId }
-    // Every value is serialized before any byte leaves: a batch with one
-    // unencodable value produces nothing, a serializer that is asynchronous
-    // (a schema registry) is awaited here, and the records leave together.
-    const records = await Promise.all(messages.map(async (message): Promise<RawRecord> => ({
-      topic,
-      key: message.key === undefined || message.key === null ? null : Buffer.from(message.key, 'utf8'),
-      value: message.value === null ? null : await this.serializer.serialize(message.value, topic),
-      headers: stampProducer(message.headers ?? {}, this.context.headerNames, stamp),
-      partition: message.partition
-    })))
+    const records = await toRecords(this.context, this.serializer, topic, messages)
     if (records.length === 0) return
     await this.context.ensureConnected()
     try {

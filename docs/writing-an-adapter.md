@@ -72,7 +72,11 @@ topic sets (one call per retry level), so an adapter must not assume a
 single consumer per group.
 
 The returned `ConsumerHandle` has `commit`, `stop`, and optionally `pause`
-and `resume`. `stop()` leaves the group and releases the client. The core
+and `resume`. Implement the pair when the client has them: the core parks
+a retry message that is not due yet by pausing its partition and resuming
+it when the message ran, which is what lets a retry delay outgrow the poll
+interval; without them the delivery waits the delay itself and every delay
+must fit under `maxProcessingTimeMs`. `stop()` leaves the group and releases the client. The core
 settles every delivery it abandoned before calling `stop()`, so an adapter
 that waits for in-flight `eachMessage` calls does not deadlock.
 
@@ -95,6 +99,19 @@ committed offset reads back exactly as committed. A partition the group
 never committed on may come back with a `null` offset or not at all, as the
 broker answers; the core treats both the same. Invariant 10 of the contract
 suite checks all of that and skips when the pair is absent.
+
+### transaction
+
+Optional. `transaction()` begins a transaction on a transactional producer
+the adapter opened when `connect()` received `transactionalId`, and
+returns a handle: `produce` sends inside it, `sendOffsets(consumption,
+offsets)` adds the offsets to commit for the group of that consumption (the
+handle the adapter returned from `consume`, so the adapter can reach the
+client consumer the broker wants the group metadata from), `commit` makes
+everything visible together, `abort` drops it. One transaction is open at
+a time; the core serializes the calls. Without `transactionalId` the call
+rejects with a `ConfigError`; an adapter without the member makes
+`harbor.transaction()` reject with a `ConfigError` naming the capability.
 
 ## Errors
 
