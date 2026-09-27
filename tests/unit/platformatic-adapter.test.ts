@@ -34,6 +34,10 @@ interface Behavior {
   offsets?: (timestamp: bigint) => OffsetsAnswer[]
   offsetsError?: unknown
   committed?: Array<{ groupId: string, topics: Array<{ name: string, partitions: Array<{ partitionIndex: number, committedOffset: bigint }> }> }>
+  beginError?: unknown
+  txCommitError?: unknown
+  txAbortError?: unknown
+  addOffsetError?: unknown
 }
 
 class FakeStream extends Readable {
@@ -58,6 +62,8 @@ class FakeStream extends Readable {
 const fakeClient = (behavior: Behavior = {}) => {
   const calls = {
     producerOptions: undefined as unknown,
+    producerOptionsList: [] as unknown[],
+    transactions: [] as unknown[],
     adminOptions: undefined as unknown,
     consumers: [] as FakeConsumer[],
     consumeOptions: [] as unknown[],
@@ -73,9 +79,14 @@ const fakeClient = (behavior: Behavior = {}) => {
 
   class FakeConsumer extends EventEmitter {
     assignments: GroupAssignment[] | null = null
+    readonly groupId: string
+    generationId = 3
+    memberId = 'member-1'
+    coordinatorId = 7
     readonly streams: FakeStream[] = []
     constructor (readonly options: unknown) {
       super()
+      this.groupId = (options as { groupId: string }).groupId
       calls.consumers.push(this)
     }
 
@@ -102,7 +113,23 @@ const fakeClient = (behavior: Behavior = {}) => {
 
   class FakeProducer {
     constructor (options: unknown) {
-      calls.producerOptions = options
+      calls.producerOptions ??= options
+      calls.producerOptionsList.push(options)
+    }
+
+    async beginTransaction (): Promise<unknown> {
+      calls.transactions.push('begin')
+      if (behavior.beginError !== undefined) throw behavior.beginError
+      let completed = false
+      return {
+        get completed () { return completed },
+        send: async (options: unknown) => { calls.transactions.push(['send', options]); if (behavior.sendError !== undefined) throw behavior.sendError; return {} },
+        cancel: async () => { calls.transactions.push('cancel'); completed = true },
+        addConsumer: async (consumer: FakeConsumer) => { calls.transactions.push(['addConsumer', consumer.groupId]) },
+        addOffset: async (message: unknown) => { calls.transactions.push(['addOffset', message]); if (behavior.addOffsetError !== undefined) throw behavior.addOffsetError },
+        commit: async () => { calls.transactions.push('commit'); if (behavior.txCommitError !== undefined) throw behavior.txCommitError; completed = true },
+        abort: async () => { calls.transactions.push('abort'); if (behavior.txAbortError !== undefined) throw behavior.txAbortError; completed = true }
+      }
     }
 
     async connectToBrokers (): Promise<void> {
@@ -375,6 +402,65 @@ describe('platformaticAdapter', () => {
       return true
     })
     await adapter.disconnect()
+  })
+})
+
+describe('platformaticAdapter: transactions', () => {
+  test('a transactionalId opens a second producer; a transaction sends, commits the consumption\'s offsets one back with the group identity, and ends', async () => {
+    const { module, calls } = fakeClient()
+    const adapter = platformaticAdapter({ client: module, producer: { compression: 'gzip' } })
+    await adapter.connect({ ...broker, transactionalId: 'orders-service-1' })
+    assert.equal(calls.producerOptionsList.length, 2)
+    assert.deepEqual(calls.producerOptionsList[1], { clientId: 'app', bootstrapBrokers: ['b:9092'], retries: 3, timeout: 60_000, compression: 'gzip', acks: -1, idempotent: true, transactionalId: 'orders-service-1' })
+    const handle = await adapter.consume({ groupId: 'g', topics: ['t'], eachMessage: async () => {} })
+    const tx = await adapter.transaction!()
+    await tx.produce([{ topic: 'out', key: null, value: Buffer.from('v'), headers: { h: '1' } }])
+    await tx.sendOffsets(handle, [{ topic: 't', partition: 0, offset: '5' }])
+    await tx.commit()
+    const [begin, send, addConsumer, addOffset, commit] = calls.transactions as [string, [string, { messages: unknown[] }], [string, string], [string, { topic: string, partition: number, offset: bigint, metadata: unknown }], string]
+    assert.equal(begin, 'begin')
+    assert.equal(send[1].messages.length, 1)
+    assert.deepEqual(addConsumer, ['addConsumer', 'g'])
+    assert.deepEqual([addOffset[1].topic, addOffset[1].partition, addOffset[1].offset], ['t', 0, 4n])
+    assert.deepEqual(addOffset[1].metadata, { consumer: { groupId: 'g', generationId: 3, memberId: 'member-1', coordinatorId: 7 } })
+    assert.equal(commit, 'commit')
+    const aborted = await adapter.transaction!()
+    await aborted.abort()
+    assert.deepEqual(calls.transactions.slice(-2), ['begin', 'abort'])
+    await adapter.disconnect()
+    assert.equal(calls.closed.filter((what) => what === 'producer').length, 2)
+  })
+
+  test('refused without a transactionalId and for a consumption this adapter did not open; client failures are wrapped', async () => {
+    const { module } = fakeClient({ addOffsetError: networkError(), txCommitError: Object.assign(new Error('fenced'), { code: 'PLT_KFK_PROTOCOL', apiId: 'INVALID_PRODUCER_EPOCH', canRetry: false }) })
+    const adapter = platformaticAdapter({ client: module })
+    await adapter.connect(broker)
+    await assert.rejects(adapter.transaction!(), { code: ERROR_CODES.CONFIG_INVALID, message: /transactionalId/ })
+    await adapter.disconnect()
+    await adapter.connect({ ...broker, transactionalId: 'x' })
+    const handle = await adapter.consume({ groupId: 'g', topics: ['t'], eachMessage: async () => {} })
+    const tx = await adapter.transaction!()
+    await assert.rejects(tx.sendOffsets({ commit: async () => {}, stop: async () => {} }, []), { code: ERROR_CODES.CONFIG_INVALID, message: /did not open/ })
+    await assert.rejects(tx.sendOffsets(handle, [{ topic: 't', partition: 0, offset: '1' }]), { message: /sendOffsets failed: connection refused/, retryable: true })
+    await assert.rejects(tx.commit(), { message: /transaction commit failed: fenced/, retryable: false })
+    await adapter.disconnect()
+
+    const refusing = fakeClient({ beginError: new Error('busy') })
+    const second = platformaticAdapter({ client: refusing.module })
+    await second.connect({ ...broker, transactionalId: 'x' })
+    await assert.rejects(second.transaction!(), { message: /transaction begin failed: busy/ })
+    await second.disconnect()
+
+    const broken = fakeClient({ sendError: protocolError('MESSAGE_TOO_LARGE', false), txAbortError: new Error('too late') })
+    const third = platformaticAdapter({ client: broken.module })
+    await third.connect({ ...broker, transactionalId: 'x' })
+    const open = await third.transaction!()
+    await assert.rejects(open.produce([{ topic: 'out', key: null, value: Buffer.from('v'), headers: {} }]), { message: /produce failed: MESSAGE_TOO_LARGE/, retryable: false })
+    await assert.rejects(open.abort(), { message: /transaction abort failed: too late/ })
+    // The client would keep the transaction as the producer's active one: cancelled, so the next one can begin.
+    assert.deepEqual(broken.calls.transactions.slice(-2), ['abort', 'cancel'])
+    await third.transaction!()
+    await third.disconnect()
   })
 })
 

@@ -252,7 +252,7 @@ describe('consumer circuit breaker', () => {
     assert.deepEqual(changesOf(changes), ['orders:closed->open'])
 
     await producer.send('orders', { value: { fail: false } })
-    await until(() => h.clock.waiting === 1, 2_000)
+    await until(() => h.clock.sleeps.includes(1_000), 2_000)
     assert.deepEqual(seen, [], 'held, not run')
     await new Promise((resolve) => setTimeout(resolve, 350))
     h.clock.advance(1_000)

@@ -84,6 +84,22 @@ describe('kafka-harbor/otel metrics', () => {
     await m.shutdown()
   })
 
+  test('transactions are counted by outcome, and their produces by the transaction kind', async () => {
+    const h = harness({ transactionalId: 'shop-1' })
+    const m = metering()
+    otelMetrics(h.harbor, { meterProvider: m.provider, lag: false })
+    h.adapter.createTopic('orders')
+    await h.harbor.transaction(async (tx) => { await tx.send('orders', { value: 1 }) })
+    await assert.rejects(h.harbor.transaction(async () => { throw new Error('no') }))
+    assert.equal(await m.point('kafka_harbor.transactions', { 'kafka_harbor.outcome': 'committed' }), 1)
+    assert.equal(await m.point('kafka_harbor.transactions', { 'kafka_harbor.outcome': 'aborted' }), 1)
+    assert.equal(await m.point('kafka_harbor.messages.produced', { 'kafka_harbor.topic': 'orders', 'kafka_harbor.kind': 'transaction' }), 1)
+    const described = (await m.descriptors()).find((d) => d.name === 'kafka_harbor.transactions')
+    assert.ok(described !== undefined && described.description.length > 20 && described.unit.length > 0)
+    await h.harbor.shutdown()
+    await m.shutdown()
+  })
+
   test('circuit breaker transitions are counted per topic by the state entered', async () => {
     const h = harness()
     const m = metering()
@@ -496,7 +512,7 @@ describe('kafka-harbor/otel tracing', () => {
   test('an offset past 2^53 is kept exact as a string and left out of the integer attribute', async () => {
     const { exporter, instrumentation } = tracing()
     const message = { topic: 'orders', partition: 0, offset: '9007199254740993', key: null, value: null, headers: {}, timestamp: new Date(0) }
-    const handlerContext = { groupId: 'g', correlationId: undefined, logger: silentLogger, signal: new AbortController().signal, attempt: 1 }
+    const handlerContext = { groupId: 'g', correlationId: undefined, logger: silentLogger, signal: new AbortController().signal, attempt: 1, transaction: async (): Promise<never> => { throw new Error('not here') } }
     await instrumentation.wrapHandler?.(message, handlerContext, async () => {})
     const span = exporter.getFinishedSpans().find((candidate) => candidate.name === 'orders process')
     assert.equal(span?.attributes['messaging.kafka.offset'], undefined)

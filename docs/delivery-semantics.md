@@ -94,6 +94,37 @@ is still executing is a conflict the engine's policy decides (quayside's
 with two keys; a business key collapses that one too, and the duplicates
 the producer sent.
 
+## Transactions
+
+`harbor.transaction()` and `ctx.transaction()` run on a transactional
+producer (`transactionalId` on the harbor). What `tx.send()` produced is
+written to the brokers as the function runs, marked as part of an open
+transaction; a consumer reading committed data (the default in both
+clients) sees none of it until the commit, and never sees it after an
+abort. Inside a handler, the consumed offset (the batch's last, for a batch
+handler) is added to the transaction before the commit, so the offset
+commit and the produces land together: a crash between them cannot leave
+the offset committed with nothing produced, nor the records produced with
+the offset uncommitted. That is exactly-once from the consumed topic to the
+produced ones, and only that: anything the function did outside Kafka ran
+once per attempt and is not rolled back by an abort.
+
+What the transaction does not cover: the consumer's own commit after the
+handler (a repeat of an offset already committed, harmless); the retry and
+DLQ hops, produced outside any transaction, which is why `ctx.transaction`
+must be the last thing a handler does: a handler that throws after its
+transaction committed walks the ladder with the plain producer, and a crash
+between the transactional commit and that hop loses the message, offset
+committed and nothing forwarded. A batch message that does not decode is
+dead-lettered before the handler runs for the same reason, and a batch
+handler must not throw `BatchFailedError` after `ctx.transaction`. A
+shutdown mid-transaction disconnects the producer and aborts it, leaving
+the message uncommitted for the next member. Transactions run one at a
+time per harbor, and one begun from inside another is refused. A
+transaction the broker times out (a minute by default) has its commit
+refused; a transaction that could be neither committed nor aborted has its
+producer reopened by the adapter for the next one.
+
 ## Retry delays
 
 A message on `orders-retry-N` becomes due `levels[N-1].delay` after its

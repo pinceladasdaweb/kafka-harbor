@@ -97,6 +97,19 @@ describe('kafka-harbor/prometheus', () => {
     await h.harbor.shutdown()
   })
 
+  test('transactions are counted by outcome, and their produces by the transaction kind', async () => {
+    const h = harness({ transactionalId: 'shop-1' })
+    const registry = new Registry()
+    prometheusMetrics(h.harbor, { registry, lag: false })
+    h.adapter.createTopic('orders')
+    await h.harbor.transaction(async (tx) => { await tx.send('orders', { value: 1 }) })
+    await assert.rejects(h.harbor.transaction(async () => { throw new Error('no') }))
+    assert.equal(await value(registry, 'kafka_harbor_transactions_total', { outcome: 'committed' }), 1)
+    assert.equal(await value(registry, 'kafka_harbor_transactions_total', { outcome: 'aborted' }), 1)
+    assert.equal(await value(registry, 'kafka_harbor_messages_produced_total', { topic: 'orders', kind: 'transaction' }), 1)
+    await h.harbor.shutdown()
+  })
+
   test('circuit breaker transitions are counted per topic by the state entered', async () => {
     const h = harness()
     const registry = new Registry()

@@ -92,7 +92,7 @@ The design principle behind every decision: **losing a message is never the defa
 - **Retry breaks ordering.** A message that goes through a retry topic is processed after later messages on the original topic. The alternative, blocking the partition until it succeeds, is what `harbor.abort()` gives you.
 - **Durations top out at about 24.8 days** (`2147483647` ms), the longest a timer can hold. A longer shutdown timeout or retry delay is a `ConfigError`, not a wait that ends after a millisecond.
 - **The default adapter has a native dependency.** `@confluentinc/kafka-javascript` ships prebuilt binaries for Node 18 to 24 on Linux (glibc and musl, x64 and arm64), macOS and Windows; on Node 26 it compiles librdkafka at install and needs a build toolchain in the image. [Docker images](#docker-images) lists what was verified. `kafka-harbor/adapters/platformatic` needs no binary at all, and any other client can be plugged in through `ClientAdapter`.
-- **No transactions.** The producer is idempotent and the consumer commits after the handler; there is no `sendOffsetsToTransaction`, so a handler that produces and consumes is at-least-once on both sides.
+- **Transactions cover Kafka only.** `harbor.transaction()` makes what it produced and the consumed offset land together, which is exactly-once from an input topic to output topics. A database write or an HTTP call inside the function is outside the transaction, and the harbor's own retry and DLQ hops are produced outside it too: a handler that throws after its transaction committed sends the message down the ladder, and the retry produces again.
 
 ## Install
 
@@ -203,6 +203,31 @@ const events = harbor.producer<OrderEvent>({
 - Keyed messages land on the partition Kafka's default partitioner picks (murmur2). `partitionForKey(key, partitions)` computes the same number, for code that needs to know where a key goes: sharding a cache by partition, asserting co-location of related keys, or routing an unkeyed message next to a keyed one.
 - A batch is serialized before any byte leaves the process: one unencodable value means nothing is produced.
 - `send()` resolves after the broker acknowledged. Transient failures are retried (default: 5 attempts, exponential backoff with full jitter); a failure marked `retryable: false` is not. When the attempts run out you get breakwater's `RETRY_EXHAUSTED` with the last failure as `cause`.
+
+### Transactions
+
+```ts
+import { createHarbor } from 'kafka-harbor'
+
+const harbor = createHarbor({ clientId: 'orders-service', brokers, adapter, transactionalId: 'orders-service-1' })
+
+// Both records land together, or neither does.
+await harbor.transaction(async (tx) => {
+  await tx.send('orders', { key: order.id, value: order })
+  await tx.send('audit', { value: { placed: order.id } })
+})
+
+// In a handler: what was produced and the consumed offset commit together.
+consumer.subscribe<Order>('orders', async (message, ctx) => {
+  await ctx.transaction(async (tx) => {
+    await tx.send('shipments', { key: message.value.id, value: ship(message.value) })
+  })
+})
+```
+
+`transactionalId` turns on a transactional producer next to the plain one. `harbor.transaction(fn)` runs `fn` with a `tx` whose `send`/`sendBatch` serialize like the producer's; when `fn` resolves the transaction commits and everything it produced becomes visible at once to consumers reading committed data (the default in both clients), and when `fn` throws it is aborted, nothing surfaces, and the error is rethrown. Inside a handler, `ctx.transaction(fn)` adds the offset of the message (or of the batch's last message) to the same transaction before the commit: Kafka's exactly-once between the consumed topic and the produced ones. The consumer's own commit after the handler repeats an offset the transaction already committed, which is harmless.
+
+What to know before relying on it. One transaction at a time per harbor: a transactional producer holds one open transaction, so calls queue behind each other, and handlers of a `concurrency: 4` consumer that all use `ctx.transaction` serialize on it. Give each process a `transactionalId` of its own and keep it across restarts: Kafka fences the previous holder of an id when a new one starts, and a fenced producer fails its next commit. Only Kafka effects are atomic: a database write or an HTTP call inside `fn` runs once per attempt and is not rolled back by an abort; `ctx.transaction` must be the last thing the handler does: a handler that throws after its transaction committed sends the message down the ladder with the plain producer, and a crash between the two loses the message, offset committed and nothing forwarded. For the same reason a batch handler must not throw `BatchFailedError` after `ctx.transaction`; a message of the batch that does not decode is dead-lettered before the handler runs, so the transaction cannot leave it behind. There is no retry inside a transaction: a produce the broker refuses aborts it, and the caller's ladder decides what comes next. A transaction has a timeout on the broker's side, a minute by default in both adapters (`producer: { 'transaction.timeout.ms': n }` on the Confluent adapter, `producer: { timeout: n }` on the platformatic one): a handler that holds one open longer has it aborted and its next commit refused. A shutdown that begins mid-transaction disconnects the producer under it, which aborts it. Every transaction ends in a `transactionCompleted` event with its outcome and record count, counted in `kafka_harbor_transactions_total` or `kafka_harbor.transactions`; its sends are `messageProduced` with kind `transaction`, counted as the broker acknowledges them, before the outcome is known, so an aborted transaction counted its sends too. The in-memory adapter supports transactions for tests, with the same `transactionalId` requirement.
 
 ## Consumer
 
@@ -434,6 +459,7 @@ metrics.detach()
 | `kafka_harbor_errors_total` | `scope` | `error` events: `consumer`, `producer`, `adapter` |
 | `kafka_harbor_consumer_stops_total` | `group`, `reason` | `shutdown`, `abort` or `crash` |
 | `kafka_harbor_circuit_state_changes_total` | `group`, `topic`, `to` | circuit breaker transitions by the state entered; `open` means the topic's partitions are held |
+| `kafka_harbor_transactions_total` | `outcome` | `committed` or `aborted` |
 | `kafka_harbor_consumer_lag` | `group`, `topic`, `partition` | gauge collected on scrape through `harbor.lag()` |
 
 Options: `registry` (default: prom-client's global one), `prefix` (default `kafka_harbor_`, `''` for none), `buckets` for the histograms in seconds (default 5ms to 10s), and `lag: false` to skip the gauge, which is required for an adapter that does not report offsets (otherwise a `ConfigError` at construction). A lag collection that fails leaves the gauge without series for that scrape and is reported through the harbor's `error` event; the scrape itself succeeds. `detach()` unsubscribes and removes the lag gauge; the counters and histograms stay registered until `registry.clear()`. Labels are deliberately low-cardinality: never an offset or a correlation id.
@@ -450,7 +476,7 @@ const harbor = createHarbor({ clientId: 'orders-service', brokers, adapter: myAd
 const metrics = otelMetrics(harbor)   // instruments under kafka_harbor.*, the same signals as the Prometheus entry point
 ```
 
-`otelMetrics` records the same signals as instruments named `kafka_harbor.messages.processed`, `kafka_harbor.messages.replayed`, `kafka_harbor.message.processing.duration`, `kafka_harbor.batches.processed`, `kafka_harbor.batch.processing.duration`, `kafka_harbor.messages.failed`, `kafka_harbor.messages.retried`, `kafka_harbor.messages.dead_lettered`, `kafka_harbor.messages.redriven`, `kafka_harbor.messages.produced`, `kafka_harbor.produce.duration`, `kafka_harbor.errors`, `kafka_harbor.consumer.stops`, `kafka_harbor.circuit.state_changes` and the observable gauge `kafka_harbor.consumer.lag`, with `kafka_harbor.group`, `kafka_harbor.topic`, `kafka_harbor.outcome`, `kafka_harbor.level`, `kafka_harbor.kind`, `kafka_harbor.scope`, `kafka_harbor.reason`, `kafka_harbor.state`, `kafka_harbor.from`, `kafka_harbor.to` and `kafka_harbor.partition` attributes. Options: `meterProvider`, `boundaries` for the histograms in seconds (default 5ms to 10s) and `lag: false`, required for an adapter that does not report offsets. Start your SDK, or pass `meterProvider`, before calling it: the metrics API has no late-binding proxy. A lag collection that fails is reported through the harbor's `error` event.
+`otelMetrics` records the same signals as instruments named `kafka_harbor.messages.processed`, `kafka_harbor.messages.replayed`, `kafka_harbor.message.processing.duration`, `kafka_harbor.batches.processed`, `kafka_harbor.batch.processing.duration`, `kafka_harbor.messages.failed`, `kafka_harbor.messages.retried`, `kafka_harbor.messages.dead_lettered`, `kafka_harbor.messages.redriven`, `kafka_harbor.messages.produced`, `kafka_harbor.produce.duration`, `kafka_harbor.errors`, `kafka_harbor.consumer.stops`, `kafka_harbor.circuit.state_changes`, `kafka_harbor.transactions` and the observable gauge `kafka_harbor.consumer.lag`, with `kafka_harbor.group`, `kafka_harbor.topic`, `kafka_harbor.outcome`, `kafka_harbor.level`, `kafka_harbor.kind`, `kafka_harbor.scope`, `kafka_harbor.reason`, `kafka_harbor.state`, `kafka_harbor.from`, `kafka_harbor.to` and `kafka_harbor.partition` attributes. Options: `meterProvider`, `boundaries` for the histograms in seconds (default 5ms to 10s) and `lag: false`, required for an adapter that does not report offsets. Start your SDK, or pass `meterProvider`, before calling it: the metrics API has no late-binding proxy. A lag collection that fails is reported through the harbor's `error` event.
 
 `otelTracing` returns the `instrumentation` hooks the harbor calls around produce calls and handlers. Every produce call runs inside a `PRODUCER` span named `<topic> send` with a `kafka_harbor.kind` attribute (`send`, `retry`, `dead-letter` or `redrive`), and the span's context is written into each record's headers by the configured propagator (W3C `traceparent` and `tracestate` with the SDK's default) unless the record already carries one. Every handler runs inside a `CONSUMER` span named `<topic> process`, parented to the context read from the message headers (a batch handler gets one span, linked to every message's context, with `messaging.batch.message_count`), with the OpenTelemetry messaging attributes (`messaging.system`, `messaging.destination.name`, `messaging.consumer.group.name`, `messaging.destination.partition.id`, `messaging.kafka.offset`) plus `kafka_harbor.attempt`, `kafka_harbor.correlation_id` and `kafka_harbor.original_topic`. The handler runs under the extracted context, so baggage the producer propagated is active there too. A retry, DLQ or redrive hop is a `PRODUCER` span parented to the context the forwarded message carries, and the hop copies that message's headers, so the first attempt, every retry, the dead-lettering and the redrive of one message belong to the trace that produced it. A handler that throws marks its span with the exception and an error status.
 
@@ -532,9 +558,10 @@ harbor
   .on('messageRetried', ({ topic, retryTopic, level, attempt, error }) => {})
   .on('messageDeadLettered', ({ topic, dlqTopic, attempts, error }) => alert(`${topic}: ${attempts} attempts, now in ${dlqTopic}`))
   .on('messageRedriven', ({ from, to, offset }) => {})
-  .on('messageProduced', ({ topic, kind, records, durationMs }) => {}) // one produce call acknowledged; kind: 'send' | 'retry' | 'dead-letter' | 'redrive'
+  .on('messageProduced', ({ topic, kind, records, durationMs }) => {}) // one produce call acknowledged; kind: 'send' | 'retry' | 'dead-letter' | 'redrive' | 'transaction'
   .on('consumerStopped', ({ groupId, reason }) => {})               // reason: 'shutdown' | 'abort' | 'crash'
   .on('circuitStateChanged', ({ groupId, topic, from, to }) => {}) // a topic's circuit breaker moved; 'open' means its partitions are held
+  .on('transactionCompleted', ({ outcome, records, durationMs, error }) => {}) // outcome: 'committed' | 'aborted'; error says why it aborted
   .on('error', ({ error, scope, groupId, topic }) => {})            // scope: 'consumer' | 'producer' | 'adapter'
 ```
 

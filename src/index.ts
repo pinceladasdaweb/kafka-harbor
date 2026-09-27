@@ -20,6 +20,8 @@ export type { CoreContext, HarborErrorEvent } from './context'
 export type { Instrumentation, OutgoingRecord, ProduceBatch, ProduceKind } from './instrumentation'
 export { defaultIdempotencyKey } from './idempotency'
 
+export type { Transaction, TransactionEvents, TransactionOffsets, TransactionOptions } from './transaction'
+
 export { defaultFailureIf } from './breaker'
 export type { ConsumerBreakerOptions } from './breaker'
 export type { IdempotencyEngine, IdempotencyInput, IdempotencyOptions } from './idempotency'
@@ -112,7 +114,8 @@ export type {
   SaslConfig,
   TopicPartition,
   TopicPartitionOffset,
-  TopicSpec
+  TopicSpec,
+  TransactionHandle
 } from './adapter'
 
 export { systemClock } from './clock'

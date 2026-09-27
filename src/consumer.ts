@@ -25,18 +25,19 @@ import { toMessage } from './message'
 import { parseDuration } from './duration'
 import { wrapped } from './instrumentation'
 import type { Serializer } from './serializer'
+import type { BreakerState } from 'breakwater'
 import { partitionKey } from './topic-partition'
 import { produceHop, type ProduceEvents } from './produce'
 import type { CoreContext, HarborErrorEvent } from './context'
-import { OFFSET_PATTERN, commitAfter, offsetDistance } from './commit'
+import type { Transaction, TransactionOptions } from './transaction'
 import type { Duration, MessageHeaders, Logger, Message } from './types'
 import { decodeHeaders, readRetryInfo, writeRetryInfo } from './headers'
 import { defaultIdempotencyKey, type IdempotencyOptions } from './idempotency'
-import type { BreakerState } from 'breakwater'
+import { OFFSET_PATTERN, commitAfter, offsetAfter, offsetDistance } from './commit'
 
-import { isCircuitRejection, resolveBreaker, type Breaker, type CircuitStateChange, type ConsumerBreakerOptions } from './breaker'
 import type { ConsumerHandle, RawMessage, TopicPartition, TopicSpec } from './adapter'
 import { firstRejection, requireNonEmptyString, requirePositiveInteger } from './validate'
+import { isCircuitRejection, resolveBreaker, type Breaker, type CircuitStateChange, type ConsumerBreakerOptions } from './breaker'
 
 /** What a handler receives besides the message. */
 export interface HandlerContext {
@@ -53,6 +54,15 @@ export interface HandlerContext {
   readonly signal: AbortSignal
   /** 1 on the first delivery; the retry count plus one on a retry topic. */
   readonly attempt: number
+  /**
+   * Runs `fn` inside a transaction that commits this message's offset
+   * along with what `tx.send()` produced: Kafka's exactly-once from the
+   * consumed topic to the produced ones. Needs `transactionalId` on the
+   * harbor. Make it the last thing the handler does: a handler that throws
+   * after its transaction committed sends the message down the ladder, and
+   * the retry produces again.
+   */
+  readonly transaction: <T>(fn: (tx: Transaction) => Promise<T>, options?: TransactionOptions) => Promise<T>
 }
 
 export type Handler<T = unknown> = (message: Message<T>, context: HandlerContext) => Promise<void> | void
@@ -67,6 +77,8 @@ export interface BatchContext {
   readonly logger: Logger
   /** Aborts when the harbor gave up waiting for this handler during shutdown; see `HandlerContext.signal`. */
   readonly signal: AbortSignal
+  /** Like `HandlerContext.transaction`, committing the offset after the batch's last message along with what was produced. */
+  readonly transaction: <T>(fn: (tx: Transaction) => Promise<T>, options?: TransactionOptions) => Promise<T>
 }
 
 /**
@@ -981,7 +993,8 @@ export class Consumer {
         correlationId,
         logger: this.context.logger,
         signal: this.shutdownController.signal,
-        attempt
+        attempt,
+        transaction: (fn, options) => this.transactionFor(raw, fn, options)
       }
       const { handler } = subscription.run
       const { idempotency, breaker } = subscription
@@ -1039,6 +1052,13 @@ export class Consumer {
     }
     if (!await this.commit(raw)) return
     this.emitFailure(item, verdict, error, durationMs)
+  }
+
+  /** A handler's transaction: what it produces and the offset after `raw` commit together, on this group's behalf. */
+  private async transactionFor<T> (raw: RawMessage, fn: (tx: Transaction) => Promise<T>, options?: TransactionOptions): Promise<T> {
+    const consumption = this.handles.get(raw.topic)
+    if (consumption === undefined) throw new ClosedError('consumer')
+    return await this.context.transaction(fn, options, { consumption, offsets: [offsetAfter(raw)] })
   }
 
   /**
@@ -1213,7 +1233,8 @@ export class Consumer {
       topic: first.raw.topic,
       partition: first.raw.partition,
       logger: this.context.logger,
-      signal: this.shutdownController.signal
+      signal: this.shutdownController.signal,
+      transaction: (fn, options) => this.transactionFor(last.raw, fn, options)
     }
     // A message that does not decode is failed on its own, before the
     // handler runs; the rest of the batch is what the handler gets.
@@ -1231,6 +1252,26 @@ export class Consumer {
       }
     }
     if (this.shutdownController.signal.aborted) return
+    const size = items.length
+    const verdicts = new Map<Pending, Exclude<Verdict, { outcome: 'crash' }>>()
+    const forward = async (item: Pending, failure: unknown): Promise<Exclude<Verdict, { outcome: 'crash' }>> => {
+      const verdict = await this.forwardFailed(item, subscription, level, failure)
+      if (verdict.outcome === 'crash') {
+        const durationMs = this.context.clock.now() - startedAt
+        this.context.emit('messageFailed', { ...this.locate(item), error: failure, durationMs, outcome: 'crash', batch: size })
+        this.context.emit('batchProcessed', { topic: first.raw.topic, partition: first.raw.partition, groupId: this.groupId, size, durationMs, outcome: 'crash' })
+        throw failure
+      }
+      verdicts.set(item, verdict)
+      return verdict
+    }
+    // What did not decode goes down its ladder BEFORE the handler runs: a
+    // transaction the handler commits, whose offset reaches past these
+    // messages, must not be able to leave them behind uncommitted-for.
+    for (const item of items) {
+      const failure = failures.get(item)
+      if (failure !== undefined) await forward(item, failure)
+    }
     let error: unknown
     if (messages.length > 0) {
       const wrapBatch = this.context.instrumentation?.wrapBatchHandler
@@ -1248,7 +1289,6 @@ export class Consumer {
     if (error === HELD_UNTIL_RELEASED) return
     const durationMs = this.context.clock.now() - startedAt
     if (this.shutdownController.signal.aborted) return
-    const size = items.length
     const batchAt = { topic: first.raw.topic, partition: first.raw.partition, groupId: this.groupId, size, durationMs }
     // The handler's own failure, when it failed the whole batch: what the
     // batch's outcome follows. A BatchFailedError is a handler that resolved
@@ -1279,17 +1319,10 @@ export class Consumer {
     }
     // Forward in offset order, then one commit for the whole batch: a
     // failure to forward leaves everything uncommitted, as for one message.
-    const verdicts = new Map<Pending, Exclude<Verdict, { outcome: 'crash' }>>()
     for (const item of items) {
       const failure = failures.get(item)
-      if (failure === undefined) continue
-      const verdict = await this.forwardFailed(item, subscription, level, failure)
-      if (verdict.outcome === 'crash') {
-        this.context.emit('messageFailed', { ...this.locate(item), error: failure, durationMs, outcome: 'crash', batch: size })
-        this.context.emit('batchProcessed', { ...batchAt, outcome: 'crash' })
-        throw failure
-      }
-      verdicts.set(item, verdict)
+      if (failure === undefined || verdicts.has(item)) continue
+      const verdict = await forward(item, failure)
       if (failure === handlerFailure) outcome = verdict.outcome
     }
     if (!await this.commit(last.raw)) return

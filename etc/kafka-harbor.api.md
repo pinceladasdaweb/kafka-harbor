@@ -53,6 +53,7 @@ export interface BatchContext {
     readonly partition: number;
     readonly signal: AbortSignal;
     readonly topic: string;
+    readonly transaction: <T>(fn: (tx: Transaction) => Promise<T>, options?: TransactionOptions) => Promise<T>;
 }
 
 // Warning: (ae-missing-release-tag) "BatchFailedError" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
@@ -80,6 +81,7 @@ export interface BrokerConfig {
     readonly sasl?: SaslConfig;
     // (undocumented)
     readonly ssl?: boolean;
+    readonly transactionalId?: string;
 }
 
 // Warning: (ae-missing-release-tag) "ClientAdapter" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
@@ -96,6 +98,7 @@ export interface ClientAdapter {
     disconnect: () => Promise<void>;
     readonly name: string;
     produce: (records: readonly RawRecord[]) => Promise<void>;
+    transaction?: () => Promise<TransactionHandle>;
 }
 
 // Warning: (ae-missing-release-tag) "Clock" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
@@ -339,6 +342,7 @@ export interface CoreContext<E extends object> {
     readonly producePolicy: RetryPolicy;
     // (undocumented)
     readonly serializer: Serializer;
+    readonly transaction: <T>(fn: (tx: Transaction) => Promise<T>, options?: TransactionOptions, offsets?: TransactionOffsets) => Promise<T>;
 }
 
 // Warning: (ae-missing-release-tag) "createHarbor" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
@@ -438,6 +442,7 @@ export interface HandlerContext {
     // (undocumented)
     readonly logger: Logger;
     readonly signal: AbortSignal;
+    readonly transaction: <T>(fn: (tx: Transaction) => Promise<T>, options?: TransactionOptions) => Promise<T>;
 }
 
 // Warning: (ae-missing-release-tag) "Harbor" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
@@ -467,6 +472,7 @@ export class Harbor implements Observable<HarborEvents> {
     shutdown(timeout?: Duration): Promise<void>;
     // (undocumented)
     get status(): HarborState;
+    transaction<T>(fn: (tx: Transaction) => Promise<T>, options?: TransactionOptions): Promise<T>;
 }
 
 // Warning: (ae-missing-release-tag) "HarborConfig" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
@@ -490,6 +496,7 @@ export interface HarborConfig {
     serializer?: Serializer;
     // (undocumented)
     ssl?: boolean;
+    transactionalId?: string;
 }
 
 // Warning: (ae-missing-release-tag) "HarborError" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
@@ -526,7 +533,7 @@ export interface HarborErrorEvent {
 // Warning: (ae-missing-release-tag) "HarborEvents" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
 //
 // @public (undocumented)
-export interface HarborEvents extends ConsumerEvents, RedriveEvents, ProducerEvents {
+export interface HarborEvents extends ConsumerEvents, RedriveEvents, ProducerEvents, TransactionEvents {
     // (undocumented)
     connected: {
         adapter: string;
@@ -866,7 +873,7 @@ export interface ProduceEvents {
 // Warning: (ae-missing-release-tag) "ProduceKind" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
 //
 // @public
-export type ProduceKind = 'send' | 'retry' | 'dead-letter' | 'redrive';
+export type ProduceKind = 'send' | 'retry' | 'dead-letter' | 'redrive' | 'transaction';
 
 // Warning: (ae-missing-release-tag) "Producer" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
 //
@@ -1173,6 +1180,60 @@ export interface TopicSpec {
     readonly replicationFactor?: number;
     // (undocumented)
     readonly topic: string;
+}
+
+// Warning: (ae-missing-release-tag) "Transaction" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
+//
+// @public
+export interface Transaction {
+    // (undocumented)
+    send: <T = unknown>(topic: string, message: OutgoingMessage<T>) => Promise<void>;
+    // (undocumented)
+    sendBatch: <T = unknown>(topic: string, messages: readonly OutgoingMessage<T>[]) => Promise<void>;
+}
+
+// Warning: (ae-missing-release-tag) "TransactionEvents" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
+//
+// @public (undocumented)
+export interface TransactionEvents extends ProduceEvents {
+    // (undocumented)
+    error: HarborErrorEvent;
+    transactionCompleted: {
+        outcome: 'committed' | 'aborted';
+        records: number;
+        durationMs: number;
+        error?: unknown;
+    };
+}
+
+// Warning: (ae-missing-release-tag) "TransactionHandle" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
+//
+// @public
+export interface TransactionHandle {
+    // (undocumented)
+    abort: () => Promise<void>;
+    // (undocumented)
+    commit: () => Promise<void>;
+    // (undocumented)
+    produce: (records: readonly RawRecord[]) => Promise<void>;
+    sendOffsets: (consumption: ConsumerHandle, offsets: readonly TopicPartitionOffset[]) => Promise<void>;
+}
+
+// Warning: (ae-missing-release-tag) "TransactionOffsets" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
+//
+// @public
+export interface TransactionOffsets {
+    // (undocumented)
+    readonly consumption: ConsumerHandle;
+    // (undocumented)
+    readonly offsets: readonly TopicPartitionOffset[];
+}
+
+// Warning: (ae-missing-release-tag) "TransactionOptions" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
+//
+// @public (undocumented)
+export interface TransactionOptions {
+    serializer?: Serializer;
 }
 
 // (No @packageDocumentation comment for this package)

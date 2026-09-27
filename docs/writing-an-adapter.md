@@ -100,6 +100,19 @@ never committed on may come back with a `null` offset or not at all, as the
 broker answers; the core treats both the same. Invariant 10 of the contract
 suite checks all of that and skips when the pair is absent.
 
+### transaction
+
+Optional. `transaction()` begins a transaction on a transactional producer
+the adapter opened when `connect()` received `transactionalId`, and
+returns a handle: `produce` sends inside it, `sendOffsets(consumption,
+offsets)` adds the offsets to commit for the group of that consumption (the
+handle the adapter returned from `consume`, so the adapter can reach the
+client consumer the broker wants the group metadata from), `commit` makes
+everything visible together, `abort` drops it. One transaction is open at
+a time; the core serializes the calls. Without `transactionalId` the call
+rejects with a `ConfigError`; an adapter without the member makes
+`harbor.transaction()` reject with a `ConfigError` naming the capability.
+
 ## Errors
 
 Wrap client errors in `AdapterError` from `kafka-harbor`, with the original

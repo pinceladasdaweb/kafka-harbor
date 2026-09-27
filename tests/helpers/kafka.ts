@@ -26,6 +26,10 @@ export async function startKafka (): Promise<KafkaFixture | undefined> {
     // the first connect does not race it.
     container = await new KafkaContainer(KAFKA_IMAGE)
       .withKraft()
+      // One broker: the transaction coordinator's log cannot be replicated
+      // three times, and without it every transactional producer hangs on
+      // its first init.
+      .withEnvironment({ KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: '1', KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: '1' })
       .withWaitStrategy(Wait.forLogMessage(/Kafka Server started/))
       .withStartupTimeout(180_000)
       .start()

@@ -19,7 +19,8 @@ import {
   type RawRecord,
   type TopicPartition,
   type TopicPartitionOffset,
-  type TopicSpec
+  type TopicSpec,
+  type TransactionHandle
 } from '../../index'
 import type { KafkaJS } from '@confluentinc/kafka-javascript'
 
@@ -98,7 +99,7 @@ const isTransient = (code: number | undefined): boolean => code === undefined ||
  * safe, without anyone noticing.
  */
 const RESERVED_CONSUMER_KEYS = ['enable.auto.commit', 'enable.auto.offset.store', 'auto.offset.reset']
-const RESERVED_PRODUCER_KEYS = ['acks', 'request.required.acks', 'enable.idempotence']
+const RESERVED_PRODUCER_KEYS = ['acks', 'request.required.acks', 'enable.idempotence', 'transactional.id']
 
 interface RebalanceAssignmentFns {
   assign: (assignment: KafkaJS.TopicPartition[]) => void
@@ -187,8 +188,13 @@ export function confluentAdapter (options: ConfluentAdapterOptions = {}): Client
   }
   let kafka: KafkaJS.Kafka | undefined
   let producer: KafkaJS.Producer | undefined
+  /** The transactional producer, opened when the harbor has a transactionalId; its transactions run one at a time. */
+  let transactional: KafkaJS.Producer | undefined
+  let transactionalId: string | undefined
   let admin: KafkaJS.Admin | undefined
   const consumers = new Set<KafkaJS.Consumer>()
+  /** The client consumer behind each consumption, which a transaction needs to commit its offsets. */
+  const consumersByHandle = new WeakMap<ConsumerHandle, KafkaJS.Consumer>()
   const adminTimeout = options.adminTimeoutMs ?? 30_000
 
   const loadClient = async (): Promise<ConfluentClientModule> => {
@@ -206,6 +212,36 @@ export function confluentAdapter (options: ConfluentAdapterOptions = {}): Client
       throw new AdapterError('confluent adapter is not connected', { retryable: false })
     }
     return { kafka, producer, admin }
+  }
+
+  const openTransactional = (instance: KafkaJS.Kafka, id: string): KafkaJS.Producer =>
+    instance.producer({ kafkaJS: { acks: -1, idempotent: true, transactionalId: id }, ...options.producer })
+
+  const discardTransactional = async (stuck: KafkaJS.Producer): Promise<void> => {
+    if (transactional === stuck) transactional = undefined
+    await stuck.disconnect().catch(() => undefined)
+  }
+
+  /** Sends through a producer or an open transaction and resolves only once every record was acknowledged. */
+  const sendThrough = async (through: Pick<KafkaJS.Producer, 'sendBatch'>, records: readonly RawRecord[]): Promise<void> => {
+    let metadata: KafkaJS.RecordMetadata[]
+    try {
+      metadata = await through.sendBatch({ topicMessages: groupByTopic(records) })
+    } catch (error) {
+      throw wrap(error, 'produce failed')
+    }
+    // The client resolves per record; an errorCode other than 0 is a
+    // record the broker did not take, and the batch is not acknowledged.
+    // Retrying the batch is worth it only when every refusal is transient:
+    // a definitive one would come back the same, at the cost of resending
+    // the records that were taken.
+    const rejected = metadata.filter((entry) => entry.errorCode !== 0)
+    if (rejected.length > 0) {
+      const detail = rejected.map((entry) => `${entry.topicName}[${entry.partition}] code ${entry.errorCode}`).join(', ')
+      throw new AdapterError(`produce not acknowledged for ${rejected.length} record(s): ${detail}`, {
+        retryable: rejected.every((entry) => isTransient(entry.errorCode))
+      })
+    }
   }
 
   const adapter: ClientAdapter = {
@@ -232,16 +268,22 @@ export function confluentAdapter (options: ConfluentAdapterOptions = {}): Client
         kafkaJS: { acks: -1, idempotent: true },
         ...options.producer
       })
+      // Transactions need a producer of their own: a transactional producer
+      // holds one open transaction and every send on it is part of it.
+      const newTransactional = config.transactionalId === undefined ? undefined : openTransactional(instance, config.transactionalId)
       const newAdmin = instance.admin()
       try {
         await newProducer.connect()
+        await newTransactional?.connect()
         await newAdmin.connect()
       } catch (error) {
-        await Promise.allSettled([newProducer.disconnect(), newAdmin.disconnect()])
+        await Promise.allSettled([newProducer.disconnect(), newTransactional?.disconnect(), newAdmin.disconnect()])
         throw wrap(error, 'connect failed')
       }
       kafka = instance
       producer = newProducer
+      transactional = newTransactional
+      transactionalId = config.transactionalId
       admin = newAdmin
     },
 
@@ -250,9 +292,12 @@ export function confluentAdapter (options: ConfluentAdapterOptions = {}): Client
       for (const consumer of consumers) pending.push(consumer.disconnect())
       consumers.clear()
       if (producer !== undefined) pending.push(producer.disconnect())
+      if (transactional !== undefined) pending.push(transactional.disconnect())
       if (admin !== undefined) pending.push(admin.disconnect())
       kafka = undefined
       producer = undefined
+      transactional = undefined
+      transactionalId = undefined
       admin = undefined
       const results = await Promise.allSettled(pending)
       const failed = results.find((result): result is PromiseRejectedResult => result.status === 'rejected')
@@ -261,23 +306,70 @@ export function confluentAdapter (options: ConfluentAdapterOptions = {}): Client
 
     async produce (records: readonly RawRecord[]) {
       const { producer: current } = requireConnected()
-      let metadata: KafkaJS.RecordMetadata[]
-      try {
-        metadata = await current.sendBatch({ topicMessages: groupByTopic(records) })
-      } catch (error) {
-        throw wrap(error, 'produce failed')
+      await sendThrough(current, records)
+    },
+
+    async transaction (): Promise<TransactionHandle> {
+      const { kafka: instance } = requireConnected()
+      if (transactionalId === undefined) throw new ConfigError('confluentAdapter: transactions need transactionalId on the harbor configuration')
+      // A producer discarded after a transaction it could neither commit nor
+      // abort is opened again here; its init clears the broker-side state.
+      if (transactional === undefined) {
+        const reopened = openTransactional(instance, transactionalId)
+        try {
+          await reopened.connect()
+        } catch (error) {
+          await reopened.disconnect().catch(() => undefined)
+          throw wrap(error, 'transaction begin failed')
+        }
+        transactional = reopened
       }
-      // The client resolves per record; an errorCode other than 0 is a
-      // record the broker did not take, and the batch is not acknowledged.
-      // Retrying the batch is worth it only when every refusal is transient:
-      // a definitive one would come back the same, at the cost of resending
-      // the records that were taken.
-      const rejected = metadata.filter((entry) => entry.errorCode !== 0)
-      if (rejected.length > 0) {
-        const detail = rejected.map((entry) => `${entry.topicName}[${entry.partition}] code ${entry.errorCode}`).join(', ')
-        throw new AdapterError(`produce not acknowledged for ${rejected.length} record(s): ${detail}`, {
-          retryable: rejected.every((entry) => isTransient(entry.errorCode))
-        })
+      const current = transactional
+      let tx: KafkaJS.Transaction
+      try {
+        tx = await current.transaction()
+      } catch (error) {
+        throw wrap(error, 'transaction begin failed')
+      }
+      return {
+        async produce (records) {
+          await sendThrough(tx, records)
+        },
+        async sendOffsets (consumption, offsets) {
+          // The client asks for the consumer itself: the group metadata the
+          // broker fences the commit with comes from it.
+          const consumer = consumersByHandle.get(consumption)
+          if (consumer === undefined) throw new ConfigError('confluentAdapter: the offsets belong to a consumption this adapter did not open')
+          const byTopic = new Map<string, Array<{ partition: number, offset: string }>>()
+          for (const { topic, partition, offset } of offsets) {
+            const partitions = byTopic.get(topic) ?? []
+            partitions.push({ partition, offset })
+            byTopic.set(topic, partitions)
+          }
+          try {
+            await tx.sendOffsets({ consumer, topics: [...byTopic].map(([topic, partitions]) => ({ topic, partitions })) })
+          } catch (error) {
+            throw wrap(error, 'sendOffsets failed')
+          }
+        },
+        async commit () {
+          try {
+            await tx.commit()
+          } catch (error) {
+            throw wrap(error, 'transaction commit failed')
+          }
+        },
+        async abort () {
+          try {
+            await tx.abort()
+          } catch (error) {
+            // The client keeps the transaction marked as ongoing after a
+            // failed abort, and would refuse every transaction from then on;
+            // the producer is dropped and opened again on the next one.
+            await discardTransactional(current)
+            throw wrap(error, 'transaction abort failed')
+          }
+        }
       }
     },
 
@@ -347,6 +439,7 @@ export function confluentAdapter (options: ConfluentAdapterOptions = {}): Client
           consumer.resume(partitions.map(({ topic, partition }) => ({ topic, partitions: [partition] })))
         }
       }
+      consumersByHandle.set(handle, consumer)
       return handle
     },
 

@@ -61,6 +61,25 @@ export interface BrokerConfig {
   readonly brokers: readonly string[]
   readonly ssl?: boolean
   readonly sasl?: SaslConfig
+  /**
+   * Turns on the transactional producer under this id. Kafka fences the
+   * previous holder of an id when a new one starts, so give each process
+   * one of its own and keep it across restarts.
+   */
+  readonly transactionalId?: string
+}
+
+/**
+ * One open transaction. `produce` and `sendOffsets` add to it; `commit`
+ * makes everything visible together (read-committed consumers see none of
+ * it before), `abort` drops everything. The core calls one at a time.
+ */
+export interface TransactionHandle {
+  produce: (records: readonly RawRecord[]) => Promise<void>
+  /** Adds offsets to commit with the transaction, for the group of the consumption that delivered them. */
+  sendOffsets: (consumption: ConsumerHandle, offsets: readonly TopicPartitionOffset[]) => Promise<void>
+  commit: () => Promise<void>
+  abort: () => Promise<void>
 }
 
 export interface ConsumeOptions {
@@ -187,6 +206,14 @@ export interface ClientAdapter {
   produce: (records: readonly RawRecord[]) => Promise<void>
 
   consume: (options: ConsumeOptions) => Promise<ConsumerHandle>
+
+  /**
+   * Optional: begins a transaction on the transactional producer that
+   * `transactionalId` at connect turned on; without the id, rejects with a
+   * ConfigError. An adapter without the member makes `harbor.transaction()`
+   * reject with a ConfigError naming the capability.
+   */
+  transaction?: () => Promise<TransactionHandle>
 
   readonly admin: AdminApi
 }
