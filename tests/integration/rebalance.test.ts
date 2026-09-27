@@ -92,6 +92,37 @@ const suite = (name: string, build: () => ClientAdapter): Promise<void> => descr
     })
   })
 
+  test('a retry delay longer than the poll interval parks the partition: nothing lost, nothing evicted, order kept', async (t) => {
+    if (kafka === undefined) return t.skip('no Kafka container')
+    const run = randomUUID().slice(0, 8)
+    const topic = `parked-${run}`
+    const { harbor, adapter } = openHarbor(build, `parked-${run}`)
+    await withHarbors([harbor], async () => {
+      await harbor.connect()
+      await adapter.admin.createTopics([{ topic, partitions: 1, replicationFactor: 1 }])
+      const errors: unknown[] = []
+      harbor.on('error', ({ error }) => { errors.push(error) })
+      const retried: string[] = []
+      // The poll interval is ten seconds (the Confluent client wants it at or above the session timeout, set below); the delay is longer, so a delivery that waited it out would be evicted.
+      const consumer = harbor.consumer({ groupId: `parked-${run}`, fromBeginning: true, autoCreateTopics: true, maxProcessingTime: '10s', retry: { levels: [{ delay: '15s' }] } })
+      consumer.subscribe<{ n: number }>(topic, (message) => {
+        if (message.topic === topic) throw new Error('first time')
+        retried.push(String(message.value.n))
+      })
+      await consumer.start()
+      // Several fetch batches behind the parked head on the retry partition.
+      const total = 300
+      await harbor.producer<{ n: number }>().sendBatch(topic, Array.from({ length: total }, (_, n) => ({ value: { n } })))
+      await waitFor(() => retried.length === total, 120_000, 'every retry copy processed')
+      await new Promise((resolve) => setTimeout(resolve, 1_000))
+      assert.deepEqual(retried, Array.from({ length: total }, (_, n) => String(n)), 'each once, in order')
+      assert.equal(errors.length, 0)
+      assert.equal(consumer.status, 'running')
+      const lag = await harbor.lag()
+      assert.equal(lag.find((entry) => entry.topic === `${topic}-retry-1`)?.committed, String(total))
+    })
+  })
+
   test('dead letters are redriven into the original topic and processed again', async (t) => {
     if (kafka === undefined) return t.skip('no Kafka container')
     const run = randomUUID().slice(0, 8)
@@ -130,6 +161,7 @@ const suite = (name: string, build: () => ClientAdapter): Promise<void> => descr
   })
 })
 
-suite('confluent', () => confluentAdapter())
+// Group timing short enough for the suite: librdkafka requires the poll interval at or above the session timeout, and the default session is 45s.
+suite('confluent', () => confluentAdapter({ consumer: { 'session.timeout.ms': 10_000, 'heartbeat.interval.ms': 3_000 } }))
 // Group timing short enough for the suite: the client's defaults are sized for production.
 suite('platformatic', () => platformaticAdapter({ consumer: { sessionTimeout: 10_000, heartbeatInterval: 1_000, rebalanceTimeout: 30_000 } }))

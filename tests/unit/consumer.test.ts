@@ -164,22 +164,20 @@ describe('Consumer: retry topics and DLQ', () => {
     await settle()
     assert.equal(attempts.length, 1)
     h.clock.advance(1)
-    await h.adapter.whenDrained('g', 'orders-retry-1')
-    assert.equal(attempts.length, 2)
+    await until(() => attempts.length === 2)
     assert.equal(attempts[1]?.topic, 'orders-retry-1')
     assert.equal(attempts[1]?.attempt, 2)
     assert.equal(attempts[1]?.retry?.count, 1)
     assert.equal(attempts[1]?.retry?.originalTopic, 'orders')
     assert.equal(attempts[1]?.retry?.lastError, 'fail #1')
-    assert.equal(h.adapter.committed('g', 'orders-retry-1', 0), '1')
+    await until(() => h.adapter.committed('g', 'orders-retry-1', 0) === '1')
 
     // Level 2: 60s.
     await until(() => h.clock.waiting === 1)
     h.clock.advance(60_000)
-    await h.adapter.whenDrained('g', 'orders-retry-2')
-    assert.equal(attempts.length, 3)
+    await until(() => attempts.length === 3)
     assert.equal(attempts[2]?.retry?.count, 2)
-    assert.equal(h.adapter.committed('g', 'orders-retry-2', 0), '1')
+    await until(() => h.adapter.committed('g', 'orders-retry-2', 0) === '1')
 
     // No level left: DLQ, with the original payload and the full trail.
     const [dead] = h.adapter.messages('orders-dlq')
@@ -242,10 +240,9 @@ describe('Consumer: retry topics and DLQ', () => {
     await h.adapter.whenDrained('g', 'orders')
     await until(() => h.clock.waiting === 1)
     h.clock.advance(1_000)
-    await h.adapter.whenDrained('g', 'orders-retry-1')
+    await until(() => events.messageProcessed.length === 1)
     assert.equal(attempts.length, 2)
     assert.equal(h.adapter.messages('orders-dlq').length, 0)
-    assert.equal(events.messageProcessed.length, 1)
     assert.equal(events.messageProcessed[0]?.topic, 'orders-retry-1')
     await h.harbor.shutdown()
   })
@@ -495,16 +492,14 @@ describe('Consumer: configuration and topics', () => {
     await h.harbor.shutdown()
   })
 
-  test('a retry delay above maxProcessingTime is rejected at construction', () => {
+  test('a retry delay above maxProcessingTime is accepted at construction: whether it fits is the adapter\'s to say at start()', () => {
     const h = harness()
-    assert.throws(
-      () => h.harbor.consumer({ groupId: 'g', maxProcessingTime: '1m', retry: { levels: [{ delay: '2m' }] } }),
-      (error: unknown) => {
-        assert.equal((error as { code: string }).code, ERROR_CODES.CONFIG_INVALID)
-        assert.match((error as Error).message, /retry\.levels\[0\]\.delay/)
-        return true
-      }
-    )
+    assert.doesNotThrow(() => h.harbor.consumer({ groupId: 'g', maxProcessingTime: '1m', retry: { levels: [{ delay: '2m' }] } }))
+    assert.throws(() => h.harbor.consumer({ groupId: 'g', retry: { levels: [{ delay: 'later' }] } }), (error: unknown) => {
+      assert.equal((error as { code: string }).code, ERROR_CODES.CONFIG_INVALID)
+      assert.match((error as Error).message, /retry\.levels\[0\]\.delay/)
+      return true
+    })
   })
 
   test('autoCreateTopics creates the ladder and the DLQ through the Admin API with the topic defaults', async () => {

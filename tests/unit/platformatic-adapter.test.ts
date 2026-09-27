@@ -610,6 +610,62 @@ describe('platformaticAdapter: consume', () => {
     await handle.stop()
   })
 
+  test('a partition lost in a rebalance is reported as revoked after the fact, and comes back unpaused', async () => {
+    const revoked: unknown[] = []
+    const { adapter, calls } = await connected()
+    const received: RawMessage[] = []
+    const handle = await adapter.consume({
+      groupId: 'g',
+      topics: ['t'],
+      onPartitionsRevoked: async (partitions) => { revoked.push(...partitions) },
+      eachMessage: async (raw) => { received.push(raw) }
+    })
+    const consumer = calls.consumers[0]!
+    consumer.assignments = [{ topic: 't', partitions: [0, 1] }]
+    consumer.emit('consumer:group:join', { groupId: 'g', memberId: 'm' })
+    handle.pause!([{ topic: 't', partition: 0 }])
+    consumer.assignments = [{ topic: 't', partitions: [1] }]
+    consumer.emit('consumer:group:join', { groupId: 'g', memberId: 'm' })
+    await settle()
+    assert.deepEqual(revoked, [{ topic: 't', partition: 0 }])
+    // Back again: a fresh stream, and the partition flows without a resume.
+    consumer.assignments = [{ topic: 't', partitions: [0, 1] }]
+    consumer.emit('consumer:group:join', { groupId: 'g', memberId: 'm' })
+    await until(() => consumer.streams.length === 2, 'a fresh stream')
+    consumer.streams[1]!.push(message({ partition: 0, offset: 0 }))
+    await until(() => received.length === 1, 'delivery on the regained partition')
+    // A join that changes nothing does not rotate again.
+    consumer.emit('consumer:group:join', { groupId: 'g', memberId: 'm' })
+    await settle()
+    assert.equal(consumer.streams.length, 2)
+    await handle.stop()
+    await adapter.disconnect()
+  })
+
+  test('a rotation forgets the offsets it queued for the partitions it kept: the fresh stream delivers them again', async () => {
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => { release = resolve })
+    const { handle, received, stream, consumer } = await consuming({}, {}, { hold: async (raw) => { if (raw.partition === 0) await gate } })
+    consumer.assignments = [{ topic: 't', partitions: [0, 1] }]
+    consumer.emit('consumer:group:join', { groupId: 'g', memberId: 'm' })
+    stream().push(message({ partition: 0, offset: 0 }))
+    stream().push(message({ partition: 1, offset: 7 }))
+    await until(() => stream().readableLength === 0, 'both taken in')
+    // Partition 1 is lost and comes back while partition 0 is in flight: the old stream is replaced, its queue dropped.
+    consumer.assignments = [{ topic: 't', partitions: [0] }]
+    consumer.emit('consumer:group:join', { groupId: 'g', memberId: 'm' })
+    consumer.assignments = [{ topic: 't', partitions: [0, 1] }]
+    consumer.emit('consumer:group:join', { groupId: 'g', memberId: 'm' })
+    await until(() => consumer.streams.length === 2, 'a fresh stream')
+    release()
+    await until(() => received.length === 1, 'the in-flight delivery')
+    // The refetch brings 1@7 again: it was dropped unprocessed, so it is not a repeat.
+    stream().push(message({ partition: 1, offset: 7 }))
+    await until(() => received.length === 2, 'the refetched message')
+    assert.deepEqual(received.map((raw) => `${raw.partition}@${raw.offset}`), ['0@0', '1@7'])
+    await handle.stop()
+  })
+
   test('pause holds the partition and resume restarts it', async () => {
     const { handle, received, stream } = await consuming()
     stream().push(message({ offset: 0 }))

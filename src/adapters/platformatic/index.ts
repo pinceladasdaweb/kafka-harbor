@@ -36,6 +36,7 @@ import {
   ConfigError,
   describeError,
   partitionKey,
+  splitPartitionKey,
   type BrokerConfig,
   type ClientAdapter,
   type CommittedOffset,
@@ -91,8 +92,11 @@ export interface PlatformaticAdapterOptions {
   adminTimeoutMs?: number
   /**
    * Messages one consumption holds, all partitions together, before the
-   * adapter stops reading the client's stream. A paused partition fills its
-   * share and the rest keep flowing until the total is reached. Default: 1000.
+   * adapter stops reading the client's stream. A paused partition (a retry
+   * message parked by the core, say) keeps filling its share, and once the
+   * total is reached the stream is left alone for every partition of the
+   * consumption until the paused one drains; a retry level with a long
+   * delay and a backlog behind it may need a larger value. Default: 1000.
    */
   bufferedMessages?: number
   /** The wait before a consumption whose stream failed opens a new one, ms. Default: 1000. */
@@ -478,12 +482,19 @@ class Consumption {
    */
   private joined (): void {
     const now = this.assignedNow()
-    const held = new Set([...this.assigned, ...this.queues.keys(), ...this.lastQueued.keys(), ...this.epochs.keys()])
+    const held = new Set([...this.assigned, ...this.queues.keys(), ...this.lastQueued.keys(), ...this.epochs.keys(), ...this.paused])
+    const lostNow: TopicPartition[] = []
     for (const key of held) {
       if (now.has(key)) continue
       this.lost.add(key)
       this.discard(key, true)
+      lostNow.push(splitPartitionKey(key))
     }
+    // The client released these already, so the core cannot be given time
+    // to finish on them; it is told after the fact, which lets it drop what
+    // it holds for them (a retry message parked in memory, for one) instead
+    // of finishing it on the next owner's partition.
+    if (lostNow.length > 0) this.options.onPartitionsRevoked?.(lostNow).catch((error: unknown) => this.report(error, 'revocation failed'))
     let regained = false
     for (const key of this.lost) {
       if (!now.has(key)) continue
@@ -530,6 +541,8 @@ class Consumption {
     if (forget) {
       this.lastQueued.delete(key)
       this.epochs.delete(key)
+      // A pause belongs to the assignment: the partition comes back unpaused.
+      this.paused.delete(key)
     }
   }
 

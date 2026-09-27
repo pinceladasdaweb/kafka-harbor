@@ -97,26 +97,41 @@ the producer sent.
 ## Retry delays
 
 A message on `orders-retry-N` becomes due `levels[N-1].delay` after its
-broker timestamp. The retry consumer sleeps until then, so the delay is
-observed even when the retry topic is otherwise idle, and it is bounded:
-every delay must fit under `maxProcessingTime` (default 5 minutes), or the
-construction fails naming the level. The wait is never longer than the
-level's delay: a broker or producer clock ahead of the consumer's does not
-stretch it, and a message on the original topic never waits at all.
+broker timestamp, so the delay is observed even when the retry topic is
+otherwise idle. The wait is never longer than the level's delay: a broker
+or producer clock ahead of the consumer's does not stretch it, and a
+message on the original topic never waits at all.
+
+A message that arrives before it is due is **parked**: the consumer pauses
+its partition through the adapter, keeps the message in memory with a
+timer, and reports the delivery settled, so the client keeps polling and
+the group never evicts the member for a long delay. When the timer fires
+the message goes through the pipeline as a delivery of its own, and the
+partition resumes once it is done; the next message on it, produced later
+and so due later, is delivered then and parks for what is left of its own
+delay. Nothing is committed while a message is parked: a crash, a stop or a
+rebalance leaves it on the retry topic for the next member, and a stop or a
+revocation cancels the timer and resumes the partition so the pause never
+outlives the assignment. Parking holds one message per retry partition in
+memory; a paused partition delivers nothing else meanwhile. A parked message
+comes back outside the adapter's delivery gate, so parked messages take
+`concurrency` slots of their own per level: at most that many run at a
+time among themselves, on top of what the adapter delivers on the
+partitions that are not paused.
 
 Three consequences:
 
-- A long ladder (`10m`, `1h`) needs a longer `maxProcessingTime`. The
-  adapter receives that number as `maxProcessingTimeMs` and the Confluent
-  adapter sets the client's `max.poll.interval.ms` from it, so the client
-  tolerates every delay the core accepted. A `consumer` passthrough that
-  pins `max.poll.interval.ms` wins; keep it above the longest delay plus the
-  handler's own time, or the group evicts the sleeping consumer.
+- A delay may be as long as a timer holds, whatever `maxProcessingTime`
+  says, because the delivery does not wait. Only an adapter without
+  `pause`/`resume` makes the delivery itself sleep, and then every delay
+  must fit under `maxProcessingTime`, the client's poll interval:
+  `start()` rejects with a `ConfigError` naming the adapter otherwise. The
+  three in-tree adapters pause.
 - Retention on each retry topic must exceed that level's delay, or the
   message expires before it is due.
 - Each level is a group member of its own. A consumer with N levels joins
   its group N+1 times: once for the original topics, once per level. A
-  message sleeping on `orders-retry-2` therefore holds no worker that
+  message parked on `orders-retry-2` therefore holds no worker that
   `orders` or `orders-retry-1` is waiting for, whatever `concurrency` is;
   the original partition keeps flowing while retries wait.
 
@@ -135,8 +150,9 @@ circuit later. The consumer stops, or a rebalance takes the partition away: the 
 stays uncommitted and the next member gets it. `hold` is counted from the
 moment the handler would have run, and never reaches past what the client
 tolerates for the delivery as a whole (`maxProcessingTime` from when the
-message was delivered, retry delay included), so deeper on the ladder the
-hold is what the delay left. The probe itself is the next message of any held
+message was delivered). A parked retry is a fresh delivery, so the hold
+starts over on every level; only with an adapter that cannot pause does the
+delay already spent count against it. The probe itself is the next message of any held
 partition of that topic; a probe that fails walks the ladder with its own
 error and reopens the circuit.
 

@@ -1,4 +1,4 @@
-import { createHarbor, type Harbor, type HarborConfig, type HarborEvents, type Logger } from '../../src/index'
+import { createHarbor, type ConsumeOptions, type ConsumerHandle, type Harbor, type HarborConfig, type HarborEvents, type Logger } from '../../src/index'
 import { memoryAdapter, type MemoryAdapter, type MemoryAdapterOptions } from '../../src/testing/index'
 import { ManualClock } from './manual-clock'
 
@@ -36,6 +36,15 @@ export function harness (config: Partial<HarborConfig> = {}, adapterOptions: Mem
     ...config
   })
   return { adapter, clock, harbor, logs }
+}
+
+/** Strips pause/resume from every consumption the adapter opens: what an adapter without them looks like to the core. */
+export const withoutPause = (h: Harness): void => {
+  const original = h.adapter.consume
+  h.adapter.consume = async (options: ConsumeOptions): Promise<ConsumerHandle> => {
+    const { pause, resume, ...handle } = await original(options)
+    return handle
+  }
 }
 
 export const text = (buffer: Buffer | null): string | null => buffer === null ? null : buffer.toString('utf8')

@@ -72,7 +72,11 @@ topic sets (one call per retry level), so an adapter must not assume a
 single consumer per group.
 
 The returned `ConsumerHandle` has `commit`, `stop`, and optionally `pause`
-and `resume`. `stop()` leaves the group and releases the client. The core
+and `resume`. Implement the pair when the client has them: the core parks
+a retry message that is not due yet by pausing its partition and resuming
+it when the message ran, which is what lets a retry delay outgrow the poll
+interval; without them the delivery waits the delay itself and every delay
+must fit under `maxProcessingTimeMs`. `stop()` leaves the group and releases the client. The core
 settles every delivery it abandoned before calling `stop()`, so an adapter
 that waits for in-flight `eachMessage` calls does not deadlock.
 

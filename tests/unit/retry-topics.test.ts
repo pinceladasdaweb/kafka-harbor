@@ -14,27 +14,23 @@ describe('default topic naming', () => {
 
 describe('resolveRetryLevels', () => {
   test('parses each delay and numbers the levels from 1', () => {
-    assert.deepEqual(resolveRetryLevels([{ delay: '5s' }, { delay: 60_000 }], 300_000), [
+    assert.deepEqual(resolveRetryLevels([{ delay: '5s' }, { delay: 60_000 }]), [
       { level: 1, delayMs: 5_000 },
       { level: 2, delayMs: 60_000 }
     ])
   })
 
   test('an empty ladder is valid', () => {
-    assert.deepEqual(resolveRetryLevels([], 300_000), [])
+    assert.deepEqual(resolveRetryLevels([]), [])
   })
 
-  test('a delay above the processing bound is rejected naming the level', () => {
-    assert.throws(() => resolveRetryLevels([{ delay: '1s' }, { delay: '10m' }], 300_000), (error: unknown) => {
+  test('an invalid delay is rejected naming the level; any duration a timer can hold is accepted', () => {
+    assert.throws(() => resolveRetryLevels([{ delay: '1s' }, { delay: 'soon' }]), (error: unknown) => {
       assert.equal((error as { code: string }).code, ERROR_CODES.CONFIG_INVALID)
       assert.match((error as Error).message, /retry\.levels\[1\]\.delay/)
-      assert.match((error as Error).message, /maxProcessingTime/)
       return true
     })
-  })
-
-  test('a delay equal to the bound is accepted', () => {
-    assert.equal(resolveRetryLevels([{ delay: 300_000 }], 300_000)[0]?.delayMs, 300_000)
+    assert.equal(resolveRetryLevels([{ delay: '1h' }])[0]?.delayMs, 3_600_000)
   })
 })
 

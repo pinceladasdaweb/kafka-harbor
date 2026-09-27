@@ -63,9 +63,11 @@ export interface MemoryAdapter extends ClientAdapter {
   failNextProduce: (error: unknown) => void
   /**
    * Resolves once every message currently on the topic has been delivered to
-   * the group. Rejects instead of waiting forever when the group's last
-   * member stopped before that happened (a consumer that aborted or
-   * crashed): nothing would ever deliver the rest.
+   * the group and none of its partitions is paused (a retry message the core
+   * parked is still to run; the partition resumes once it did). Rejects
+   * instead of waiting forever when the group's last member stopped before
+   * that happened (a consumer that aborted or crashed): nothing would ever
+   * deliver the rest.
    */
   whenDrained: (groupId: string, topic: string) => Promise<void>
   /** Currently paused partitions of a group. */
@@ -155,8 +157,11 @@ export function memoryAdapter (options: MemoryAdapterOptions = {}): MemoryAdapte
       for (;;) {
         const topic = topics.get(topicName)
         const entry = groups.get(groupId)
+        // A paused partition holds a message the core parked and will run
+        // later; the topic is drained once that ran too, which is when the
+        // core resumes the partition.
         const drained = topic !== undefined && entry !== undefined &&
-          topic.partitions.every((messages, partition) => (entry.positions.get(partitionKey(topicName, partition)) ?? 0) >= messages.length)
+          topic.partitions.every((messages, partition) => (entry.positions.get(partitionKey(topicName, partition)) ?? 0) >= messages.length && !entry.paused.has(partitionKey(topicName, partition)))
         if (drained) return
         if (entry !== undefined && entry.members === 0 && entry.stopped) {
           throw new Error(`whenDrained("${groupId}", "${topicName}"): the group has no member left; its last consumption stopped before the topic was drained`)

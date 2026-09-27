@@ -111,9 +111,11 @@ export interface ConsumerHandle {
   stop: () => Promise<void>
   /**
    * Stops fetching from these partitions without leaving the group, until
-   * `resume`. Optional: the core does not call either today; an application
-   * holding the handle may. A pause belongs to this consumption and must not
-   * survive its `stop()`.
+   * `resume`. Optional, and worth having: the core parks a retry message
+   * that is not due yet by pausing its partition, which is what lets a
+   * retry delay outgrow the poll interval; without the pair the delivery
+   * waits instead and every delay must fit under `maxProcessingTimeMs`. A
+   * pause belongs to this consumption and must not survive its `stop()`.
    */
   pause?: (partitions: readonly TopicPartition[]) => void
   resume?: (partitions: readonly TopicPartition[]) => void
