@@ -1,5 +1,12 @@
 # CHANGELOG
 
+## 0.9.0 (2026-09-27)
+
+* docs: an Express application around the harbor as an executable example by Pedro Rogério [View](https://github.com/pinceladasdaweb/kafka-harbor/commit/636f944259315ff05fcc3d1472598caeca606dce)
+* feat: retry delays waited outside the delivery, by parking the message and pausing its partition by Pedro Rogério [View](https://github.com/pinceladasdaweb/kafka-harbor/commit/1b677922bc6e249beb623a52c3785cc07db37516)
+* feat: transactions, with the consumed offset committed along from a handler by Pedro Rogério [View](https://github.com/pinceladasdaweb/kafka-harbor/commit/bd4d9a2b034e402776ef0ac3abd6e0e1748e30b2)
+
+
 ## 0.8.0 (2026-09-25)
 
 * feat: circuit breaker per topic that holds the partition instead of failing every message by Pedro Rogério [View](https://github.com/pinceladasdaweb/kafka-harbor/commit/adf0bda5d49fb2fa1345ef021cd94eb481006e29)
