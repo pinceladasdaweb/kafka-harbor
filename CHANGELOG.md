@@ -1,5 +1,19 @@
 # CHANGELOG
 
+## 0.9.1 (2026-09-28)
+
+* chore(deps-dev): bump @nestjs/testing from 12.0.3 to 12.1.0 by dependabot[bot] [View](https://github.com/pinceladasdaweb/kafka-harbor/commit/06de96baeedf5e3eda6233102bc93c2a2e983248)
+* chore(deps-dev): bump @microsoft/api-extractor from 7.59.1 to 7.59.2 by dependabot[bot] [View](https://github.com/pinceladasdaweb/kafka-harbor/commit/200feb437e4ebf5dadd5daffd86f281a20baa90c)
+* chore(deps-dev): bump @nestjs/common from 12.0.3 to 12.1.0 by dependabot[bot] [View](https://github.com/pinceladasdaweb/kafka-harbor/commit/21c74289c4661452025ae0465206a24a5dc1771b)
+* chore(deps-dev): bump @commitlint/config-conventional by dependabot[bot] [View](https://github.com/pinceladasdaweb/kafka-harbor/commit/bc0bb61651f9e8a8e45d49d4cd71db42bd33b09c)
+* chore(deps-dev): bump @commitlint/cli from 21.2.2 to 21.2.3 by dependabot[bot] [View](https://github.com/pinceladasdaweb/kafka-harbor/commit/5ec6de5f27eacc895aa750b1f6552a8fb214e12c)
+* chore(deps-dev): bump @platformatic/kafka from 2.11.0 to 2.12.0 by dependabot[bot] [View](https://github.com/pinceladasdaweb/kafka-harbor/commit/c085c45b0ee0b0626ed71f7a47d0f1cbfc700a16)
+* chore(deps-dev): bump rollup from 4.63.3 to 4.63.4 by dependabot[bot] [View](https://github.com/pinceladasdaweb/kafka-harbor/commit/aa0a892eec41161188d54322455363c6ce5bfd77)
+* chore(deps-dev): bump @nestjs/core from 12.0.3 to 12.1.0 by dependabot[bot] [View](https://github.com/pinceladasdaweb/kafka-harbor/commit/984ccd61645b7d81cc9d4c28fe34b6893c337d1a)
+* chore(deps-dev): bump tsx from 4.23.13 to 4.23.15 by dependabot[bot] [View](https://github.com/pinceladasdaweb/kafka-harbor/commit/01dc7804763032ec9494e0f7e8d46e9f055f36d5)
+* chore(deps-dev): bump @types/node from 26.6.1 to 26.6.2 by dependabot[bot] [View](https://github.com/pinceladasdaweb/kafka-harbor/commit/e3cf2051ae43717e8ac0abfc2a31c8fcdcd6ea14)
+
+
 ## 0.9.0 (2026-09-27)
 
 * docs: an Express application around the harbor as an executable example by Pedro Rogério [View](https://github.com/pinceladasdaweb/kafka-harbor/commit/636f944259315ff05fcc3d1472598caeca606dce)
