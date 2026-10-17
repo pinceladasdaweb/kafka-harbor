@@ -8,12 +8,15 @@ import {
   AdapterError,
   OFFSET_PATTERN,
   ConfigError,
+  FencedError,
   describeError,
+  parseDuration,
   type BrokerConfig,
   type ClientAdapter,
   type CommittedOffset,
   type ConsumeOptions,
   type ConsumerHandle,
+  type Duration,
   type PartitionOffsets,
   type RawMessage,
   type RawRecord,
@@ -47,8 +50,8 @@ export interface ConfluentAdapterOptions {
   producer?: LibrdkafkaConfig
   /** Extra librdkafka properties for every consumer. */
   consumer?: LibrdkafkaConfig
-  /** Timeout for Admin API calls, ms. Default: 30000. */
-  adminTimeoutMs?: number
+  /** Timeout for Admin API calls, and how long a transactional producer's initialization is tried. A duration (`'30s'`) or milliseconds. Default: '30s'. */
+  adminTimeoutMs?: Duration
   /** The client's own log level (KafkaJS.logLevel: 0 nothing, 1 error, 2 warn, 3 info, 4 debug). Default: 1. */
   logLevel?: 0 | 1 | 2 | 3 | 4
 }
@@ -86,7 +89,22 @@ const DEFINITIVE_CODES = new Set([
   43, // ERR_UNSUPPORTED_FOR_MESSAGE_FORMAT
   44, // ERR_POLICY_VIOLATION
   58, // ERR_SASL_AUTHENTICATION_FAILED
-  87 // ERR_INVALID_RECORD
+  87, // ERR_INVALID_RECORD
+  // A producer the broker fenced, or one that fell out of its own
+  // idempotent sequence, is done: retrying it walks the whole ladder for
+  // nothing. So are refusals of the client's identity or of the request.
+  -150, // ERR__FATAL
+  -144, // ERR__FENCED
+  -169, // ERR__AUTHENTICATION
+  -170, // ERR__NOT_IMPLEMENTED
+  12, // ERR_OFFSET_METADATA_TOO_LARGE
+  34, // ERR_ILLEGAL_SASL_STATE
+  47, // ERR_INVALID_PRODUCER_EPOCH
+  48, // ERR_INVALID_TXN_STATE
+  49, // ERR_INVALID_PRODUCER_ID_MAPPING
+  53, // ERR_TRANSACTIONAL_ID_AUTHORIZATION_FAILED
+  76, // ERR_UNSUPPORTED_COMPRESSION_TYPE
+  90 // ERR_PRODUCER_FENCED
 ])
 
 /** Whether a failure carrying `code` is worth another attempt. No code at all is transient: it was not the broker refusing. */
@@ -98,12 +116,40 @@ const isTransient = (code: number | undefined): boolean => code === undefined ||
  * consumer into at-most-once, or let a produce resolve before the record is
  * safe, without anyone noticing.
  */
-const RESERVED_CONSUMER_KEYS = ['enable.auto.commit', 'enable.auto.offset.store', 'auto.offset.reset']
+const RESERVED_CONSUMER_KEYS = ['enable.auto.commit', 'enable.auto.offset.store', 'auto.offset.reset', 'group.id', 'rebalance_cb', 'offset_commit_cb']
 const RESERVED_PRODUCER_KEYS = ['acks', 'request.required.acks', 'enable.idempotence', 'transactional.id']
 
 interface RebalanceAssignmentFns {
   assign: (assignment: KafkaJS.TopicPartition[]) => void
   unassign: (assignment: KafkaJS.TopicPartition[]) => void
+}
+
+/** The pause between two attempts to initialize the transactional producer while the coordinator is not ready yet. */
+const TRANSACTIONAL_RETRY_DELAY_MS = 250
+
+/**
+ * A newer epoch on the transactional id: ERR__FENCED (librdkafka's own,
+ * which it reports for both of the broker's below), INVALID_PRODUCER_EPOCH,
+ * PRODUCER_FENCED. Another producer took the id, or the broker aborted a
+ * transaction open past `transaction.timeout.ms`: librdkafka does not tell
+ * the two apart.
+ */
+const FENCING_CODES = new Set([-144, 47, 90])
+
+/** librdkafka's `transaction.timeout.ms` when the configuration leaves it out. */
+const DEFAULT_TRANSACTION_TIMEOUT_MS = 60_000
+
+/** Waits `ms`, or less when `signal` aborts. */
+const pause = async (ms: number, signal: AbortSignal): Promise<void> => {
+  await new Promise<void>((resolve) => {
+    const done = (): void => {
+      clearTimeout(timer)
+      signal.removeEventListener('abort', done)
+      resolve()
+    }
+    const timer = setTimeout(done, ms)
+    signal.addEventListener('abort', done, { once: true })
+  })
 }
 
 const toRaw = (payload: KafkaJS.EachMessagePayload): RawMessage => {
@@ -184,7 +230,7 @@ export function confluentAdapter (options: ConfluentAdapterOptions = {}): Client
   for (const source of [options.global, options.consumer]) {
     for (const key of RESERVED_CONSUMER_KEYS) {
       if (source !== undefined && key in source) {
-        throw new ConfigError(`confluentAdapter: "${key}" is managed by the adapter (the core commits after the handler; fromBeginning drives the reset policy) and cannot be overridden`)
+        throw new ConfigError(`confluentAdapter: "${key}" is managed by the adapter (the core commits after the handler and settles revocations itself; the group and fromBeginning come from the consumer) and cannot be overridden`)
       }
     }
   }
@@ -196,6 +242,18 @@ export function confluentAdapter (options: ConfluentAdapterOptions = {}): Client
     }
   }
   let kafka: KafkaJS.Kafka | undefined
+  /**
+   * The connection open or being opened. `closed` aborts when it is
+   * released, so a transactional producer still being opened on it gives
+   * up; `fenced` is set once another producer took the transactional id,
+   * and refuses every transaction on it from then on.
+   */
+  let link = { closed: new AbortController(), fenced: false }
+  const configuredTimeout = options.producer?.['transaction.timeout.ms'] ?? options.global?.['transaction.timeout.ms']
+  /** How long the broker lets a transaction stay open, which tells a fenced producer from a transaction it aborted. */
+  const transactionTimeoutMs = configuredTimeout === undefined ? DEFAULT_TRANSACTION_TIMEOUT_MS : Number(configuredTimeout)
+  if (!Number.isFinite(transactionTimeoutMs) || transactionTimeoutMs < 1) throw new ConfigError(`confluentAdapter: transaction.timeout.ms must be a positive number, got ${String(configuredTimeout)}`)
+  let connecting: Promise<void> | undefined
   let producer: KafkaJS.Producer | undefined
   /** The transactional producer, opened when the harbor has a transactionalId; its transactions run one at a time. */
   let transactional: KafkaJS.Producer | undefined
@@ -204,7 +262,7 @@ export function confluentAdapter (options: ConfluentAdapterOptions = {}): Client
   const consumers = new Set<KafkaJS.Consumer>()
   /** The client consumer behind each consumption, which a transaction needs to commit its offsets. */
   const consumersByHandle = new WeakMap<ConsumerHandle, KafkaJS.Consumer>()
-  const adminTimeout = options.adminTimeoutMs ?? 30_000
+  const adminTimeout = parseDuration(options.adminTimeoutMs ?? 30_000, 'confluentAdapter adminTimeoutMs')
 
   const loadClient = async (): Promise<ConfluentClientModule> => {
     try {
@@ -225,31 +283,99 @@ export function confluentAdapter (options: ConfluentAdapterOptions = {}): Client
   const openTransactional = (instance: KafkaJS.Kafka, id: string): KafkaJS.Producer =>
     instance.producer({ kafkaJS: { acks: -1, idempotent: true, transactionalId: id }, ...options.producer })
 
+  /**
+   * Opens and initializes the transactional producer. The client gives the
+   * initialization a fixed few seconds, which the first one on a fresh
+   * cluster (the coordinator creating its log) can outlast: a transient
+   * failure is tried again, on a new producer, until `adminTimeoutMs`.
+   */
+  const connectTransactional = async (instance: KafkaJS.Kafka, id: string, signal: AbortSignal): Promise<KafkaJS.Producer> => {
+    const deadline = Date.now() + adminTimeout
+    for (;;) {
+      const candidate = openTransactional(instance, id)
+      try {
+        await candidate.connect()
+      } catch (error) {
+        await candidate.disconnect().catch(() => undefined)
+        if (!isTransient(errorCode(error)) || Date.now() >= deadline || signal.aborted) throw error
+        await pause(TRANSACTIONAL_RETRY_DELAY_MS, signal)
+        continue
+      }
+      // Released while it was being opened: nobody would close it.
+      if (signal.aborted) {
+        await candidate.disconnect().catch(() => undefined)
+        throw new AdapterError('confluent adapter is not connected', { retryable: false })
+      }
+      return candidate
+    }
+  }
+
   const discardTransactional = async (stuck: KafkaJS.Producer): Promise<void> => {
     if (transactional === stuck) transactional = undefined
     await stuck.disconnect().catch(() => undefined)
   }
 
-  /** Sends through a producer or an open transaction and resolves only once every record was acknowledged. */
+  /**
+   * Sends through the producer and resolves only once
+   * every record was acknowledged: the client resolves a batch only when
+   * every delivery report came back clean, and rejects with the first
+   * refusal otherwise.
+   */
   const sendThrough = async (through: Pick<KafkaJS.Producer, 'sendBatch'>, records: readonly RawRecord[]): Promise<void> => {
-    let metadata: KafkaJS.RecordMetadata[]
     try {
-      metadata = await through.sendBatch({ topicMessages: groupByTopic(records) })
+      await through.sendBatch({ topicMessages: groupByTopic(records) })
     } catch (error) {
       throw wrap(error, 'produce failed')
     }
-    // The client resolves per record; an errorCode other than 0 is a
-    // record the broker did not take, and the batch is not acknowledged.
-    // Retrying the batch is worth it only when every refusal is transient:
-    // a definitive one would come back the same, at the cost of resending
-    // the records that were taken.
-    const rejected = metadata.filter((entry) => entry.errorCode !== 0)
-    if (rejected.length > 0) {
-      const detail = rejected.map((entry) => `${entry.topicName}[${entry.partition}] code ${entry.errorCode}`).join(', ')
-      throw new AdapterError(`produce not acknowledged for ${rejected.length} record(s): ${detail}`, {
-        retryable: rejected.every((entry) => isTransient(entry.errorCode))
-      })
+  }
+
+  /** Opens the clients of a connection; `connect` runs one at a time. */
+  const open = async (config: BrokerConfig): Promise<void> => {
+    const connection = { closed: new AbortController(), fenced: false }
+    // A disconnect from now on aborts this connection, not the last one.
+    link = connection
+    const { KafkaJS: client } = await loadClient()
+    if (connection.closed.signal.aborted) throw new AdapterError('confluent adapter disconnected while connecting', { retryable: false })
+    const kafkaJS: KafkaJS.KafkaConfig = {
+      brokers: [...config.brokers],
+      clientId: config.clientId,
+      // The client logs connection retries and group events at INFO on its
+      // own logger; the harbor reports outcomes through events, so only the
+      // client's errors are let through. Override with `global`.
+      logLevel: options.logLevel ?? 1,
+      ...(config.ssl !== undefined && { ssl: config.ssl }),
+      ...(config.sasl !== undefined && { sasl: { mechanism: config.sasl.mechanism, username: config.sasl.username, password: config.sasl.password } as KafkaJS.SASLOptions })
     }
+    const instance = new client.Kafka({ kafkaJS, ...options.global })
+    const newProducer = instance.producer({
+      // Never lose or duplicate by default: every produce waits for all
+      // in-sync replicas, and the idempotent producer de-duplicates the
+      // client's own retries.
+      kafkaJS: { acks: -1, idempotent: true },
+      ...options.producer
+    })
+    const newAdmin = instance.admin()
+    // Transactions need a producer of their own: a transactional producer
+    // holds one open transaction and every send on it is part of it.
+    let newTransactional: KafkaJS.Producer | undefined
+    try {
+      await newProducer.connect()
+      if (config.transactionalId !== undefined) newTransactional = await connectTransactional(instance, config.transactionalId, connection.closed.signal)
+      await newAdmin.connect()
+    } catch (error) {
+      await Promise.allSettled([newProducer.disconnect(), newTransactional?.disconnect(), newAdmin.disconnect()])
+      throw wrap(error, 'connect failed')
+    }
+    // Released while it was being opened: nobody would close the clients.
+    if (connection.closed.signal.aborted) {
+      await Promise.allSettled([newProducer.disconnect(), newTransactional?.disconnect(), newAdmin.disconnect()])
+      throw new AdapterError('confluent adapter disconnected while connecting', { retryable: false })
+    }
+    kafka = instance
+    producer = newProducer
+    transactional = newTransactional
+    transactionalId = config.transactionalId
+    admin = newAdmin
   }
 
   const adapter: ClientAdapter = {
@@ -257,45 +383,12 @@ export function confluentAdapter (options: ConfluentAdapterOptions = {}): Client
 
     async connect (config: BrokerConfig) {
       if (kafka !== undefined) return
-      const { KafkaJS: client } = await loadClient()
-      const kafkaJS: KafkaJS.KafkaConfig = {
-        brokers: [...config.brokers],
-        clientId: config.clientId,
-        // The client logs connection retries and group events at INFO on its
-        // own logger; the harbor reports outcomes through events, so only the
-        // client's errors are let through. Override with `global`.
-        logLevel: options.logLevel ?? 1,
-        ...(config.ssl !== undefined && { ssl: config.ssl }),
-        ...(config.sasl !== undefined && { sasl: { mechanism: config.sasl.mechanism, username: config.sasl.username, password: config.sasl.password } as KafkaJS.SASLOptions })
-      }
-      const instance = new client.Kafka({ kafkaJS, ...options.global })
-      const newProducer = instance.producer({
-        // Never lose or duplicate by default: every produce waits for all
-        // in-sync replicas, and the idempotent producer de-duplicates the
-        // client's own retries.
-        kafkaJS: { acks: -1, idempotent: true },
-        ...options.producer
-      })
-      // Transactions need a producer of their own: a transactional producer
-      // holds one open transaction and every send on it is part of it.
-      const newTransactional = config.transactionalId === undefined ? undefined : openTransactional(instance, config.transactionalId)
-      const newAdmin = instance.admin()
-      try {
-        await newProducer.connect()
-        await newTransactional?.connect()
-        await newAdmin.connect()
-      } catch (error) {
-        await Promise.allSettled([newProducer.disconnect(), newTransactional?.disconnect(), newAdmin.disconnect()])
-        throw wrap(error, 'connect failed')
-      }
-      kafka = instance
-      producer = newProducer
-      transactional = newTransactional
-      transactionalId = config.transactionalId
-      admin = newAdmin
+      connecting ??= open(config).finally(() => { connecting = undefined })
+      await connecting
     },
 
     async disconnect () {
+      link.closed.abort()
       const pending: Array<Promise<unknown>> = []
       for (const consumer of consumers) pending.push(consumer.disconnect())
       consumers.clear()
@@ -319,29 +412,65 @@ export function confluentAdapter (options: ConfluentAdapterOptions = {}): Client
 
     async transaction (): Promise<TransactionHandle> {
       const { kafka: instance } = requireConnected()
-      if (transactionalId === undefined) throw new ConfigError('confluentAdapter: transactions need transactionalId on the harbor configuration')
+      const id = transactionalId
+      if (id === undefined) throw new ConfigError('confluentAdapter: transactions need transactionalId on the harbor configuration')
+      const connection = link
+      // Another producer took the id: opening one again would fence it
+      // back, the zombie fencing the live one.
+      if (connection.fenced) throw new FencedError(id)
       // A producer discarded after a transaction it could neither commit nor
       // abort is opened again here; its init clears the broker-side state.
       if (transactional === undefined) {
-        const reopened = openTransactional(instance, transactionalId)
         try {
-          await reopened.connect()
+          transactional = await connectTransactional(instance, id, connection.closed.signal)
         } catch (error) {
-          await reopened.disconnect().catch(() => undefined)
           throw wrap(error, 'transaction begin failed')
         }
-        transactional = reopened
       }
       const current = transactional
       let tx: KafkaJS.Transaction
       try {
         tx = await current.transaction()
       } catch (error) {
+        if (FENCING_CODES.has(errorCode(error) ?? 0)) {
+          connection.fenced = true
+          await discardTransactional(current)
+          throw new FencedError(id, { cause: error })
+        }
         throw wrap(error, 'transaction begin failed')
+      }
+      // A monotonic clock: a wall clock stepped by NTP would move a fence
+      // across the timeout.
+      const began = performance.now()
+      let discarded = false
+      /**
+       * What a failed step of the transaction throws. A fenced producer is
+       * fatal to librdkafka, and dropped; before `transaction.timeout.ms`
+       * elapsed it can only be another producer holding the id, and after
+       * it the broker aborting this transaction, which the next producer's
+       * initialization recovers from.
+       */
+      const failed = async (error: unknown, what: string): Promise<Error> => {
+        if (!FENCING_CODES.has(errorCode(error) ?? 0)) return wrap(error, what)
+        // Measured before the producer is released, which flushes for up to
+        // seconds: a fence must not age into a timeout while it does.
+        const elapsed = performance.now() - began
+        discarded = true
+        await discardTransactional(current)
+        if (elapsed < transactionTimeoutMs) {
+          connection.fenced = true
+          return new FencedError(id, { cause: error })
+        }
+        return new AdapterError(`${what}: the broker aborted the transaction (open past transaction.timeout.ms, or the id was taken): ${describeError(error)}`, { cause: error, retryable: true })
       }
       return {
         async produce (records) {
-          await sendThrough(tx, records)
+          // Resolves only once every record was acknowledged, as sendThrough.
+          try {
+            await tx.sendBatch({ topicMessages: groupByTopic(records) })
+          } catch (error) {
+            throw await failed(error, 'produce failed')
+          }
         },
         async sendOffsets (consumption, offsets) {
           // The client asks for the consumer itself: the group metadata the
@@ -357,25 +486,30 @@ export function confluentAdapter (options: ConfluentAdapterOptions = {}): Client
           try {
             await tx.sendOffsets({ consumer, topics: [...byTopic].map(([topic, partitions]) => ({ topic, partitions })) })
           } catch (error) {
-            throw wrap(error, 'sendOffsets failed')
+            throw await failed(error, 'sendOffsets failed')
           }
         },
         async commit () {
           try {
             await tx.commit()
           } catch (error) {
-            throw wrap(error, 'transaction commit failed')
+            throw await failed(error, 'transaction commit failed')
           }
         },
         async abort () {
+          // Discarded already: the next producer's init clears what the
+          // broker still holds.
+          if (discarded) return
           try {
             await tx.abort()
           } catch (error) {
             // The client keeps the transaction marked as ongoing after a
             // failed abort, and would refuse every transaction from then on;
-            // the producer is dropped and opened again on the next one.
-            await discardTransactional(current)
-            throw wrap(error, 'transaction abort failed')
+            // the producer is dropped and opened again on the next one,
+            // unless another producer fenced it.
+            const failure = await failed(error, 'transaction abort failed')
+            if (!discarded) await discardTransactional(current)
+            throw failure
           }
         }
       }
@@ -385,6 +519,10 @@ export function confluentAdapter (options: ConfluentAdapterOptions = {}): Client
       const { kafka: current } = requireConnected()
       const rebalanceCb = async (error: { code?: number }, assignment: KafkaJS.TopicPartition[], fns: RebalanceAssignmentFns): Promise<void> => {
         if (error.code === ERR__REVOKE_PARTITIONS) {
+          // Awaited even when the group already took the partitions away (a
+          // missed poll): the client releases them only once the deliveries
+          // in flight settled anyway, and the core uses the wait for what it
+          // holds outside deliveries (a batch it is running).
           try {
             await consumeOptions.onPartitionsRevoked?.(assignment.map(({ topic, partition }) => ({ topic, partition })))
           } finally {
@@ -414,8 +552,19 @@ export function confluentAdapter (options: ConfluentAdapterOptions = {}): Client
         await consumer.subscribe({ topics: [...consumeOptions.topics] })
         await consumer.run({
           partitionsConsumedConcurrently: consumeOptions.concurrency ?? 1,
+          // A rejected delivery is settled like any other (the contract):
+          // reported, never redelivered. Left to the client, a rejection
+          // would rewind the partition and deliver the message again, for
+          // as long as it kept failing.
           eachMessage: async (payload) => {
-            await consumeOptions.eachMessage(toRaw(payload))
+            try {
+              await consumeOptions.eachMessage(toRaw(payload))
+            } catch (failure) {
+              // An error callback that throws must not hand the rejection back to the client either.
+              try {
+                consumeOptions.onError?.(failure)
+              } catch {}
+            }
           }
         })
       } catch (error) {
@@ -456,8 +605,9 @@ export function confluentAdapter (options: ConfluentAdapterOptions = {}): Client
         const { admin: current } = requireConnected()
         const topics: KafkaJS.ITopicConfig[] = specs.map((spec) => ({
           topic: spec.topic,
-          numPartitions: spec.partitions ?? 1,
-          replicationFactor: spec.replicationFactor ?? 1,
+          // Left out, the client asks for the broker's defaults (-1).
+          numPartitions: spec.partitions,
+          replicationFactor: spec.replicationFactor,
           ...(spec.config !== undefined && {
             configEntries: Object.entries(spec.config).map(([name, value]) => ({ name, value }))
           })

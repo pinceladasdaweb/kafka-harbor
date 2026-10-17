@@ -89,7 +89,11 @@ export interface ConsumeOptions {
    * Called for every message, in order within a partition. The adapter must
    * not commit on its own and must not deliver the next message of the same
    * partition until the returned promise settles. Partitions may be
-   * processed concurrently up to `concurrency`.
+   * processed concurrently up to `concurrency`. A promise that rejects is
+   * settled like one that resolves: the adapter reports the error through
+   * `onError` and moves on, and never delivers the message again on its
+   * own (the core's never rejects; this is for what else drives an
+   * adapter).
    */
   readonly eachMessage: (message: RawMessage) => Promise<void>
   /** Maximum partitions processed concurrently. Default: 1. */
@@ -98,19 +102,24 @@ export interface ConsumeOptions {
    * The longest one `eachMessage` call may take, retry delay included, in
    * milliseconds. An adapter maps it to the client setting that decides how
    * long a member may go without polling (`max.poll.interval.ms`), so the
-   * core's `maxProcessingTime` and the client agree on the same number. An
+   * core's `maxProcessingTime` and the client agree on the same number (a
+   * client may scale it, as the Confluent one doubles it on the wire). An
    * adapter that ignores it leaves the client's default in place.
    */
   readonly maxProcessingTimeMs?: number
   /**
-   * Called when a rebalance is about to take these partitions away. The
-   * adapter awaits it before releasing them; the core uses that time to let
-   * the handlers still running on those partitions finish and commit, so the
-   * next owner does not repeat their work. Bounded by the core, never longer
-   * than `maxProcessingTimeMs`.
+   * Called when a rebalance takes these partitions away. An adapter whose
+   * client can delay the release awaits it first: the core uses that time to
+   * let the handlers still running on those partitions finish and commit, so
+   * the next owner does not repeat their work, bounded by
+   * `maxProcessingTimeMs`. An adapter whose client released them already (a
+   * client that rebalances on its own, as the platformatic one does) calls
+   * it after the fact without awaiting it: the core then drops what it holds for
+   * them (a retry message parked in memory) instead of running it on the
+   * next owner's partition.
    */
   readonly onPartitionsRevoked?: (partitions: readonly TopicPartition[]) => Promise<void>
-  /** Called when a fetch loop error is not attributable to a message. */
+  /** Called with a fetch-loop error that belongs to no message, and with the rejection of an `eachMessage` promise. */
   readonly onError?: (error: unknown) => void
   /** Whether a brand-new group starts from the earliest offset. Default: false. */
   readonly fromBeginning?: boolean
@@ -142,7 +151,9 @@ export interface ConsumerHandle {
 
 export interface TopicSpec {
   readonly topic: string
+  /** Left out: the broker's default (`num.partitions`). */
   readonly partitions?: number
+  /** Left out: the broker's default (`default.replication.factor`). */
   readonly replicationFactor?: number
   /** Broker-side topic configs, e.g. `{ 'retention.ms': '3600000' }`. */
   readonly config?: Record<string, string>
