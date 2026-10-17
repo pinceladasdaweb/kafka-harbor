@@ -12,9 +12,9 @@ import { once } from 'node:events'
 
 import express from 'express'
 
-import { createHarbor, type HarborEvents, type Message } from '../src/index'
-import { prometheusMetrics } from '../src/prometheus/index'
-import { memoryAdapter } from '../src/testing/index'
+import { createHarbor, type HarborEvents, type Message } from 'kafka-harbor'
+import { prometheusMetrics } from 'kafka-harbor/prometheus'
+import { memoryAdapter } from 'kafka-harbor/testing'
 
 interface Order { id: string, total: number }
 

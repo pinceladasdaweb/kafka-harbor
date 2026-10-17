@@ -13,7 +13,13 @@
     "forceConsistentCasingInFileNames": true,
     "skipLibCheck": true,
     "declaration": false,
-    "sourceMap": false
+    "sourceMap": false,
+    // The examples import the package by its name, as an application would;
+    // here the name resolves to the sources, for the type check and for tsx.
+    "paths": {
+      "kafka-harbor": ["./src/index.ts"],
+      "kafka-harbor/*": ["./src/*/index.ts"]
+    }
   },
   "include": ["src", "tests", "examples", "scripts"],
   // The consumer check compiles against dist/ with its own resolution; see

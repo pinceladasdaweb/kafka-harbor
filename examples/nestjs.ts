@@ -12,10 +12,10 @@ import assert from 'node:assert/strict'
 import { Injectable, Module } from '@nestjs/common'
 import { NestFactory } from '@nestjs/core'
 
-import type { BatchContext, Harbor, HandlerContext, Message } from '../src/index'
-import { memoryAdapter } from '../src/testing/index'
-import { KafkaBatchListener, KafkaConsumer, KafkaListener, KafkaRetry } from '../src/decorators/index'
-import { KAFKA_HARBOR, KafkaHarborModule } from '../src/nestjs/index'
+import type { BatchContext, Harbor, HandlerContext, Message } from 'kafka-harbor'
+import { memoryAdapter } from 'kafka-harbor/testing'
+import { KafkaBatchListener, KafkaConsumer, KafkaListener, KafkaRetry } from 'kafka-harbor/decorators'
+import { KAFKA_HARBOR, KafkaHarborModule } from 'kafka-harbor/nestjs'
 
 interface Order { id: string, total: number }
 

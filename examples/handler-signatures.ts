@@ -14,8 +14,8 @@
  */
 import assert from 'node:assert/strict'
 
-import { createHarbor, type Handler, type HandlerContext, type Message } from '../src/index'
-import { memoryAdapter } from '../src/testing/index'
+import { createHarbor, type Handler, type HandlerContext, type Message } from 'kafka-harbor'
+import { memoryAdapter } from 'kafka-harbor/testing'
 
 interface Order { id: string, customerId: string, total: number }
 interface Payment { orderId: string, amount: number, method: 'card' | 'pix' }
