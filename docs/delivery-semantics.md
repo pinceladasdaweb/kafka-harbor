@@ -84,6 +84,11 @@ At-least-once means these can happen and your handler should tolerate them:
 - **Retry produce acknowledged, commit failed.** The message exists on the
   retry topic *and* gets redelivered from the source, so the handler sees it
   twice (once per topic) and both copies walk the ladder.
+- **A batch that did not decode, then was not committed.** A message of a
+  batch that does not decode goes to the DLQ before the handler runs (a
+  transaction the handler commits must not leave it behind). If the batch
+  is then left uncommitted (a shutdown abandons it, a hold is released, a
+  commit fails), the next member dead-letters that message once more.
 
 For exactly-once *effects* on top of at-least-once *delivery*, run the
 handler through an idempotency engine (`consumer({ idempotency })`, see the
@@ -118,12 +123,17 @@ between the transactional commit and that hop loses the message, offset
 committed and nothing forwarded. A batch message that does not decode is
 dead-lettered before the handler runs for the same reason, and a batch
 handler must not throw `BatchFailedError` after `ctx.transaction`. A
-shutdown mid-transaction disconnects the producer and aborts it, leaving
-the message uncommitted for the next member. Transactions run one at a
+shutdown waits for a transaction in flight, up to the shutdown's own
+timeout, before it releases the client; one still open then is aborted with it, leaving the
+message uncommitted for the next member. Transactions run one at a
 time per harbor, and one begun from inside another is refused. A
-transaction the broker times out (a minute by default) has its commit
-refused; a transaction that could be neither committed nor aborted has its
-producer reopened by the adapter for the next one.
+transaction the broker times out (a minute by default) fails its next
+step with a retryable error, and the message walks the ladder; a
+transaction that could be neither committed nor aborted has its producer
+reopened by the adapter for the next one. A harbor another producer
+fenced (its `transactionalId` taken) runs no more transactions: each fails
+with `FencedError`, and a consumer whose handler throws it stops without
+committing, leaving the message to the member that holds the id.
 
 ## Retry delays
 
@@ -141,9 +151,11 @@ the message goes through the pipeline as a delivery of its own, and the
 partition resumes once it is done; the next message on it, produced later
 and so due later, is delivered then and parks for what is left of its own
 delay. Nothing is committed while a message is parked: a crash, a stop or a
-rebalance leaves it on the retry topic for the next member, and a stop or a
-revocation cancels the timer and resumes the partition so the pause never
-outlives the assignment. Parking holds one message per retry partition in
+rebalance leaves it on the retry topic for the next member. A revocation
+cancels the timer and resumes the partition, so the pause never outlives
+the assignment; a stop cancels the timer and leaves the partition to the
+consumption it closes, which takes its pauses with it (the adapter contract
+says a pause does not outlive `stop()`). Parking holds one message per retry partition in
 memory; a paused partition delivers nothing else meanwhile. A parked message
 comes back outside the adapter's delivery gate, so parked messages take
 `concurrency` slots of their own per level: at most that many run at a
@@ -196,11 +208,19 @@ function that returns the same name for every topic of a level
 decides which handler a message belongs to. That header is network input:
 a message on a shared topic whose header names no subscription of the
 consumer is dead-lettered to the owners' DLQ when they share one, tracking
-headers untouched, so someone can look. When the owners have different
+headers untouched, so someone can look (a `messageDeadLettered` with the
+reason; no `messageFailed`, since no handler ran). When the owners have different
 DLQs there is no honest destination and the consumer stops with the offset
 uncommitted. An unshared retry topic never consults the header for routing:
 its single owner is the answer, and a corrupt tracking block there is a
-first delivery, as before.
+first delivery, as before. On a shared one the original-topic header is the
+routing itself, so a message whose tracking block is corrupt goes the
+unroutable way.
+
+The tracking block carries the text of the last failure (`x-last-error`, up
+to 1024 characters): what the handler threw, as `describeError` writes it. An error
+whose message holds personal data puts it in a header of the retry and DLQ
+topics; throw errors that describe the failure, not the payload.
 
 Levels never mix. A name that is level 1 of one topic and level 2 of another
 is refused at `subscribe()`, because the level decides the delay a message
