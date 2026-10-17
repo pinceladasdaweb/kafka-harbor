@@ -1,15 +1,19 @@
 name: Publish package
+# A release follows a CI run that passed on a push to main, and works on the
+# very commit that run tested: lint, types, unit and integration suites,
+# examples, documentation and API reports have all passed on it first.
 on:
-  push:
-    branches:
-      - main
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
 permissions:
   contents: write
   # Required for OIDC trusted publishing: npm exchanges the workflow's
   # identity token for a short-lived credential, so no NPM_TOKEN secret.
   id-token: write
-# Serialize releases: concurrent pushes to main must not race each other
-# through version bump / publish / tag push.
+# Serialize releases: concurrent runs must not race each other through
+# version bump / publish / tag push.
 concurrency:
   group: publish
   cancel-in-progress: false
@@ -20,49 +24,80 @@ jobs:
     # (Settings > Secrets and variables > Actions > Variables, value "true").
     # Until the trusted publisher exists on npmjs.com the job is skipped, so a
     # push to main never attempts a publish by accident.
-    if: vars.NPM_PUBLISH_ENABLED == 'true'
+    if: >-
+      vars.NPM_PUBLISH_ENABLED == 'true' &&
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_branch == 'main' &&
+      github.event.workflow_run.head_repository.full_name == github.repository
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
+          ref: ${{ github.event.workflow_run.head_sha }}
           fetch-depth: 0
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version: 24
           registry-url: 'https://registry.npmjs.org'
           cache: npm
       # Trusted publishing (OIDC) requires npm >= 11.5.1; the runner's
-      # bundled npm may lag behind, so upgrade explicitly.
+      # bundled npm may lag behind. A fixed version, not whatever is latest.
       - name: Update npm for trusted publishing
         run: |
-          npm install -g npm@latest
+          npm install -g npm@11.21.1
           npm --version
       - name: Configure git
         run: |
           git config --global user.name "Github Actions"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
-      # The publish job runs hermetic: no Docker, no broker. The integration
-      # suite is the CI workflow's job; requiring it here is what made the
-      # first release of a sibling library fail on a missing service.
+      # Hermetic: no Docker, no broker. The CI run this follows already ran
+      # the integration suite on this commit.
+      # Only the commit main points at is released, and only once: a CI run
+      # re-run on an older commit, or a publish re-run after its release
+      # commit landed, publishes nothing.
+      - name: Check that this commit is still main and not released yet
+        env:
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          git fetch origin main
+          if [[ "$(git rev-parse origin/main)" != "$HEAD_SHA" ]]; then
+            echo "main has moved past $HEAD_SHA; the run for the newer commit releases it"
+            exit 1
+          fi
+          if [[ -n "$(git tag --points-at HEAD 'v*')" ]]; then
+            echo "$HEAD_SHA is a release commit already"
+            exit 1
+          fi
       - name: Install dependencies
         run: |
           npm ci --ignore-scripts
-      - name: Lint, type check and unit tests
-        run: |
-          npm run lint
-          npm run check:types
-          npm run check:types:next
-          npm test
       - name: Bump version based on commit message
         run: |
-          COMMIT_MSG=$(git log -1 --pretty=%B)
-          echo "Last commit message: $COMMIT_MSG"
+          # The subject of the merge commit decides, and nothing else: "major
+          # release" or "minor release" (a merge into main says "minor
+          # release X.Y.Z"; the X.Y.Z is for the reader, the registry decides
+          # the number); anything else is a patch. A subject that merely
+          # mentions a word ("a minor typo", "majority") decides nothing, and
+          # neither does the body: a major is never one by accident.
+          SUBJECT=$(git log -1 --pretty=%s)
+          echo "Last commit subject: $SUBJECT"
 
           # The npm registry is the source of truth for what is already
           # published: basing the bump on package.json/tags desyncs whenever
           # a previous run publishes but fails a later step.
           PKG_NAME=$(node -p "require('./package.json').name")
-          PUBLISHED_VERSION=$(npm view "$PKG_NAME" version 2>/dev/null || true)
+          # Not found means not published yet; any other failure (the
+          # registry away) stops the release instead of guessing.
+          if ! VIEW=$(npm view "$PKG_NAME" version 2>/tmp/npm-view.err); then
+            if grep -q 'E404' /tmp/npm-view.err; then
+              VIEW=""
+            else
+              cat /tmp/npm-view.err
+              exit 1
+            fi
+          fi
+          PUBLISHED_VERSION="$VIEW"
 
           if [[ -z "$PUBLISHED_VERSION" ]]; then
             NEW_VERSION=$(node -p "require('./package.json').version")
@@ -71,10 +106,10 @@ jobs:
             echo "Latest published version: $PUBLISHED_VERSION"
             npm version "$PUBLISHED_VERSION" --no-git-tag-version --allow-same-version
 
-            if [[ $COMMIT_MSG == *"BREAKING CHANGE"* || $COMMIT_MSG == *"major"* ]]; then
+            if printf '%s' "$SUBJECT" | grep -Eqi '(^|[^[:alnum:]_])major release([^[:alnum:]_]|$)'; then
               echo "Major version bump"
               NEW_VERSION=$(npm version major --no-git-tag-version)
-            elif [[ $COMMIT_MSG == *"minor"* ]]; then
+            elif printf '%s' "$SUBJECT" | grep -Eqi '(^|[^[:alnum:]_])minor release([^[:alnum:]_]|$)'; then
               echo "Minor version bump"
               NEW_VERSION=$(npm version minor --no-git-tag-version)
             else
@@ -92,59 +127,51 @@ jobs:
       # The declarations are checked the way a consumer sees them, and the
       # public API is contract: a report that drifted from the sources must
       # never reach the registry.
-      - name: Consumer type check and API report check
+      - name: Consumer checks and API reports
         run: |
           npx tsc -p tests/consumer/tsconfig.json
-          npx api-extractor run
+          node scripts/check-dist-runtime.mjs
+          node scripts/check-package.mjs
+          node scripts/api-report.mjs check
       - name: Generate changelog
         run: |
-          parse_date () {
-            git log -1 --pretty=format:'%ad' --date=short "$1"
-          }
-          create_tag () {
-            git tag "$1"
-          }
-          get_package_version () {
-            node -p "require('./package.json').version"
-          }
-
-          new_version="$(get_package_version)"
-
           if [[ -f CHANGELOG.md ]]; then
             existing_changelog=$(sed '1d' CHANGELOG.md)
           else
             existing_changelog=""
           fi
 
-          changelog_content="# CHANGELOG\n\n"
-
-          if [[ -z $(git tag | tail -1) ]]; then
-            first_tag="$new_version"
-            create_tag "$first_tag"
-            tag_date=$(parse_date "${first_tag}")
-            changelog_content+="## ${first_tag} (${tag_date})\n\n"
-            changelog_content+=$(git log --pretty=format:"* %s by %an [View](https://github.com/${GITHUB_REPOSITORY}/commit/%H)" --reverse | grep -v 'Merge\|skip]')
-            changelog_content+="\n\n"
+          changelog_content="# CHANGELOG\n\n## ${new_version} ($(date +'%Y-%m-%d'))\n\n"
+          previous_tag=$(git describe --tags --abbrev=0 --match 'v*' 2>/dev/null || true)
+          if [[ -z "$previous_tag" ]]; then
+            changelog_content+=$(git log --pretty=format:"* %s by %an [View](https://github.com/${GITHUB_REPOSITORY}/commit/%H)" --reverse | grep -v 'Merge\|skip]' || true)
           else
-            previous_tag=$(git describe --tags --abbrev=0)
-            create_tag "$new_version"
-            changelog_content+="## ${new_version} ($(date +'%Y-%m-%d'))\n\n"
-            changelog_content+=$(git log ${previous_tag}..HEAD --pretty=format:"* %s by %an [View](https://github.com/${GITHUB_REPOSITORY}/commit/%H)" --reverse | grep -v 'Merge\|skip]')
-            changelog_content+="\n\n"
+            changelog_content+=$(git log ${previous_tag}..HEAD --pretty=format:"* %s by %an [View](https://github.com/${GITHUB_REPOSITORY}/commit/%H)" --reverse | grep -v 'Merge\|skip]' || true)
           fi
+          changelog_content+="\n\n"
 
           echo -e "${changelog_content}${existing_changelog}" > CHANGELOG.md
+      # The release commit carries the version it releases, and the tag
+      # points at it: `git checkout vX.Y.Z` shows that version in
+      # package.json. Both stay local until the package is published.
+      - name: Commit and tag the release
+        run: |
+          git add package.json package-lock.json CHANGELOG.md
+          git diff --staged --quiet || git commit -m "[ci skip]: release v${new_version}" --no-verify
+          git tag -a "v${new_version}" -m "Release v${new_version}"
       # Authentication happens via OIDC trusted publishing (id-token: write
       # plus the trusted publisher configured on npmjs.com), no token secret.
       # Provenance attestation is generated automatically.
+      # The build checked above is the one published: no second build.
       - name: Publish package to npm
         run: |
-          npm publish --access public
-      - name: Create and push tag
+          npm publish --access public --ignore-scripts
+      # One push for the commit and the tag: both land, or neither does. A
+      # main that moved meanwhile refuses it; the package is out, and the
+      # next release bumps from the registry as always.
+      - name: Push the release commit and tag
         run: |
-          NEW_VERSION=$(node -p "require('./package.json').version")
-          git tag -a "v$NEW_VERSION" -m "Release v$NEW_VERSION"
-          git push origin "v$NEW_VERSION"
+          git push --atomic origin "HEAD:main" "v${new_version}"
       # Reuses the version section just written to CHANGELOG.md as the release
       # body. For milestone releases, edit the release afterwards with curated
       # notes; this step never overwrites an existing release.
@@ -152,22 +179,10 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          NEW_VERSION=$(node -p "require('./package.json').version")
+          awk "/^## ${new_version} /{flag=1; next} /^## /{flag=0} flag" CHANGELOG.md > /tmp/release-notes.md
 
-          awk "/^## ${NEW_VERSION} /{flag=1; next} /^## /{flag=0} flag" CHANGELOG.md > /tmp/release-notes.md
-
-          if gh release view "v$NEW_VERSION" >/dev/null 2>&1; then
-            echo "Release v$NEW_VERSION already exists, skipping"
+          if gh release view "v${new_version}" >/dev/null 2>&1; then
+            echo "Release v${new_version} already exists, skipping"
           else
-            gh release create "v$NEW_VERSION" --title "v$NEW_VERSION" --notes-file /tmp/release-notes.md
+            gh release create "v${new_version}" --title "v${new_version}" --notes-file /tmp/release-notes.md
           fi
-      # The lockfile is versioned, so the bump touches it as well.
-      - name: Commit package files
-        run: |
-          git add package.json package-lock.json CHANGELOG.md
-
-          git diff --quiet && git diff --staged --quiet || (
-            git commit -m "[ci skip]: update package files and changelog" --no-verify
-          )
-
-          git push origin HEAD

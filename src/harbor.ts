@@ -14,8 +14,8 @@ import type { BrokerConfig, ClientAdapter, SaslConfig } from './adapter'
 import { AbortProcessingError, ClosedError, ConfigError, describeError } from './errors'
 import { redrive, type RedriveEvents, type RedriveOptions, type RedriveResult } from './redrive'
 import { TransactionRunner, type Transaction, type TransactionEvents, type TransactionOptions } from './transaction'
-import { Producer, buildProducerRetry, type ProducerEvents, type ProducerOptions, type ProducerRetryOptions } from './producer'
-import { Consumer, type ConsumerEvents, type ConsumerOptions, type ConsumerState, type PartitionLag, type StopReason } from './consumer'
+import { ProducerPipeline, buildProducerRetry, type Producer, type ProducerEvents, type ProducerOptions, type ProducerRetryOptions } from './producer'
+import { ConsumerPipeline, type Consumer, type ConsumerEvents, type ConsumerOptions, type ConsumerState, type PartitionLag, type StopReason } from './consumer'
 
 export interface HeaderOptions {
   /** Prefix of every header the library writes. Default: 'x-'. */
@@ -123,8 +123,12 @@ export class Harbor implements Observable<HarborEvents> {
 
   private readonly producePolicy: RetryPolicy
   private readonly transactions: TransactionRunner
-  private readonly consumers = new Set<Consumer>()
+  private readonly consumers = new Set<ConsumerPipeline>()
   private state: HarborState = 'idle'
+  /** Aborted, with a ClosedError, once the shutdown stops producing for good and releases the client. */
+  private readonly closedController = new AbortController()
+  /** Sends and transactions in flight, which a shutdown gives what is left of its timeout before it releases the client. */
+  private readonly producing = new Set<Promise<unknown>>()
   /** Whether the adapter holds an open connection that shutdown must release. */
   private adapterConnected = false
   private connecting: Promise<void> | undefined
@@ -212,11 +216,11 @@ export class Harbor implements Observable<HarborEvents> {
   }
 
   producer<T = unknown> (options: ProducerOptions<T> = {}): Producer<T> {
-    return new Producer<T>(this.pipelineContext(), options)
+    return new ProducerPipeline<T>(this.pipelineContext(), options)
   }
 
   consumer (options: ConsumerOptions): Consumer {
-    const consumer = new Consumer(this.pipelineContext(), options)
+    const consumer = new ConsumerPipeline(this.pipelineContext(), options)
     this.consumers.add(consumer)
     return consumer
   }
@@ -234,7 +238,9 @@ export class Harbor implements Observable<HarborEvents> {
       producePolicy: this.producePolicy,
       emit: (event, payload) => this.emitter.emit(event as keyof HarborEvents, payload as HarborEvents[keyof HarborEvents]),
       isClosed: () => this.isClosed(),
-      ensureConnected: () => this.connect(),
+      closed: this.closedController.signal,
+      ensureConnected: () => this.ensureConnected(),
+      track: (work) => this.track(work),
       instrumentation: this.fullConfig.instrumentation,
       transaction: (fn, options, offsets) => this.transactions.run(fn, options, offsets)
     }
@@ -344,11 +350,23 @@ export class Harbor implements Observable<HarborEvents> {
       if (this.connecting !== undefined && !await this.settledInTime(this.connecting, Math.max(0, deadline - this.clock.now()))) {
         this.logger.warn(`[kafka-harbor] connect still pending after ${timeoutMs}ms; the client is released when it settles`)
       }
+      // Sends and transactions in flight get what is left of the timeout
+      // too, including the ones begun while it runs; past it, a retry
+      // waiting out its backoff fails with ClosedError instead of trying a
+      // client that is gone, and an attempt under way fails as the client
+      // reports its release.
+      while (this.producing.size > 0) {
+        if (await this.settledInTime(Promise.allSettled([...this.producing]), Math.max(0, deadline - this.clock.now()))) continue
+        this.logger.warn(`[kafka-harbor] ${this.producing.size} send(s) or transaction(s) still in flight after ${timeoutMs}ms; the client is released under them`)
+        break
+      }
+      this.closedController.abort(new ClosedError('harbor'))
       if (this.adapterConnected) {
         await this.adapter.disconnect()
         this.emitter.emit('disconnected', { adapter: this.adapter.name })
       }
     } finally {
+      this.closedController.abort(new ClosedError('harbor'))
       this.state = 'closed'
     }
     const failed = results.find((result): result is PromiseRejectedResult => result.status === 'rejected')
@@ -407,6 +425,29 @@ export class Harbor implements Observable<HarborEvents> {
 
   private isClosed (): boolean {
     return this.state === 'closing' || this.state === 'closed'
+  }
+
+  /**
+   * The connection the pipelines produce through. A shutdown drains the
+   * handlers still running before it releases the client, and what they
+   * produce on the way out (a send, a transaction, a retry hop) must go
+   * through: refusing it would fail the message, and down the ladder it
+   * would go, on every deploy.
+   */
+  private async ensureConnected (): Promise<void> {
+    // Connected and not released yet: open, or closing with the client
+    // still there. Anything else is connect()'s to decide (and refuse).
+    if (this.adapterConnected && !this.closedController.signal.aborted) return
+    await this.connect()
+  }
+
+  private async track<T> (work: Promise<T>): Promise<T> {
+    this.producing.add(work)
+    try {
+      return await work
+    } finally {
+      this.producing.delete(work)
+    }
   }
 }
 

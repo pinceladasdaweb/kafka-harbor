@@ -13,15 +13,18 @@ import { SerializationError, isSerializationError } from './errors'
  * backed by a service reports the service being away, and the message then
  * walks the retry ladder instead.
  */
+// Methods, not function-typed properties: a `Serializer<string>` has to fit
+// where any serializer goes (the harbor-wide one, a consumer's, a
+// transaction's), and only method parameters are checked bivariantly.
 export interface Serializer<T = unknown> {
-  serialize: (value: T, topic: string) => Buffer | Promise<Buffer>
-  deserialize: (bytes: Buffer, topic: string) => T | Promise<T>
+  serialize (value: T, topic: string): Buffer | Promise<Buffer>
+  deserialize (bytes: Buffer, topic: string): T | Promise<T>
 }
 
 /** A serializer that answers without a promise, which the built-in ones do; usable wherever a `Serializer` is. */
 export interface SyncSerializer<T = unknown> extends Serializer<T> {
-  serialize: (value: T, topic: string) => Buffer
-  deserialize: (bytes: Buffer, topic: string) => T
+  serialize (value: T, topic: string): Buffer
+  deserialize (bytes: Buffer, topic: string): T
 }
 
 /**
@@ -57,7 +60,13 @@ class Unencodable {
   }
 }
 
-const walk = (value: unknown, seen: WeakSet<object>): void => {
+/**
+ * `key` is what JSON.stringify hands to `toJSON`: the property name, the
+ * index as a string, or '' at the root. `encodedBy` is the object whose
+ * `toJSON` returned `value`: JSON.stringify calls `toJSON` once per value,
+ * so what it returned is written as it is, by its own keys.
+ */
+const walk = (value: unknown, key: string, seen: WeakSet<object>, encodedBy?: object): void => {
   switch (typeof value) {
     case 'number':
       if (!Number.isFinite(value)) throw new Unencodable(`is ${String(value)}; JSON turns it into null`)
@@ -65,20 +74,34 @@ const walk = (value: unknown, seen: WeakSet<object>): void => {
     case 'object': {
       if (value === null) return
       if (value instanceof Date) {
+        if (encodedBy !== undefined) throw new Unencodable('is a Date returned by toJSON; JSON writes it as {}')
         if (Number.isNaN(value.getTime())) throw new Unencodable('is an invalid Date')
         return
       }
       const rejected = isRejectedShape(value)
       if (rejected !== null) throw new Unencodable(`is a ${rejected}; JSON would not preserve it`)
-      if (seen.has(value)) throw new Unencodable('closes a cycle')
+      // What JSON.stringify encodes for an object with `toJSON` (a URL, a
+      // money or date-time type) is what that returns, so that is what is
+      // checked, as JSON would read it.
+      const { toJSON } = value as { toJSON?: unknown }
+      if (encodedBy === undefined && typeof toJSON === 'function') {
+        if (seen.has(value)) throw new Unencodable('closes a cycle')
+        seen.add(value)
+        walk(toJSON.call(value, key), key, seen, value)
+        seen.delete(value)
+        return
+      }
+      // A `toJSON` that returns its own object: written by its keys, not a cycle.
+      if (seen.has(value) && value !== encodedBy) throw new Unencodable('closes a cycle')
       seen.add(value)
       if (Array.isArray(value)) {
-        for (let index = 0; index < value.length; index++) descend(value[index], `[${index}]`, seen)
+        for (let index = 0; index < value.length; index++) descend(value[index], String(index), `[${index}]`, seen)
       } else {
         // `undefined` inside an object is dropped by JSON.stringify rather
         // than encoded; a consumer would see a missing key and never know
-        // whether the producer meant to send it.
-        for (const key in value) descend((value as Record<string, unknown>)[key], `.${key}`, seen)
+        // whether the producer meant to send it. Own enumerable keys only:
+        // the ones JSON.stringify reads.
+        for (const name of Object.keys(value)) descend((value as Record<string, unknown>)[name], name, `.${name}`, seen)
       }
       seen.delete(value)
       break
@@ -91,9 +114,9 @@ const walk = (value: unknown, seen: WeakSet<object>): void => {
   }
 }
 
-const descend = (item: unknown, segment: string, seen: WeakSet<object>): void => {
+const descend = (item: unknown, key: string, segment: string, seen: WeakSet<object>): void => {
   try {
-    walk(item, seen)
+    walk(item, key, seen)
   } catch (failure) {
     if (failure instanceof Unencodable) failure.segments.push(segment)
     throw failure
@@ -102,7 +125,7 @@ const descend = (item: unknown, segment: string, seen: WeakSet<object>): void =>
 
 const assertEncodable = (value: unknown): void => {
   try {
-    walk(value, new WeakSet())
+    walk(value, '', new WeakSet())
   } catch (failure) {
     if (failure instanceof Unencodable) throw new SerializationError(failure.message())
     throw failure

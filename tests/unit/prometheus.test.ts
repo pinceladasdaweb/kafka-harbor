@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { describe, test } from 'node:test'
 
-import { Registry, register as globalRegistry } from 'prom-client'
+import { Counter, Gauge, Registry, register as globalRegistry } from 'prom-client'
 
 import { ERROR_CODES } from '../../src/index'
 import { prometheusMetrics } from '../../src/prometheus/index'
@@ -299,6 +299,108 @@ describe('kafka-harbor/prometheus', () => {
       return true
     })
     prometheusMetrics(h.harbor, { registry: new Registry(), lag: false })
+    await h.harbor.shutdown()
+  })
+
+  test('a harbor attached again after detach counts on in the same metrics', async () => {
+    const h = harness()
+    const registry = new Registry()
+    const first = prometheusMetrics(h.harbor, { registry, lag: false })
+    await h.harbor.producer().send('orders', { value: 1 })
+    first.detach()
+    prometheusMetrics(h.harbor, { registry, lag: false })
+    await h.harbor.producer().send('orders', { value: 2 })
+    assert.equal(await value(registry, 'kafka_harbor_messages_produced_total', { topic: 'orders', kind: 'send' }), 2)
+    await h.harbor.shutdown()
+  })
+
+  test('two harbors share a registry: they count into the same metrics, and the lag gauge covers both until the last one detaches', async () => {
+    const [a, b] = [harness(), harness()] as const
+    const registry = new Registry()
+    const metricsA = prometheusMetrics(a.harbor, { registry })
+    const metricsB = prometheusMetrics(b.harbor, { registry })
+    for (const [h, groupId] of [[a, 'group-a'], [b, 'group-b']] as const) {
+      const consumer = h.harbor.consumer({ groupId, fromBeginning: true, autoCreateTopics: true })
+      consumer.subscribe('orders', () => {})
+      await h.harbor.producer().send('orders', { value: 1 })
+      await consumer.start()
+      await h.adapter.whenDrained(groupId, 'orders')
+    }
+    assert.equal(await value(registry, 'kafka_harbor_messages_processed_total', { group: 'group-a' }), 1)
+    assert.equal(await value(registry, 'kafka_harbor_messages_processed_total', { group: 'group-b' }), 1)
+    assert.equal(await value(registry, 'kafka_harbor_messages_produced_total', { topic: 'orders', kind: 'send' }), 2)
+    const lagGroups = async (): Promise<string[] | undefined> => (await registry.getMetricsAsJSON()).find((m) => m.name === 'kafka_harbor_consumer_lag')?.values.map((entry) => String(entry.labels.group)).sort()
+    assert.deepEqual(await lagGroups(), ['group-a', 'group-b'])
+    metricsA.detach()
+    metricsA.detach()
+    assert.deepEqual(await lagGroups(), ['group-b'])
+    metricsB.detach()
+    assert.equal(await lagGroups(), undefined, 'the gauge goes with the last harbor')
+    await a.harbor.shutdown()
+    await b.harbor.shutdown()
+  })
+
+  test('a metric of the same name that something else registered with another type or other labels is refused, and so is a lag gauge of its own', async () => {
+    const h = harness()
+    const labelled = new Registry()
+    new Counter({ name: 'kafka_harbor_messages_processed_total', help: 'not ours', labelNames: ['service'], registers: [labelled] }) // eslint-disable-line no-new
+    assert.throws(() => prometheusMetrics(h.harbor, { registry: labelled, lag: false }), { code: ERROR_CODES.CONFIG_INVALID, message: /already has a metric named "kafka_harbor_messages_processed_total" of another type, with other labels or buckets/ })
+    assert.equal((await labelled.getMetricsAsJSON()).length, 1, 'refused before anything was registered')
+    const typed = new Registry()
+    new Gauge({ name: 'kafka_harbor_messages_processed_total', help: 'not ours', labelNames: ['group', 'topic'], registers: [typed] }) // eslint-disable-line no-new
+    assert.throws(() => prometheusMetrics(h.harbor, { registry: typed, lag: false }), { code: ERROR_CODES.CONFIG_INVALID })
+    const gauged = new Registry()
+    new Gauge({ name: 'kafka_harbor_consumer_lag', help: 'not ours', registers: [gauged] }) // eslint-disable-line no-new
+    assert.throws(() => prometheusMetrics(h.harbor, { registry: gauged }), { code: ERROR_CODES.CONFIG_INVALID, message: /"kafka_harbor_consumer_lag" that these metrics did not register/ })
+    assert.equal((await gauged.getMetricsAsJSON()).length, 1, 'refused before anything was registered')
+  })
+
+  test('the same harbor attached twice to a registry with one prefix is refused until detached; other buckets are refused too', () => {
+    const h = harness()
+    const registry = new Registry()
+    const metrics = prometheusMetrics(h.harbor, { registry, lag: false })
+    assert.throws(() => prometheusMetrics(h.harbor, { registry, lag: false }), { code: ERROR_CODES.CONFIG_INVALID, message: /attached to this registry with prefix "kafka_harbor_" already/ })
+    prometheusMetrics(h.harbor, { registry, prefix: 'other_', lag: false })
+    metrics.detach()
+    metrics.detach()
+    prometheusMetrics(h.harbor, { registry, lag: false })
+    // Detaching one attachment leaves the others in place.
+    assert.throws(() => prometheusMetrics(h.harbor, { registry, prefix: 'other_', lag: false }), { code: ERROR_CODES.CONFIG_INVALID, message: /prefix "other_" already/ })
+    assert.throws(() => prometheusMetrics(harness().harbor, { registry, lag: false, buckets: [1, 2] }), { code: ERROR_CODES.CONFIG_INVALID, message: /message_processing_duration_seconds/ })
+  })
+
+  test('a harbor attached to a registry cleared since without a detach attaches again, and its old listeners stop counting', async () => {
+    const h = harness()
+    const registry = new Registry()
+    const stale = prometheusMetrics(h.harbor, { registry, lag: false })
+    registry.clear()
+    prometheusMetrics(h.harbor, { registry, lag: false })
+    assert.throws(() => prometheusMetrics(h.harbor, { registry, lag: false }), { code: ERROR_CODES.CONFIG_INVALID, message: /already/ })
+    stale.detach()
+    const consumer = h.harbor.consumer({ groupId: 'g', fromBeginning: true, autoCreateTopics: true })
+    consumer.subscribe('orders', () => {})
+    await h.harbor.producer().send('orders', { value: 1 })
+    await consumer.start()
+    await h.adapter.whenDrained('g', 'orders')
+    assert.equal(await value(registry, 'kafka_harbor_messages_processed_total', { group: 'g' }), 1)
+    await h.harbor.shutdown()
+  })
+
+  test('a registry cleared since gets its metrics, and its lag gauge, registered anew; the old attachment\'s detach leaves the new gauge alone', async () => {
+    const old = harness()
+    const h = harness()
+    const registry = new Registry()
+    const stale = prometheusMetrics(old.harbor, { registry })
+    registry.clear()
+    prometheusMetrics(h.harbor, { registry })
+    stale.detach()
+    const consumer = h.harbor.consumer({ groupId: 'g', fromBeginning: true, autoCreateTopics: true })
+    consumer.subscribe('orders', () => {})
+    await h.harbor.producer().send('orders', { value: 1 })
+    await consumer.start()
+    await h.adapter.whenDrained('g', 'orders')
+    assert.equal(await value(registry, 'kafka_harbor_messages_processed_total', { group: 'g' }), 1)
+    assert.equal((await registry.getMetricsAsJSON()).find((m) => m.name === 'kafka_harbor_consumer_lag')?.values.length, 1)
     await h.harbor.shutdown()
   })
 })

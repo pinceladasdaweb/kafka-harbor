@@ -29,8 +29,8 @@ runAdapterContract('confluent', async () => {
     throw Object.assign(new Error('Kafka container not available'), { skip: true })
   }
   const adapter = confluentAdapter({ global: { 'allow.auto.create.topics': false } })
-  await adapter.connect({ clientId: 'contract', brokers: kafka.brokers })
   const run = randomUUID().slice(0, 8)
+  await adapter.connect({ clientId: 'contract', brokers: kafka.brokers, transactionalId: `contract-${run}` })
   return {
     adapter,
     topic: async (label, partitions = 1) => {

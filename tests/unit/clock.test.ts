@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { describe, test } from 'node:test'
 
-import { systemClock } from '../../src/index'
+import { systemClock } from '../../src/clock'
 
 describe('systemClock', () => {
   test('now() is the wall clock', () => {

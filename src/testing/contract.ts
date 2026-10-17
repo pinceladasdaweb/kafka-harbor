@@ -22,6 +22,15 @@
  *     leader yet may be left out until it has one), and a committed offset
  *     reads back as committed, while a partition never committed on reads
  *     back as null or is left out.
+ * 11. One group, consumed twice on disjoint topics (the core opens one
+ *     consumption per retry level): each consumption gets its own topics,
+ *     every message of them, and nothing of the other's.
+ * 12. A rejected eachMessage is settled like any other: the partition moves
+ *     on and the message is not delivered again by that consumption.
+ * 13. Transactions, when implemented (and the setup connected with a
+ *     transactionalId): what a committed transaction produced is delivered,
+ *     what an aborted one produced never is, and offsets sent with a
+ *     transaction read back as committed once it commits.
  *
  * In this repository the suite runs against the in-memory adapter in the
  * unit run and against the Confluent and platformatic adapters on a
@@ -227,6 +236,8 @@ export function runAdapterContract (name: string, setup: () => Promise<AdapterCo
       assert.equal(received.length, 1, 'nothing may arrive while paused')
       handle.resume([{ topic, partition: 0 }])
       await waitFor(() => received.length === 2, timeoutMs, 'message after resume')
+      // A partition this consumption never had is not an error to resume.
+      assert.doesNotThrow(() => handle.resume?.([{ topic, partition: 9 }]))
       // A pause left in place must not outlive the consumption that set it.
       handle.pause([{ topic, partition: 0 }])
       await handle.stop()
@@ -286,6 +297,85 @@ export function runAdapterContract (name: string, setup: () => Promise<AdapterCo
       await handle.commit([{ topic, partition: 0, offset: '2' }])
       await handle.stop()
       assert.deepEqual(committedOn(await admin.fetchCommittedOffsets(groupId, [topic])), [[0, '2'], [1, null]])
+    })
+
+    test('11. one group consumed twice on disjoint topics: each consumption gets its own topics, all of them', async () => {
+      const orders = await ctx.topic('split-orders', 2)
+      const payments = await ctx.topic('split-payments', 2)
+      const groupId = ctx.group('split')
+      await ctx.adapter.produce([
+        ...[0, 1, 2, 3].map((n) => ({ topic: orders, key: null, value: bytes(`o${n}`), headers: {}, partition: n % 2 })),
+        ...[0, 1, 2, 3].map((n) => ({ topic: payments, key: null, value: bytes(`p${n}`), headers: {}, partition: n % 2 }))
+      ])
+      const first = await consumeAll(orders, groupId, 4)
+      const second = await consumeAll(payments, groupId, 4)
+      await second.handle.stop()
+      await first.handle.stop()
+      assert.deepEqual([...new Set(first.received.map((message) => message.topic))], [orders])
+      assert.deepEqual([...new Set(second.received.map((message) => message.topic))], [payments])
+      assert.deepEqual([...new Set(first.received.map(valueOf))].sort(), ['o0', 'o1', 'o2', 'o3'])
+      assert.deepEqual([...new Set(second.received.map(valueOf))].sort(), ['p0', 'p1', 'p2', 'p3'])
+    })
+
+    test('12. a rejected eachMessage is settled: the partition moves on, the message is not delivered again', async () => {
+      const topic = await ctx.topic('reject')
+      await ctx.adapter.produce(['a', 'b'].map((value) => ({ topic, key: null, value: bytes(value), headers: {} })))
+      const seen: string[] = []
+      const handle = await ctx.adapter.consume({
+        groupId: ctx.group('reject'),
+        topics: [topic],
+        fromBeginning: true,
+        onError: () => {},
+        eachMessage: async (message) => {
+          seen.push(valueOf(message))
+          if (valueOf(message) === 'a') throw new Error('rejected on purpose')
+        }
+      })
+      await waitFor(() => seen.includes('b'), timeoutMs, 'the message after the rejected one')
+      await new Promise((resolve) => setTimeout(resolve, 300))
+      await handle.stop()
+      assert.deepEqual(seen, ['a', 'b'])
+    })
+
+    test('13. a committed transaction is delivered, an aborted one never is, and its offsets read back as committed', async (t) => {
+      if (ctx.adapter.transaction === undefined) {
+        t.skip('adapter does not implement transactions')
+        return
+      }
+      let begun
+      try {
+        begun = await ctx.adapter.transaction()
+      } catch (error) {
+        if ((error as { code?: unknown }).code !== 'CONFIG_INVALID') throw error
+        t.skip('the setup connected without a transactionalId')
+        return
+      }
+      const topic = await ctx.topic('transactions')
+      await begun.produce([{ topic, key: null, value: bytes('committed'), headers: {} }])
+      await begun.commit()
+      const aborted = await ctx.adapter.transaction()
+      await aborted.produce([{ topic, key: null, value: bytes('aborted'), headers: {} }])
+      await aborted.abort()
+      await ctx.adapter.produce([{ topic, key: null, value: bytes('after'), headers: {} }])
+      const groupId = ctx.group('transactions')
+      const { received, handle } = await consumeAll(topic, groupId, 2)
+      await new Promise((resolve) => setTimeout(resolve, 300))
+      assert.deepEqual(received.map(valueOf), ['committed', 'after'])
+      const withOffsets = await ctx.adapter.transaction()
+      await withOffsets.sendOffsets(handle, [{ topic, partition: 0, offset: (BigInt((received[0] as RawMessage).offset) + 1n).toString() }])
+      await withOffsets.commit()
+      const { fetchCommittedOffsets } = ctx.adapter.admin
+      if (fetchCommittedOffsets !== undefined) {
+        const expected = (BigInt((received[0] as RawMessage).offset) + 1n).toString()
+        let committed: string | null | undefined
+        const deadline = Date.now() + timeoutMs
+        while (committed !== expected && Date.now() < deadline) {
+          committed = (await fetchCommittedOffsets.call(ctx.adapter.admin, groupId, [topic])).find((entry) => entry.partition === 0)?.offset
+          if (committed !== expected) await new Promise((resolve) => setTimeout(resolve, 100))
+        }
+        assert.equal(committed, expected)
+      }
+      await handle.stop()
     })
   })
 }

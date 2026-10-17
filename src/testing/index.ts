@@ -30,6 +30,10 @@ import {
 export { runAdapterContract } from './contract'
 export type { AdapterContractSetup } from './contract'
 
+/** Header values as a broker delivers them: bytes. The adapter stores what the core produced, which is text. */
+const asBytes = (headers: RawMessage['headers']): RawMessage['headers'] =>
+  Object.fromEntries(Object.entries(headers as Record<string, string>).map(([name, value]) => [name, Buffer.from(value, 'utf8')]))
+
 export interface MemoryAdapterOptions {
   /** Partitions for topics created on demand. Default: 1. */
   partitions?: number
@@ -56,7 +60,11 @@ export interface MemoryAdapter extends ClientAdapter {
   /** Topic names known to the broker. */
   topics: () => string[]
   createTopic: (topic: string, partitions?: number) => void
-  /** Every message on a topic, across partitions, in the order they were appended. */
+  /**
+   * Every message on a topic, across partitions, in the order they were
+   * appended, headers as strings for reading; a consumption receives them
+   * as bytes, the way a broker hands them over.
+   */
   messages: (topic: string) => RawMessage[]
   /** The committed offset (next to read) of a group on a partition. */
   committed: (groupId: string, topic: string, partition: number) => string | undefined
@@ -332,14 +340,15 @@ export function memoryAdapter (options: MemoryAdapterOptions = {}): MemoryAdapte
           await acquire()
           try {
             if (stopped) return
-            await consumeOptions.eachMessage(message)
+            // Header values arrive as bytes, as from a broker: code that
+            // reads them raw meets here what it meets in production.
+            await consumeOptions.eachMessage({ ...message, headers: asBytes(message.headers) })
+          } catch (error) {
+            // Settled like any other delivery (the contract): reported, not redelivered.
+            consumeOptions.onError?.(error)
+          } finally {
             entry.positions.set(slot, position + 1)
             wake()
-          } catch (error) {
-            consumeOptions.onError?.(error)
-            // The message is redelivered, but not in a tight loop.
-            await new Promise((resolve) => setImmediate(resolve))
-          } finally {
             release()
           }
         }

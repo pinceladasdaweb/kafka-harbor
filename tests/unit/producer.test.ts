@@ -3,8 +3,9 @@ import { describe, test } from 'node:test'
 
 import { fixed } from 'breakwater'
 
-import { AdapterError, ERROR_CODES } from '../../src/index'
-import { captureErrors, harness, json, text } from '../helpers/harness'
+import { AdapterError, ERROR_CODES, partitionForKey } from '../../src/index'
+import { captureErrors, gate, harness, json, text } from '../helpers/harness'
+import { settle, until } from '../helpers/manual-clock'
 
 describe('Producer', () => {
   test('serializes the value, keeps the key and writes the automatic headers', async () => {
@@ -158,11 +159,11 @@ describe('Producer', () => {
     })
   })
 
-  test('reports an acknowledged batch as messageProduced and a failed one as a producer error, then rejects', async () => {
+  test('reports an acknowledged batch as batchProduced and a failed one as a producer error, then rejects', async () => {
     const { adapter, clock, harbor } = harness()
     const produced: Array<{ topic: string, kind: string, records: number, durationMs: number }> = []
     const errors: Array<{ scope: string, topic?: string, error: unknown }> = []
-    harbor.on('messageProduced', (event) => { produced.push(event) })
+    harbor.on('batchProduced', (event) => { produced.push(event) })
     harbor.on('error', (event) => { errors.push(event) })
     const producer = harbor.producer({ retry: { attempts: 2, backoff: fixed(0) } })
 
@@ -215,5 +216,115 @@ describe('Producer', () => {
     const producer = harbor.producer()
     await harbor.shutdown()
     await assert.rejects(producer.send('orders', { value: 1 }), { code: ERROR_CODES.CLOSED })
+  })
+})
+
+describe('Producer: what it refuses, and what a shutdown does to its sends', () => {
+  test('a header or a key that is not a string, a message or a batch of the wrong shape are refused before anything is sent', async () => {
+    const { adapter, harbor } = harness()
+    const producer = harbor.producer()
+    const refused = async (send: Promise<void>, message: RegExp): Promise<void> => {
+      await assert.rejects(send, (error: unknown) => {
+        assert.equal((error as { code: string }).code, ERROR_CODES.CONFIG_INVALID)
+        assert.equal((error as { retryable: boolean }).retryable, false)
+        assert.match((error as Error).message, message)
+        return true
+      })
+    }
+    await refused(producer.send('orders', { value: 1, headers: { 'x-tenant': undefined as unknown as string } }), /header "x-tenant" of a message for topic "orders" must be a string; got undefined/)
+    await refused(producer.send('orders', { value: 1, headers: { n: 5 as unknown as string } }), /header "n" .* got number/)
+    await refused(producer.send('orders', { value: 1, headers: { n: null as unknown as string } }), /header "n" .* got null/)
+    await refused(producer.send('orders', { value: 1, headers: 'x' as never }), /the headers of a message for topic "orders" must be an object of strings; got string/)
+    await refused(producer.send('orders', { value: 1, headers: null as never }), /headers .* got null/)
+    await refused(producer.send('orders', { value: 1, headers: ['a'] as never }), /headers .* got array/)
+    await refused(producer.send('orders', { value: 1, key: 42 as never }), /the key of a message for topic "orders" must be a string or a Buffer; got number/)
+    await refused(producer.send('orders', null as never), /a message for topic "orders" must be an object; got null/)
+    await refused(producer.send('orders', 'x' as never), /must be an object; got string/)
+    await refused(producer.sendBatch('orders', { value: 1 } as never), /messages for topic "orders" must be an array/)
+    assert.equal(adapter.calls.filter((call) => call.method === 'produce' || call.method === 'connect').length, 0, 'nothing sent, nothing retried, not even a connection')
+  })
+
+  test('a shutdown waits for a send in flight before it releases the client', async () => {
+    const h = harness()
+    const acknowledged = gate()
+    let sending = false
+    const original = h.adapter.produce
+    h.adapter.produce = async (records) => {
+      sending = true
+      await acknowledged.wait
+      await original(records)
+    }
+    const sent = h.harbor.producer().send('orders', { value: 1 })
+    await until(() => sending)
+    let closed = false
+    const closing = h.harbor.shutdown().then(() => { closed = true })
+    await settle()
+    assert.equal(closed, false, 'the shutdown waits for the send')
+    assert.equal(h.adapter.connected, true)
+    acknowledged.release()
+    await sent
+    await closing
+    assert.equal(h.adapter.messages('orders').length, 1)
+    assert.equal(h.adapter.connected, false)
+  })
+
+  test('past the shutdown timeout, a send waiting out a retry backoff fails at once with ClosedError', async () => {
+    const h = harness()
+    const errors = captureErrors(h.harbor)
+    h.adapter.failNextProduce(new AdapterError('broker hiccup'))
+    const sent = h.harbor.producer({ retry: { attempts: 3, backoff: fixed(60_000) } }).send('orders', { value: 1 })
+    await until(() => h.adapter.calls.some((call) => call.method === 'produce'))
+    await settle()
+    const startedAt = Date.now()
+    await h.harbor.shutdown(0)
+    await assert.rejects(sent, { code: ERROR_CODES.CLOSED })
+    assert.ok(Date.now() - startedAt < 1_000, 'the backoff was not sat out')
+    assert.ok(h.logs.some((entry) => entry.level === 'warn' && entry.message.includes('1 send(s) or transaction(s) still in flight after 0ms')))
+    assert.equal(h.adapter.messages('orders').length, 0)
+    assert.deepEqual(errors, [], 'the harbor closing is the caller\'s ClosedError, not a producer failure')
+  })
+
+  test('a send begun while the shutdown waits for the ones in flight is waited for too', async () => {
+    const h = harness()
+    const gates = [gate(), gate()]
+    let entered = 0
+    const original = h.adapter.produce
+    h.adapter.produce = async (records) => {
+      await gates[entered++]?.wait
+      await original(records)
+    }
+    const producer = h.harbor.producer()
+    const first = producer.send('orders', { value: 1 })
+    await until(() => entered === 1)
+    let closed = false
+    const closing = h.harbor.shutdown('1m').then(() => { closed = true })
+    await settle()
+    const second = producer.send('orders', { value: 2 })
+    await until(() => entered === 2)
+    gates[0]?.release()
+    await first
+    await settle()
+    assert.equal(closed, false, 'the second send is waited for as well')
+    gates[1]?.release()
+    await second
+    await closing
+    assert.equal(h.adapter.messages('orders').length, 2)
+    assert.equal(h.adapter.connected, false)
+  })
+
+  test('a key may be bytes: produced as they are, and partitioned by them', async () => {
+    const { adapter, harbor } = harness({}, { partitions: 4 })
+    const key = Buffer.from([0xff, 0x00, 0x10])
+    await harbor.producer().send('orders', { value: 1, key })
+    const [record] = adapter.messages('orders')
+    assert.deepEqual(record?.key, key)
+    assert.equal(record?.partition, partitionForKey(key, 4))
+    // Copied when the send begins: the caller may reuse its buffer.
+    const reused = Buffer.from('first')
+    const sending = harbor.producer().send('orders', { value: 2, key: reused })
+    reused.write('later')
+    await sending
+    assert.deepEqual(adapter.messages('orders')[1]?.key, Buffer.from('first'))
+    await harbor.shutdown()
   })
 })

@@ -1,10 +1,14 @@
 import assert from 'node:assert/strict'
+import { execFile } from 'node:child_process'
+import { promisify } from 'node:util'
 import { describe, test } from 'node:test'
 
 import { BatchFailedError, ERROR_CODES, type BatchContext, type HandlerContext, type Message } from '../../src/index'
 import { DLQHandler, KafkaBatchListener, KafkaConsumer, KafkaListener, KafkaRetry, bindListeners, consumerOptionsOf, hasListeners, listenersOf } from '../../src/decorators/index'
 import { captureEvents, harness } from '../helpers/harness'
 import { until } from '../helpers/manual-clock'
+
+const run = promisify(execFile)
 
 interface Order { id: string, total: number }
 
@@ -221,6 +225,67 @@ describe('kafka-harbor/decorators without a framework', () => {
     await until(() => failed.length === 1)
     assert.equal(failed[0]?.offset, '1')
     assert.equal(h.adapter.messages('orders-dlq').length, 1)
+    await h.harbor.shutdown()
+  })
+
+  test('another copy of the module, as a CJS and an ESM build loaded side by side make, reads what this one recorded under the standard decorators', async () => {
+    const specifier = new URL('../../src/decorators/index.ts?second-copy', import.meta.url).href
+    const copy = await import(specifier) as typeof import('../../src/decorators/index')
+    assert.notEqual(copy.listenersOf, listenersOf, 'a module instance of its own')
+    class Holder {
+      onOrder (): void {}
+    }
+    const initializers: Array<(this: unknown) => void> = []
+    KafkaListener('orders')(Holder.prototype.onOrder, { kind: 'method', name: 'onOrder', static: false, addInitializer: (initializer) => { initializers.push(initializer) } })
+    const instance = new Holder()
+    for (const initializer of initializers) initializer.call(instance)
+    assert.deepEqual(copy.listenersOf(instance).map((entry) => [entry.kind, entry.method]), [['each', 'onOrder']])
+    assert.equal(copy.hasListeners(instance), true)
+  })
+
+  test('where the global object takes no new property, the module still loads and records under its own table', async () => {
+    const decorators = new URL('../../src/decorators/index.ts', import.meta.url).href
+    const core = new URL('../../src/index.ts', import.meta.url).href
+    const script = [
+      // The core is loaded before the global object is closed, as in an
+      // application (and as code instrumented for mutation testing needs).
+      `await import(${JSON.stringify(core)})`,
+      'Object.preventExtensions(globalThis)',
+      `const { KafkaListener, listenersOf } = await import(${JSON.stringify(decorators)})`,
+      'class Holder { onOrder () {} }',
+      'const initializers = []',
+      "KafkaListener('orders')(Holder.prototype.onOrder, { kind: 'method', name: 'onOrder', static: false, addInitializer: (initializer) => { initializers.push(initializer) } })",
+      'const instance = new Holder()',
+      'for (const initializer of initializers) initializer.call(instance)',
+      'process.stdout.write(JSON.stringify(listenersOf(instance).map((entry) => entry.method)))'
+    ].join('\n')
+    const { stdout } = await run(process.execPath, ['--import', 'tsx', '--input-type=module', '-e', script])
+    assert.equal(stdout, '["onOrder"]')
+  })
+
+  test('the shared table sits on the global object out of sight and out of reach: not enumerable, not writable, not configurable', () => {
+    const descriptor = Object.getOwnPropertyDescriptor(globalThis, Symbol.for('kafka-harbor:instance-listeners'))
+    assert.ok(descriptor !== undefined)
+    assert.deepEqual([descriptor.enumerable, descriptor.writable, descriptor.configurable], [false, false, false])
+  })
+
+  test('a @DLQHandler names the DLQ itself where the consumer\'s own DLQ is off, and @KafkaConsumer may leave the group to bindListeners', async () => {
+    const h = harness()
+    const seen: unknown[] = []
+    @KafkaConsumer({ dlq: { enabled: false }, fromBeginning: true })
+    class Inspector {
+      @DLQHandler('orders', { topic: 'orders-graveyard' })
+      onDead (message: Message): void { seen.push(message.value) }
+    }
+    const instance = new Inspector()
+    assert.deepEqual(listenersOf(instance).map((entry) => [entry.kind, (entry as { topic?: string }).topic]), [['dlq', 'orders-graveyard']])
+    const consumer = bindListeners(h.harbor, instance, { groupId: 'inspector' })
+    await h.harbor.connect()
+    h.adapter.createTopic('orders-graveyard')
+    await h.harbor.producer().send('orders-graveyard', { value: 'lost' })
+    await consumer.start()
+    await until(() => seen.length === 1)
+    assert.deepEqual(seen, ['lost'])
     await h.harbor.shutdown()
   })
 })

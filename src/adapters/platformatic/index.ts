@@ -34,7 +34,9 @@ import type {
 import {
   AdapterError,
   ConfigError,
+  FencedError,
   describeError,
+  parseDuration,
   partitionKey,
   splitPartitionKey,
   type BrokerConfig,
@@ -42,6 +44,7 @@ import {
   type CommittedOffset,
   type ConsumeOptions,
   type ConsumerHandle,
+  type Duration,
   type PartitionOffsets,
   type RawMessage,
   type RawRecord,
@@ -89,8 +92,8 @@ export interface PlatformaticAdapterOptions {
   consumer?: PlatformaticConsumerConfig
   /** Extra client options for the admin client. */
   admin?: PlatformaticClientConfig
-  /** How long `createTopics` waits for a created topic to be visible, ms. Default: 30000. */
-  adminTimeoutMs?: number
+  /** How long `createTopics` waits for a created topic to be visible, and how long a transaction's begin is tried. A duration (`'30s'`) or milliseconds. Default: '30s'. */
+  adminTimeoutMs?: Duration
   /**
    * Messages one consumption holds, all partitions together, before the
    * adapter stops reading the client's stream. A paused partition (a retry
@@ -100,8 +103,16 @@ export interface PlatformaticAdapterOptions {
    * delay and a backlog behind it may need a larger value. Default: 1000.
    */
   bufferedMessages?: number
-  /** The wait before a consumption whose stream failed opens a new one, ms. Default: 1000. */
-  reconnectDelayMs?: number
+  /** The wait before a consumption whose stream failed opens a new one. A duration or milliseconds. Default: '1s'. */
+  reconnectDelayMs?: Duration
+  /**
+   * How long the broker lets a transaction stay open before it aborts it
+   * (at most the broker's `transaction.max.timeout.ms`, 15 minutes by
+   * default). The client uses the same value as the request timeout of the
+   * transactional producer. Default: the `timeout` of `producer`, or of
+   * `global`, when one is set; '1m' otherwise.
+   */
+  transactionTimeout?: Duration
 }
 
 const SASL_MECHANISMS = {
@@ -125,7 +136,7 @@ const RESERVED_CLIENT_KEYS = ['clientId', 'bootstrapBrokers']
  * its default of five seconds aborts a transaction whose handler takes
  * longer; a minute is what the Confluent client defaults to.
  */
-const DEFAULT_TRANSACTION_TIMEOUT_MS = 60_000
+const DEFAULT_TRANSACTION_TIMEOUT = '1m'
 
 /** The retries the producer makes on its own before the adapter reports the batch; the client would retry forever with idempotence on. */
 const DEFAULT_PRODUCER_RETRIES = 3
@@ -148,11 +159,15 @@ export const partitionAssignerBySubscription: GroupPartitionsAssigner = (_curren
   const assignments = new Map(memberIds.map((memberId) => [memberId, { memberId, assignments: new Map<string, GroupAssignment>() }]))
   const subscribedTopics = new Set(topics)
   for (const member of members.values()) for (const topic of member.topics ?? []) subscribedTopics.add(topic)
+  // One cursor for every topic, as the client's own round-robin keeps: a
+  // fresh one per topic would hand the first member the odd partition of
+  // every topic.
+  let cursor = 0
   for (const topic of [...subscribedTopics].sort()) {
     const subscribed = memberIds.filter((memberId) => members.get(memberId)?.topics?.includes(topic) ?? true)
     const count = metadata.topics.get(topic)?.partitionsCount ?? 0
     for (let partition = 0; partition < count && subscribed.length > 0; partition++) {
-      const member = assignments.get(subscribed[partition % subscribed.length] as string) as GroupPartitionsAssignments
+      const member = assignments.get(subscribed[cursor++ % subscribed.length] as string) as GroupPartitionsAssignments
       let entry = member.assignments.get(topic)
       if (entry === undefined) {
         entry = { topic, partitions: [] }
@@ -216,6 +231,26 @@ const isTransient = (error: unknown): boolean => !errorNodes(error).some(isDefin
 
 const wrap = (error: unknown, what: string): AdapterError =>
   new AdapterError(`${what}: ${describeError(error)}`, { cause: error, retryable: isTransient(error) })
+
+/** Whether the broker refused the producer because another one took its transactional id since (a newer epoch). */
+const isFenced = (error: unknown): boolean =>
+  errorNodes(error).some((node) => node.apiId === 'PRODUCER_FENCED' || node.apiId === 'INVALID_PRODUCER_EPOCH')
+
+/** The pause between two attempts to begin a transaction while the coordinator is not ready (a fresh cluster creating its log). */
+const TRANSACTION_RETRY_DELAY_MS = 250
+
+/** Waits `ms`, or less when `signal` aborts. */
+const pause = async (ms: number, signal: AbortSignal): Promise<void> => {
+  await new Promise<void>((resolve) => {
+    const done = (): void => {
+      clearTimeout(timer)
+      signal.removeEventListener('abort', done)
+      resolve()
+    }
+    const timer = setTimeout(done, ms)
+    signal.addEventListener('abort', done, { once: true })
+  })
+}
 
 /** Whether every broker answer in the tree says the metadata the request was built on is stale: a leader moved, a partition is between leaders. */
 const isStaleMetadata = (error: unknown): boolean => {
@@ -424,6 +459,9 @@ class Consumption {
         this.lost.clear()
       }
       const failure = await this.pump(stream)
+      // The stream is dead from here, whoever ended it: a client error or a
+      // regained partition meanwhile has no stream to drop or rotate.
+      this.stream = undefined
       stream = undefined
       if (this.stopped) return
       if (this.rotating) {
@@ -566,23 +604,27 @@ class Consumption {
     this.ready.push(key)
   }
 
-  /** Every free slot takes the partition that has been waiting longest. */
+  /**
+   * Every free slot takes the partition that has been waiting longest. A
+   * partition lines up with a message queued and neither running nor paused
+   * (`markReady`), and leaves the line with its queue (`discard`); only a
+   * pause can come between the two.
+   */
   private dispatch (): void {
     while (!this.stopped && this.active < this.concurrency && this.ready.length > 0) {
       const key = this.ready.shift() as string
       this.waiting.delete(key)
-      if (this.running.has(key) || this.paused.has(key) || (this.queues.get(key)?.length ?? 0) === 0) continue
+      if (this.paused.has(key)) continue
+      const message = (this.queues.get(key) as ClientMessage[]).shift() as ClientMessage
+      this.queued--
       this.running.add(key)
       this.active++
-      this.deliverNext(key).catch(() => undefined)
+      this.deliver(key, message).catch(() => undefined)
     }
   }
 
-  private async deliverNext (key: string): Promise<void> {
+  private async deliver (key: string, message: ClientMessage): Promise<void> {
     try {
-      const message = this.queues.get(key)?.shift()
-      if (message === undefined) return
-      this.queued--
       this.release()
       if (!this.isAssigned(message.topic, message.partition)) {
         this.lastQueued.delete(key)
@@ -592,9 +634,10 @@ class Consumption {
       this.epochs.set(key, message.leaderEpoch)
       try {
         await this.options.eachMessage(toRaw(message))
-      } catch {
-        // A rejected delivery is the core's verdict on the message, not
-        // the adapter's: the partition moves on once the promise settled.
+      } catch (failure) {
+        // A rejected delivery is settled like any other (the contract):
+        // reported, and the partition moves on.
+        this.options.onError?.(failure)
       }
     } finally {
       this.running.delete(key)
@@ -639,20 +682,53 @@ class Consumption {
   }
 }
 
+/** The client as installed next to the application; a `client` option replaces it. */
+async function loadInstalledClient (): Promise<PlatformaticClientModule> {
+  // The unit suite loads the installed client through here; V8 still reports
+  // a branch of its own inside the dynamic import, which no test can take.
+  /* c8 ignore next */
+  const installed: unknown = await import('@platformatic/kafka')
+  return installed as PlatformaticClientModule
+}
+
 export function platformaticAdapter (options: PlatformaticAdapterOptions = {}): ClientAdapter {
   refuse([options.global, options.producer, options.consumer, options.admin], RESERVED_CLIENT_KEYS, 'comes from the harbor configuration')
   refuse([options.global, options.consumer], RESERVED_CONSUMER_KEYS, 'is managed by the adapter (the core commits after the handler and reads bytes)')
   refuse([options.global, options.producer], RESERVED_PRODUCER_KEYS, 'is managed by the adapter (every produce waits for all in-sync replicas and is idempotent; the core commits only after that)')
 
-  const adminTimeout = options.adminTimeoutMs ?? 30_000
+  const adminTimeout = parseDuration(options.adminTimeoutMs ?? 30_000, 'platformaticAdapter adminTimeoutMs')
   const settings: ConsumptionSettings = {
     bufferedMessages: options.bufferedMessages ?? 1000,
-    reconnectDelayMs: options.reconnectDelayMs ?? 1000
+    reconnectDelayMs: parseDuration(options.reconnectDelayMs ?? 1000, 'platformaticAdapter reconnectDelayMs')
   }
   for (const [name, value] of Object.entries({ adminTimeoutMs: adminTimeout, ...settings })) {
     if (!Number.isInteger(value) || value < 1) throw new ConfigError(`platformaticAdapter: ${name} must be a positive integer, got ${String(value)}`)
   }
-  let state: { module: PlatformaticClientModule, config: BrokerConfig, producer: ClientProducer, transactional: ClientProducer | undefined, admin: Admin } | undefined
+  // Named after the option it came from, so a refusal points at what was set.
+  const [timeoutOption, timeoutValue] = options.transactionTimeout !== undefined
+    ? ['transactionTimeout', options.transactionTimeout]
+    : options.producer?.timeout !== undefined
+      ? ['producer.timeout', options.producer.timeout]
+      : options.global?.timeout !== undefined ? ['global.timeout', options.global.timeout] : ['transactionTimeout', DEFAULT_TRANSACTION_TIMEOUT]
+  const transactionTimeoutMs = parseDuration(timeoutValue, `platformaticAdapter ${timeoutOption}`)
+  if (transactionTimeoutMs < 1) throw new ConfigError(`platformaticAdapter: ${timeoutOption}, the transaction timeout, must be positive`)
+  // An idempotent producer with fewer than two retries (or `true`, or none
+  // at all) is one the client retries forever: a produce on a partition that
+  // is gone would never return. What counts is what the spread hands it.
+  const producerRetries = { retries: DEFAULT_PRODUCER_RETRIES, ...options.global, ...options.producer }.retries
+  if (producerRetries === undefined || producerRetries === true || (typeof producerRetries === 'number' && producerRetries < 2)) {
+    throw new ConfigError(`platformaticAdapter: producer retries of ${String(producerRetries)} make the client retry forever (the producer is idempotent); use 2 or more, or false for none`)
+  }
+  /**
+   * The open connection. `closed` aborts when it is released, so work still
+   * reopening a producer on it gives up; `fenced` is set once another
+   * producer took the transactional id, and refuses every transaction from
+   * then on.
+   */
+  let state: { module: PlatformaticClientModule, config: BrokerConfig, producer: ClientProducer, transactional: ClientProducer | undefined, admin: Admin, closed: AbortController, fenced: boolean } | undefined
+  let connecting: Promise<void> | undefined
+  /** Aborts when the adapter disconnects while a connection is being opened. */
+  let opening: AbortController | undefined
   const consumptions = new Set<Consumption>()
   /** The consumption behind each handle, which a transaction needs to commit its offsets. */
   const consumptionsByHandle = new WeakMap<ConsumerHandle, Consumption>()
@@ -660,12 +736,35 @@ export function platformaticAdapter (options: PlatformaticAdapterOptions = {}): 
   const loadClient = async (): Promise<PlatformaticClientModule> => {
     try {
       if (typeof options.client === 'function') return await options.client()
-      if (options.client !== undefined) return options.client
-      return await import('@platformatic/kafka') as unknown as PlatformaticClientModule
+      return options.client ?? await loadInstalledClient()
     } catch (cause) {
       throw new AdapterError('@platformatic/kafka could not be loaded; add it as a dependency to use platformaticAdapter()', { cause, retryable: false })
     }
   }
+
+  /**
+   * The transactional producer; its request timeout is what the broker
+   * gives a transaction. It introduces itself as a new producer for its id
+   * (-1, -1): the broker then fences whoever held the id before (this
+   * process before a restart, or a producer this adapter gave up on), aborts
+   * what that one left open, and bumps the epoch. The client's default
+   * (0, 0) is answered as fenced instead. Introducing itself with the
+   * identity of a producer given up on would not help tell a timeout from a
+   * fence: the broker refuses that identity after either.
+   */
+  const openTransactional = (module: PlatformaticClientModule, config: BrokerConfig, transactionalId: string): ClientProducer =>
+    new module.Producer({
+      ...baseOptions(config),
+      retries: DEFAULT_PRODUCER_RETRIES,
+      ...options.global,
+      ...options.producer,
+      timeout: transactionTimeoutMs,
+      acks: -1,
+      idempotent: true,
+      transactionalId,
+      producerId: -1n,
+      producerEpoch: -1
+    })
 
   const requireConnected = (): NonNullable<typeof state> => {
     if (state === undefined) throw new AdapterError('platformatic adapter is not connected', { retryable: false })
@@ -700,52 +799,71 @@ export function platformaticAdapter (options: PlatformaticAdapterOptions = {}): 
     return result
   }
 
+  /** Opens the clients of a connection; `connect` runs one at a time. */
+  const open = async (config: BrokerConfig): Promise<void> => {
+    const connection = new AbortController()
+    opening = connection
+    const module = await loadClient()
+    if (connection.signal.aborted) throw new AdapterError('platformatic adapter disconnected while connecting', { retryable: false })
+    const base = baseOptions(config)
+    const producer = new module.Producer({
+      ...base,
+      retries: DEFAULT_PRODUCER_RETRIES,
+      ...options.global,
+      ...options.producer,
+      // Never lose or duplicate by default: every produce waits for all
+      // in-sync replicas, and the idempotent producer de-duplicates the
+      // client's own retries.
+      acks: -1,
+      idempotent: true
+    })
+
+    // Transactions need a producer of their own: a transactional producer
+    // holds one open transaction and every send on it is part of it.
+    const transactional = config.transactionalId === undefined ? undefined : openTransactional(module, config, config.transactionalId)
+    const admin = new module.Admin({ ...base, ...options.global, ...options.admin })
+
+    try {
+      // The client connects on first use; asking for the brokers now makes
+      // a wrong address or a refused credential fail here, not on the first
+      // produce.
+      await admin.connectToBrokers()
+      await producer.connectToBrokers()
+      await transactional?.connectToBrokers()
+    } catch (error) {
+      await Promise.allSettled([producer.close(), transactional?.close(), admin.close()])
+      throw wrap(error, 'connect failed')
+    }
+    // Released while it was being opened: nobody would close the clients.
+    if (connection.signal.aborted) {
+      await Promise.allSettled([producer.close(), transactional?.close(), admin.close()])
+      throw new AdapterError('platformatic adapter disconnected while connecting', { retryable: false })
+    }
+
+    state = { module, config, producer, transactional, admin, closed: connection, fenced: false }
+  }
+
   const adapter: ClientAdapter = {
     name: 'platformatic',
 
     async connect (config: BrokerConfig) {
       if (state !== undefined) return
-      const module = await loadClient()
-      const base = baseOptions(config)
-      const producer = new module.Producer({
-        ...base,
-        retries: DEFAULT_PRODUCER_RETRIES,
-        ...options.global,
-        ...options.producer,
-        // Never lose or duplicate by default: every produce waits for all
-        // in-sync replicas, and the idempotent producer de-duplicates the
-        // client's own retries.
-        acks: -1,
-        idempotent: true
+      connecting ??= open(config).finally(() => {
+        connecting = undefined
+        opening = undefined
       })
-
-      // Transactions need a producer of their own: a transactional producer
-      // holds one open transaction and every send on it is part of it.
-      const transactional = config.transactionalId === undefined
-        ? undefined
-        : new module.Producer({ ...base, retries: DEFAULT_PRODUCER_RETRIES, timeout: DEFAULT_TRANSACTION_TIMEOUT_MS, ...options.global, ...options.producer, acks: -1, idempotent: true, transactionalId: config.transactionalId })
-      const admin = new module.Admin({ ...base, ...options.global, ...options.admin })
-
-      try {
-        // The client connects on first use; asking for the brokers now makes
-        // a wrong address or a refused credential fail here, not on the first
-        // produce.
-        await admin.connectToBrokers()
-        await producer.connectToBrokers()
-        await transactional?.connectToBrokers()
-      } catch (error) {
-        await Promise.allSettled([producer.close(), transactional?.close(), admin.close()])
-        throw wrap(error, 'connect failed')
-      }
-
-      state = { module, config, producer, transactional, admin }
+      await connecting
     },
 
     async disconnect () {
+      opening?.abort()
       const pending: Array<Promise<unknown>> = []
       for (const consumption of consumptions) pending.push(consumption.stop())
       consumptions.clear()
-      if (state !== undefined) pending.push(state.producer.close(), state.admin.close(), ...(state.transactional === undefined ? [] : [state.transactional.close()]))
+      if (state !== undefined) {
+        state.closed.abort()
+        pending.push(state.producer.close(), state.admin.close(), ...(state.transactional === undefined ? [] : [state.transactional.close()]))
+      }
       state = undefined
       const results = await Promise.allSettled(pending)
       const failed = results.find((result): result is PromiseRejectedResult => result.status === 'rejected')
@@ -764,20 +882,82 @@ export function platformaticAdapter (options: PlatformaticAdapterOptions = {}): 
     },
 
     async transaction (): Promise<TransactionHandle> {
-      const { transactional } = requireConnected()
-      if (transactional === undefined) throw new ConfigError('platformaticAdapter: transactions need transactionalId on the harbor configuration')
+      const current = requireConnected()
+      const { module, config } = current
+      const transactionalId = config.transactionalId
+      if (transactionalId === undefined) throw new ConfigError('platformaticAdapter: transactions need transactionalId on the harbor configuration')
+      const deadline = Date.now() + adminTimeout
+      let transactional: ClientProducer
       let tx: Awaited<ReturnType<ClientProducer['beginTransaction']>>
-      try {
-        tx = await transactional.beginTransaction()
-      } catch (error) {
-        throw wrap(error, 'transaction begin failed')
+      for (;;) {
+        // Another producer took the id: opening one again would fence it
+        // back, the zombie fencing the live one.
+        if (current.fenced) throw new FencedError(transactionalId)
+        // A producer given up on (an abort that failed, a transaction the
+        // broker aborted) is opened again here, and its initialization
+        // fences and aborts the old one.
+        const reopened = current.transactional ?? openTransactional(module, config, transactionalId)
+        current.transactional = reopened
+        transactional = reopened
+        try {
+          tx = await transactional.beginTransaction()
+          break
+        } catch (error) {
+          // The client keeps a begin it could not finish as its active
+          // transaction: this producer is done either way.
+          if (current.transactional === transactional) current.transactional = undefined
+          await transactional.close().catch(() => undefined)
+          // Refused at begin: another producer holds the id now.
+          if (isFenced(error)) {
+            current.fenced = true
+            throw new FencedError(transactionalId, { cause: error })
+          }
+          const failure = wrap(error, 'transaction begin failed')
+          // The coordinator of a fresh cluster creating its log, say: tried
+          // again on a new producer until adminTimeoutMs.
+          if (!failure.retryable || Date.now() >= deadline || current.closed.signal.aborted) throw failure
+          await pause(TRANSACTION_RETRY_DELAY_MS, current.closed.signal)
+          if (current.closed.signal.aborted) throw new AdapterError('platformatic adapter is not connected', { retryable: false })
+        }
+      }
+      // A monotonic clock: a wall clock stepped by NTP would move a fence
+      // across the timeout.
+      const began = performance.now()
+      let dropped = false
+      /**
+       * Gives the producer up: the next transaction opens a new one, whose
+       * initialization aborts what the broker may still hold open under
+       * this epoch.
+       */
+      const drop = async (): Promise<void> => {
+        dropped = true
+        if (current.transactional === transactional) current.transactional = undefined
+        await transactional.close().catch(() => undefined)
+      }
+      /**
+       * What a failed step of the transaction throws. A newer epoch on the
+       * id is either another producer that took it, or the broker aborting
+       * this transaction once `transactionTimeout` elapsed, which the broker
+       * answers the same way: before the timeout it can only be the first.
+       */
+      const failed = async (error: unknown, what: string): Promise<Error> => {
+        if (!isFenced(error)) return wrap(error, what)
+        // Measured before the producer closes, which may wait on requests
+        // in flight: a fence must not age into a timeout while it does.
+        const elapsed = performance.now() - began
+        await drop()
+        if (elapsed < transactionTimeoutMs) {
+          current.fenced = true
+          return new FencedError(transactionalId, { cause: error })
+        }
+        return new AdapterError(`${what}: the broker aborted the transaction (open past transactionTimeout, or the id was taken): ${describeError(error)}`, { cause: error, retryable: true })
       }
       return {
         async produce (records) {
           try {
             await tx.send({ messages: records.map(toClientMessage) })
           } catch (error) {
-            throw wrap(error, 'produce failed')
+            throw await failed(error, 'produce failed')
           }
         },
         async sendOffsets (consumption, offsets) {
@@ -798,25 +978,30 @@ export function platformaticAdapter (options: PlatformaticAdapterOptions = {}): 
               } as unknown as ClientMessage)
             }
           } catch (error) {
-            throw wrap(error, 'sendOffsets failed')
+            throw await failed(error, 'sendOffsets failed')
           }
         },
         async commit () {
           try {
             await tx.commit()
           } catch (error) {
-            throw wrap(error, 'transaction commit failed')
+            throw await failed(error, 'transaction commit failed')
           }
         },
         async abort () {
+          // Given up on already: the next producer's initialization aborts
+          // what the broker still holds.
+          if (dropped) return
           try {
             await tx.abort()
           } catch (error) {
-            // The client keeps the transaction as the producer's active one
-            // after a failed abort and would refuse every transaction from
-            // then on; cancelling forgets it on the client's side.
-            if (!tx.completed) await tx.cancel().catch(() => undefined)
-            throw wrap(error, 'transaction abort failed')
+            // The broker may still hold the transaction open under this
+            // producer's epoch: forgetting it on the client's side alone
+            // would let the next transaction append to it, and its commit
+            // make what was aborted visible.
+            const failure = await failed(error, 'transaction abort failed')
+            if (!dropped) await drop()
+            throw failure
           }
         }
       }
@@ -824,10 +1009,16 @@ export function platformaticAdapter (options: PlatformaticAdapterOptions = {}): 
 
     async consume (consumeOptions: ConsumeOptions): Promise<ConsumerHandle> {
       const { module, config } = requireConnected()
+      const partitionAssigner = options.consumer?.partitionAssigner ?? partitionAssignerBySubscription
       const consumer = new module.Consumer({
         ...baseOptions(config),
         ...options.global,
         ...options.consumer,
+        // On the consumer as well as on the stream: a rejoin the client
+        // starts on its own (a commit refused during a rebalance) reads the
+        // consumer's options, and would otherwise assign round-robin over
+        // every member whatever each subscribed to.
+        partitionAssigner,
         groupId: consumeOptions.groupId,
         // The core commits after the handler finished; the client must
         // never commit on its own.
@@ -837,7 +1028,7 @@ export function platformaticAdapter (options: PlatformaticAdapterOptions = {}): 
         topics: [...consumeOptions.topics],
         autocommit: false,
         // The join happens on the first consume, with these options.
-        partitionAssigner: options.consumer?.partitionAssigner ?? partitionAssignerBySubscription,
+        partitionAssigner,
         // Start where the group committed; a group that never did starts
         // where fromBeginning says.
         mode: 'committed',
@@ -876,7 +1067,8 @@ export function platformaticAdapter (options: PlatformaticAdapterOptions = {}): 
         for (const spec of specs) {
           try {
             await admin.createTopics({
-              topics: [{ topic: spec.topic, partitions: spec.partitions ?? 1, replicas: spec.replicationFactor ?? 1 }],
+              // Left out, the client asks for the broker's defaults (-1).
+              topics: [{ topic: spec.topic, partitions: spec.partitions, replicas: spec.replicationFactor }],
               ...(spec.config !== undefined && { configs: Object.entries(spec.config).map(([name, value]) => ({ name, value })) })
             })
           } catch (error) {

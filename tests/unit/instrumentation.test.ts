@@ -113,6 +113,7 @@ describe('instrumentation hooks in the pipelines', () => {
         calls.push(`record ${record.topic} corr=${record.headers['x-correlation-id']}`)
         return { traceparent: '00-abc-def-01' }
       },
+      propagationFields: () => ['traceparent'],
       async wrapHandler (message, context, run) {
         calls.push(`handle ${message.topic}@${message.offset} group=${context.groupId} attempt=${context.attempt} traceparent=${message.headers.traceparent}`)
         return await run()
@@ -155,7 +156,7 @@ describe('instrumentation hooks in the pipelines', () => {
     await h.harbor.shutdown()
   })
 
-  test('the trace context travels through the retry ladder, the DLQ and the redrive untouched; every hop is a batch with its origin', async () => {
+  test('the application\'s trace context wins on its own send; a hop carries the one the hook gives for its propagation fields; every hop is a batch with its origin', async () => {
     const { instrumentation, calls } = tracing()
     const h = harness({ instrumentation })
     const consumer = h.harbor.consumer({ groupId: 'g', fromBeginning: true, autoCreateTopics: true, retry: { levels: [{ delay: 0 }] } })
@@ -166,9 +167,11 @@ describe('instrumentation hooks in the pipelines', () => {
     await h.adapter.whenDrained('g', 'orders-retry-1')
     await consumer.stop()
     await h.harbor.redrive({ from: 'orders-dlq', idleTimeout: 0 })
-    // The header the record carries wins over the hook's, on the first send and on every hop.
-    for (const topic of ['orders', 'orders-retry-1', 'orders-dlq']) assert.equal(h.adapter.messages(topic)[0]?.headers.traceparent, '00-original-01', topic)
-    assert.equal(h.adapter.messages('orders')[1]?.headers.traceparent, '00-original-01', 'redriven')
+    // On the application's send the header it set wins; a hop copies the forwarded message's headers, and there the hook's win.
+    assert.equal(h.adapter.messages('orders')[0]?.headers.traceparent, '00-original-01')
+    for (const topic of ['orders-retry-1', 'orders-dlq']) assert.equal(h.adapter.messages(topic)[0]?.headers.traceparent, '00-abc-def-01', topic)
+    assert.equal(h.adapter.messages('orders')[1]?.headers.traceparent, '00-abc-def-01', 'redriven')
+    assert.equal(h.adapter.messages('orders-dlq')[0]?.headers['x-original-topic'], 'orders', 'the rest of the copied headers stays')
     assert.deepEqual(calls.filter((call) => call.startsWith('produce')), [
       'produce orders x1 send',
       'produce orders-retry-1 x1 retry from orders@0',
@@ -224,6 +227,85 @@ describe('instrumentation hooks in the pipelines', () => {
     await h.adapter.whenDrained('g', 'orders-retry-1')
     assert.equal(h.adapter.messages('orders-dlq').length, 0)
     assert.equal(h.adapter.committed('g', 'orders-retry-1', 0), '1')
+    await h.harbor.shutdown()
+  })
+
+  test('on a hop a hook replaces only the propagation fields it declares: the copied tracking, correlation and application headers stay, and a stale field goes', async () => {
+    const consumed = async (instrumentation: Instrumentation): Promise<Record<string, unknown>> => {
+      const h = harness({ instrumentation })
+      const consumer = h.harbor.consumer({ groupId: 'g', fromBeginning: true, autoCreateTopics: true, retry: { levels: [{ delay: 0 }] } })
+      consumer.subscribe('orders', () => { throw new Error('always') })
+      await consumer.start()
+      await h.harbor.producer().send('orders', { value: 1, headers: { 'x-tenant': 'acme', traceparent: 'mine', tracestate: 'stale' } })
+      await until(() => h.adapter.messages('orders-dlq').length === 1)
+      const forwarded = { ...h.adapter.messages('orders-retry-1')[0]?.headers }
+      await h.harbor.shutdown()
+      return forwarded
+    }
+    const greedy = (): MessageHeaders => ({ 'x-tenant': 'none', 'x-correlation-id': 'hook', 'x-retry-count': '0', traceparent: 'hop' })
+    const declared = await consumed({ onProduce: greedy, propagationFields: () => ['traceparent', 'tracestate'] })
+    assert.equal(declared.traceparent, 'hop')
+    assert.equal(declared.tracestate, undefined, 'a field the hook did not write is not copied over either')
+    assert.equal(declared['x-tenant'], 'acme')
+    assert.equal(declared['x-correlation-id'], 'corr-fixed')
+    assert.equal(declared['x-retry-count'], '1')
+    // Without declared fields the hop keeps every header it copied.
+    const undeclared = await consumed({ onProduce: greedy })
+    assert.equal(undeclared.traceparent, 'mine')
+    assert.equal(undeclared.tracestate, 'stale')
+    assert.equal(undeclared['x-retry-count'], '1')
+  })
+
+  test('what a hook returns that is not text is left out of the headers', async () => {
+    const h = harness({ instrumentation: { onProduce: () => ({ 'x-request-id': undefined as unknown as string, 'x-count': 5 as unknown as string, traceparent: 'ok' }) } })
+    await h.harbor.producer().send('orders', { value: 1 })
+    const headers = h.adapter.messages('orders')[0]?.headers ?? {}
+    assert.equal('x-request-id' in headers, false)
+    assert.equal('x-count' in headers, false)
+    assert.equal(headers.traceparent, 'ok')
+    await h.harbor.shutdown()
+  })
+
+  test('a propagationFields hook that throws, or returns no list, is logged and the hop keeps what it copied', async () => {
+    const hooks = [() => { throw new Error('fields down') }, () => 5 as unknown as readonly string[]]
+    for (const propagationFields of hooks) {
+      const h = harness({ instrumentation: { onProduce: () => ({ traceparent: 'hop' }), propagationFields } })
+      const consumer = h.harbor.consumer({ groupId: 'g', fromBeginning: true, autoCreateTopics: true, retry: { levels: [{ delay: 0 }] } })
+      consumer.subscribe('orders', () => { throw new Error('always') })
+      await consumer.start()
+      await h.harbor.producer().send('orders', { value: 1, headers: { traceparent: 'mine' } })
+      await until(() => h.adapter.messages('orders-retry-1').length === 1)
+      assert.equal(h.adapter.messages('orders-retry-1')[0]?.headers.traceparent, 'mine')
+      assert.ok(h.logs.some((entry) => entry.level === 'error'))
+      await h.harbor.shutdown()
+    }
+  })
+
+  test('a hop without instrumentation, or with one that declares no fields, logs nothing', async () => {
+    for (const instrumentation of [undefined, { onProduce: () => ({ traceparent: 'hop' }) }]) {
+      const h = harness(instrumentation === undefined ? {} : { instrumentation })
+      const consumer = h.harbor.consumer({ groupId: 'g', fromBeginning: true, autoCreateTopics: true, retry: { levels: [{ delay: 0 }] } })
+      consumer.subscribe('orders', () => { throw new Error('always') })
+      await consumer.start()
+      await h.harbor.producer().send('orders', { value: 1 })
+      await until(() => h.adapter.messages('orders-retry-1').length === 1)
+      assert.deepEqual(h.logs.filter((entry) => entry.level === 'error'), [])
+      await h.harbor.shutdown()
+    }
+  })
+
+  test('the harbor\'s own tracking headers stay the hop\'s, whatever propagationFields declares', async () => {
+    const h = harness({ instrumentation: { onProduce: () => ({ traceparent: 'hop', 'x-correlation-id': 'hook', 'x-retry-count': '0' }), propagationFields: () => ['traceparent', 'x-correlation-id', 'x-retry-count'] } })
+    const consumer = h.harbor.consumer({ groupId: 'g', fromBeginning: true, autoCreateTopics: true, retry: { levels: [{ delay: 0 }] } })
+    consumer.subscribe('orders', () => { throw new Error('always') })
+    await consumer.start()
+    await h.harbor.producer().send('orders', { value: 1, headers: { traceparent: 'mine' } })
+    await until(() => h.adapter.messages('orders-retry-1').length === 1)
+    const headers = h.adapter.messages('orders-retry-1')[0]?.headers ?? {}
+    assert.equal(headers.traceparent, 'hop')
+    assert.equal(headers['x-retry-count'], '1')
+    assert.notEqual(headers['x-correlation-id'], 'hook')
+    assert.equal(headers['x-correlation-id'], h.adapter.messages('orders')[0]?.headers['x-correlation-id'])
     await h.harbor.shutdown()
   })
 })

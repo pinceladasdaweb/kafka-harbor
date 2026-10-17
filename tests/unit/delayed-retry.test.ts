@@ -1,8 +1,8 @@
 import assert from 'node:assert/strict'
 import { describe, test } from 'node:test'
 
-import { ERROR_CODES } from '../../src/index'
-import { captureEvents, harness, withoutPause } from '../helpers/harness'
+import { ERROR_CODES, type ConsumeOptions } from '../../src/index'
+import { captureEvents, gate, harness, tapConsumption, withoutPause, type Harness } from '../helpers/harness'
 import { settle, until } from '../helpers/manual-clock'
 
 describe('retry delays with a partition that pauses', () => {
@@ -286,6 +286,177 @@ describe('retry delays with a partition that pauses', () => {
     await until(() => batches.filter((event) => event.topic === 'orders-retry-1' && event.outcome === 'processed').length === 1)
     assert.deepEqual(seen, [[1, 2]])
     assert.equal(h.adapter.committed('g', 'orders-retry-1', 0), '2')
+    await h.harbor.shutdown()
+  })
+
+  test('a stop while a delivery waits behind a parked message, or sleeps out its delay without pause, leaves it uncommitted', async () => {
+    // Through a pause that does nothing, the second retry message waits on the first one's wait; the stop ends both.
+    const leaky = harness()
+    const leakyOriginal = leaky.adapter.consume
+    leaky.adapter.consume = async (options) => ({ ...(await leakyOriginal(options)), pause: () => {} })
+    const retried: unknown[] = []
+    const leakyConsumer = leaky.harbor.consumer({ groupId: 'g', fromBeginning: true, autoCreateTopics: true, retry: { levels: [{ delay: '2s' }] } })
+    leakyConsumer.subscribe('orders', (message) => {
+      if (message.topic === 'orders') throw new Error('first time')
+      retried.push(message.value)
+    })
+    await leakyConsumer.start()
+    await leaky.harbor.producer().sendBatch('orders', [{ value: 'a' }, { value: 'b' }])
+    await until(() => leaky.logs.some((entry) => entry.level === 'warn' && entry.message.includes('delivered orders-retry-1[0]@1 on a paused partition')))
+    await leaky.harbor.shutdown()
+    assert.deepEqual(retried, [])
+    assert.equal(leaky.adapter.committed('g', 'orders-retry-1', 0), undefined)
+    assert.equal(leaky.adapter.messages('orders-retry-1').length, 2, 'both are left for the next member')
+    assert.equal(leaky.clock.waiting, 0)
+
+    // Without pause/resume the delivery sleeps; the stop wakes it and it goes without running the handler.
+    const plain = harness()
+    withoutPause(plain)
+    let attempts = 0
+    const consumer = plain.harbor.consumer({ groupId: 'g', fromBeginning: true, autoCreateTopics: true, retry: { levels: [{ delay: '30s' }] } })
+    consumer.subscribe('orders', () => { attempts++; throw new Error('always') })
+    await consumer.start()
+    await plain.harbor.producer().send('orders', { value: 1 })
+    await until(() => plain.clock.waiting === 1)
+    await plain.harbor.shutdown()
+    assert.equal(attempts, 1, 'the retry never ran')
+    assert.equal(plain.adapter.committed('g', 'orders-retry-1', 0), undefined)
+    assert.equal(plain.adapter.messages('orders-dlq').length, 0)
+    assert.equal(plain.clock.waiting, 0)
+  })
+})
+
+type Revoke = NonNullable<ConsumeOptions['onPartitionsRevoked']>
+
+/** The revocation callback the core handed to the adapter for the consumption of `topic`. */
+const revocationOf = (h: Harness, topic: string): () => Revoke => {
+  const tap = tapConsumption(h, topic)
+  return () => tap().onPartitionsRevoked as Revoke
+}
+
+describe('retry delays and revocations', () => {
+  test('without pause/resume, a message waiting out its delay in the delivery is left to the next owner when its partition is revoked', async () => {
+    const h = harness()
+    withoutPause(h)
+    const revoke = revocationOf(h, 'orders-retry-1')
+    let attempts = 0
+    const consumer = h.harbor.consumer({ groupId: 'g', fromBeginning: true, autoCreateTopics: true, retry: { levels: [{ delay: '30s' }] } })
+    consumer.subscribe('orders', () => { attempts++; throw new Error('always') })
+    await consumer.start()
+    await h.harbor.producer().send('orders', { value: 1 })
+    await until(() => h.clock.waiting === 1)
+    await revoke()([{ topic: 'orders-retry-1', partition: 0 }])
+    h.clock.advance(30_000)
+    await settle()
+    assert.equal(attempts, 1, 'the retry never ran here')
+    assert.equal(h.adapter.committed('g', 'orders-retry-1', 0), undefined)
+    assert.equal(h.adapter.messages('orders-dlq').length, 0)
+    await h.harbor.shutdown()
+  })
+
+  test('a delivery waiting behind a parked message is left to the next owner when the revocation discards the parked one', async () => {
+    const h = harness()
+    const leakyOriginal = h.adapter.consume
+    h.adapter.consume = async (options) => ({ ...(await leakyOriginal(options)), pause: () => {} })
+    const revoke = revocationOf(h, 'orders-retry-1')
+    const seen: unknown[] = []
+    const consumer = h.harbor.consumer({ groupId: 'g', fromBeginning: true, autoCreateTopics: true, retry: { levels: [{ delay: '2s' }] } })
+    consumer.subscribe('orders', (message) => {
+      if (message.topic === 'orders') throw new Error('first time')
+      seen.push(message.value)
+    })
+    await consumer.start()
+    await h.harbor.producer().sendBatch('orders', [{ value: 'a' }, { value: 'b' }])
+    await until(() => h.logs.some((entry) => entry.level === 'warn' && entry.message.includes('delivered orders-retry-1[0]@1 on a paused partition')))
+    await revoke()([{ topic: 'orders-retry-1', partition: 0 }])
+    await settle()
+    assert.equal(h.clock.waiting, 0, 'neither waits anymore')
+    h.clock.advance(2_000)
+    await settle()
+    assert.deepEqual(seen, [])
+    assert.equal(h.adapter.committed('g', 'orders-retry-1', 0), undefined)
+    await h.harbor.shutdown()
+  })
+
+  test('a parked message that came due but waits for a slot is still discarded by a revocation, and its partition resumed', async () => {
+    const h = harness({}, { partitions: 3 })
+    const revoke = revocationOf(h, 'orders-retry-1')
+    const processed = captureEvents(h.harbor, 'messageProcessed')
+    const held = gate()
+    let first: number | undefined
+    const consumer = h.harbor.consumer({ groupId: 'g', fromBeginning: true, autoCreateTopics: true, concurrency: 1, retry: { levels: [{ delay: '5s' }] }, topicDefaults: { partitions: 3 } })
+    consumer.subscribe('orders', async (message) => {
+      if (message.topic === 'orders') throw new Error('first time')
+      first ??= message.partition
+      if (message.partition === first) await held.wait
+    })
+    await consumer.start()
+    await h.harbor.producer().sendBatch('orders', [0, 1, 2].map((partition) => ({ value: partition, partition })))
+    await until(() => h.adapter.paused('g').length === 3)
+    h.clock.advance(5_000)
+    await until(() => first !== undefined)
+    await settle()
+    // One runs; two wait for its slot. One of those is revoked; the other still runs after.
+    const [other, kept] = h.adapter.paused('g').map((entry) => entry.partition).filter((partition) => partition !== first) as [number, number]
+    await revoke()([{ topic: 'orders-retry-1', partition: other }])
+    assert.deepEqual(h.adapter.paused('g').map((entry) => entry.partition).sort(), [first, kept].sort(), 'the discarded one resumed before its release')
+    held.release()
+    await until(() => processed.length === 2)
+    await settle()
+    assert.deepEqual(processed.map((event) => event.partition).sort(), [first, kept].sort())
+    assert.equal(h.adapter.committed('g', 'orders-retry-1', other), undefined)
+    assert.deepEqual(h.adapter.paused('g'), [])
+    await h.harbor.shutdown()
+  })
+
+  test('a parked message woken for a freed slot and discarded before it takes it passes the slot on to the next in line', async () => {
+    const h = harness({}, { partitions: 3 })
+    const processed = captureEvents(h.harbor, 'messageProcessed')
+    const paused: number[] = []
+    let revokeOnResume: number | undefined
+    const original = h.adapter.consume
+    h.adapter.consume = async (options) => {
+      const handle = await original(options)
+      if (!options.topics.includes('orders-retry-1')) return handle
+      return {
+        ...handle,
+        pause: (partitions) => {
+          paused.push(...partitions.map((entry) => entry.partition))
+          handle.pause?.(partitions)
+        },
+        resume: (partitions) => {
+          handle.resume?.(partitions)
+          // Called right after the running message freed its slot and woke the next in line: that one is revoked before it takes the slot.
+          if (revokeOnResume === undefined) return
+          const partition = revokeOnResume
+          revokeOnResume = undefined
+          options.onPartitionsRevoked?.([{ topic: 'orders-retry-1', partition }]).catch(() => {})
+        }
+      }
+    }
+    const held = gate()
+    let first: number | undefined
+    const consumer = h.harbor.consumer({ groupId: 'g', fromBeginning: true, autoCreateTopics: true, concurrency: 1, retry: { levels: [{ delay: '5s' }] }, topicDefaults: { partitions: 3 } })
+    consumer.subscribe('orders', async (message) => {
+      if (message.topic === 'orders') throw new Error('first time')
+      first ??= message.partition
+      if (message.partition === first) await held.wait
+    })
+    await consumer.start()
+    await h.harbor.producer().sendBatch('orders', [0, 1, 2].map((partition) => ({ value: partition, partition })))
+    await until(() => paused.length === 3)
+    h.clock.advance(5_000)
+    await until(() => first !== undefined)
+    await settle()
+    // Parked messages take the slot in the order they parked: the first runs, the second is next in line, the third behind it.
+    const [running, inLine, behind] = paused as [number, number, number]
+    assert.equal(running, first)
+    revokeOnResume = inLine
+    held.release()
+    await until(() => processed.length === 2)
+    assert.deepEqual(processed.map((event) => event.partition), [running, behind])
+    assert.equal(h.adapter.committed('g', 'orders-retry-1', inLine), undefined)
+    assert.deepEqual(h.adapter.paused('g'), [])
     await h.harbor.shutdown()
   })
 })

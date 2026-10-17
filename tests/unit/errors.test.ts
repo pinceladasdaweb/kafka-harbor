@@ -18,7 +18,12 @@ import {
   isHarborError,
   isSerializationError,
   isShutdownTimeoutError,
-  isTopicMissingError
+  isTopicMissingError,
+  isAdapterError,
+  isClosedError,
+  isConfigError,
+  isFencedError,
+  FencedError
 } from '../../src/index'
 
 describe('error classes', () => {
@@ -52,13 +57,24 @@ describe('error classes', () => {
 })
 
 describe('type guards', () => {
-  test('match by code only, on any object shape', () => {
-    assert.equal(isAbortProcessingError({ code: 'ABORT_PROCESSING' }), true)
-    assert.equal(isSerializationError({ code: 'SERIALIZATION' }), true)
+  test('match by shape, not class: a code of the table and a boolean retryable, from any copy of the package', () => {
+    assert.equal(isAbortProcessingError({ code: 'ABORT_PROCESSING', retryable: false }), true)
+    assert.equal(isSerializationError({ code: 'SERIALIZATION', retryable: false }), true)
+    // A code alone is someone else's error that happens to use the same word.
+    assert.equal(isSerializationError({ code: 'SERIALIZATION' }), false)
+    assert.equal(isConfigError(new ConfigError('x')), true)
+    assert.equal(isAdapterError(new AdapterError('x')), true)
+    assert.equal(isClosedError(new ClosedError('harbor')), true)
+    assert.equal(isClosedError(new ConfigError('x')), false)
+    assert.equal(new AbortProcessingError('stop').retryable, false, 'never retried: it stops the consumer')
     assert.equal(isTopicMissingError(new TopicMissingError('t')), true)
     assert.equal(isShutdownTimeoutError(new ShutdownTimeoutError(1, 1)), true)
     assert.equal(isTopicMissingError(new ShutdownTimeoutError(1, 1)), false)
     assert.equal(isShutdownTimeoutError({ code: 'TOPIC_MISSING' }), false)
+    const fenced = new FencedError('orders-1', { cause: new Error('epoch') })
+    assert.deepEqual([isFencedError(fenced), fenced.code, fenced.retryable, fenced.transactionalId, fenced.name], [true, 'FENCED', false, 'orders-1', 'FencedError'])
+    assert.match(fenced.message, /transactional id "orders-1" is held by another producer/)
+    assert.equal(isFencedError(new ConfigError('x')), false)
   })
 
   test('reject null, primitives and objects with a foreign or non-string code', () => {
@@ -67,15 +83,17 @@ describe('type guards', () => {
       assert.equal(isAbortProcessingError(value), false)
       assert.equal(isSerializationError(value), false)
     }
-    assert.equal(isHarborError({ code: 'CLOSED' }), true)
+    assert.equal(isHarborError({ code: 'CLOSED', retryable: false }), true)
+    assert.equal(isHarborError({ code: 'CLOSED' }), false)
+    assert.equal(isHarborError({ code: 'CLOSED', retryable: 'no' }), false)
   })
 })
 
 describe('shape guards', () => {
   test('isBatchFailedError needs both the code and the list of failed messages', () => {
-    assert.equal(isBatchFailedError({ code: 'BATCH_FAILED' }), false)
+    assert.equal(isBatchFailedError({ code: 'BATCH_FAILED', retryable: true }), false)
     assert.equal(isBatchFailedError({ failed: [] }), false)
-    assert.equal(isBatchFailedError({ code: 'BATCH_FAILED', failed: [] }), true)
+    assert.equal(isBatchFailedError({ code: 'BATCH_FAILED', retryable: true, failed: [] }), true)
   })
 
   test('isDeclaredRetryable is true only for an object that says retryable: true', () => {

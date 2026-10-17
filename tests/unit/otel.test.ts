@@ -117,8 +117,8 @@ describe('kafka-harbor/otel metrics', () => {
     await consumer.start()
     listener?.({ from: 'closed', to: 'open' })
     listener?.({ from: 'open', to: 'closed' })
-    assert.equal(await m.point('kafka_harbor.circuit.state_changes', { 'kafka_harbor.group': 'g', 'kafka_harbor.topic': 'orders', 'kafka_harbor.state': 'open' }), 1)
-    assert.equal(await m.point('kafka_harbor.circuit.state_changes', { 'kafka_harbor.topic': 'orders', 'kafka_harbor.state': 'closed' }), 1)
+    assert.equal(await m.point('kafka_harbor.circuit.state_changes', { 'kafka_harbor.group': 'g', 'kafka_harbor.topic': 'orders', 'kafka_harbor.to': 'open' }), 1)
+    assert.equal(await m.point('kafka_harbor.circuit.state_changes', { 'kafka_harbor.topic': 'orders', 'kafka_harbor.to': 'closed' }), 1)
     const described = (await m.descriptors()).find((d) => d.name === 'kafka_harbor.circuit.state_changes')
     assert.ok(described !== undefined && described.description.length > 20 && described.unit.length > 0)
     await h.harbor.shutdown()
@@ -221,14 +221,20 @@ describe('kafka-harbor/otel metrics', () => {
     assert.equal(produce.value.sum, 0.04)
 
     const custom = metering()
-    otelMetrics(h.harbor, { meterProvider: custom.provider, boundaries: [0.5, 5], lag: false })
+    otelMetrics(h.harbor, { meterProvider: custom.provider, buckets: [0.5, 5], lag: false })
+    // The former name, still read.
+    const legacy = metering()
+    otelMetrics(h.harbor, { meterProvider: legacy.provider, boundaries: [1, 2], lag: false })
     await h.harbor.producer().send('orders', { value: 2 })
     await h.adapter.whenDrained('g', 'orders')
     const shaped = (await custom.points('kafka_harbor.produce.duration'))[0] as unknown as { value: { buckets: { boundaries: number[] } } }
     assert.deepEqual(shaped.value.buckets.boundaries, [0.5, 5])
+    const formerly = (await legacy.points('kafka_harbor.produce.duration'))[0] as unknown as { value: { buckets: { boundaries: number[] } } }
+    assert.deepEqual(formerly.value.buckets.boundaries, [1, 2])
     await h.harbor.shutdown()
     await m.shutdown()
     await custom.shutdown()
+    await legacy.shutdown()
   })
 
   test('a failed message records its duration in seconds; the messages of a failed batch record none of their own', async () => {
@@ -333,7 +339,7 @@ describe('kafka-harbor/otel tracing', () => {
     return { exporter, instrumentation: otelTracing({ tracerProvider: provider, propagator: new W3CTraceContextPropagator() }) }
   }
 
-  test('the consumer span is a child of the producer span, through the headers, across the retry ladder', async () => {
+  test('the consumer span is a child of the producer span through the headers, and a retry attempt the child of the hop that forwarded it', async () => {
     const { exporter, instrumentation } = tracing()
     const h = harness({ instrumentation })
     const consumer = h.harbor.consumer({ groupId: 'g', fromBeginning: true, autoCreateTopics: true, retry: { levels: [{ delay: 0 }] } })
@@ -347,21 +353,24 @@ describe('kafka-harbor/otel tracing', () => {
     const spans = exporter.getFinishedSpans()
     const send = spans.find((span) => span.name === 'orders send')
     const first = spans.find((span) => span.name === 'orders process')
+    const hop = spans.find((span) => span.name === 'orders-retry-1 send')
     const second = spans.find((span) => span.name === 'orders-retry-1 process')
-    assert.ok(send !== undefined && first !== undefined && second !== undefined, `spans: ${spans.map((s) => s.name).join(', ')}`)
+    assert.ok(send !== undefined && first !== undefined && hop !== undefined && second !== undefined, `spans: ${spans.map((s) => s.name).join(', ')}`)
 
     assert.equal(send.kind, SpanKind.PRODUCER)
     assert.equal(send.attributes['messaging.system'], 'kafka')
     assert.equal(send.attributes['messaging.destination.name'], 'orders')
     assert.equal(send.attributes['messaging.operation.name'], 'send')
-    assert.equal(send.attributes['messaging.batch.message_count'], 1)
+    assert.equal(send.attributes['messaging.batch.message_count'], undefined, 'one record is not a batch')
     assert.equal(send.attributes['kafka_harbor.kind'], 'send')
     assert.match(String(h.adapter.messages('orders')[0]?.headers.traceparent), new RegExp(`^00-${send.spanContext().traceId}-${send.spanContext().spanId}-01$`))
 
+    assert.equal(first.parentSpanContext?.spanId, send.spanContext().spanId, 'the first attempt is the child of the send')
+    assert.equal(hop.parentSpanContext?.spanId, first.spanContext().spanId, 'the hop is the child of the attempt that failed')
+    assert.equal(second.parentSpanContext?.spanId, hop.spanContext().spanId, 'the retry is the child of the hop')
     for (const span of [first, second]) {
       assert.equal(span.kind, SpanKind.CONSUMER)
       assert.equal(span.spanContext().traceId, send.spanContext().traceId, 'one trace for the whole ladder')
-      assert.equal(span.parentSpanContext?.spanId, send.spanContext().spanId, 'parented to the producer span')
       assert.equal(span.attributes['messaging.consumer.group.name'], 'g')
       assert.equal(span.attributes['messaging.destination.partition.id'], '0')
       assert.equal(span.attributes['messaging.kafka.offset'], 0)
@@ -376,7 +385,7 @@ describe('kafka-harbor/otel tracing', () => {
     await h.harbor.shutdown()
   })
 
-  test('every hop is a producer span of its own, in the trace of the message it forwards', async () => {
+  test('every hop is a producer span of its own, the child of the attempt that failed, and the record it forwards carries it', async () => {
     const { exporter, instrumentation } = tracing()
     const h = harness({ instrumentation })
     const consumer = h.harbor.consumer({ groupId: 'g', fromBeginning: true, autoCreateTopics: true, retry: { levels: [{ delay: 0 }] } })
@@ -390,25 +399,57 @@ describe('kafka-harbor/otel tracing', () => {
     assert.equal(result.reprocessed, 1)
 
     const spans = exporter.getFinishedSpans()
-    const send = spans.find((span) => span.name === 'orders send' && span.attributes['kafka_harbor.kind'] === 'send')
-    assert.ok(send !== undefined)
-    const hops = [
-      ['orders-retry-1 send', 'retry'],
-      ['orders-dlq send', 'dead-letter'],
-      ['orders send', 'redrive']
-    ] as const
-    for (const [name, kind] of hops) {
-      const hop = spans.find((span) => span.name === name && span.attributes['kafka_harbor.kind'] === kind)
-      assert.ok(hop !== undefined, `${name} (${kind}) among ${spans.map((s) => `${s.name}/${String(s.attributes['kafka_harbor.kind'] ?? '')}`).join(', ')}`)
-      assert.equal(hop.kind, SpanKind.PRODUCER)
-      assert.equal(hop.spanContext().traceId, send.spanContext().traceId, 'the hop stays in the trace of the message')
-      assert.equal(hop.parentSpanContext?.spanId, send.spanContext().spanId, 'parented to the context the message carries')
-      assert.equal(hop.attributes['messaging.batch.message_count'], 1)
+    const named = (name: string, kind?: string) => {
+      const span = spans.find((entry) => entry.name === name && (kind === undefined || entry.attributes['kafka_harbor.kind'] === kind))
+      assert.ok(span !== undefined, `${name} ${kind ?? ''} among ${spans.map((s) => `${s.name}/${String(s.attributes['kafka_harbor.kind'] ?? '')}`).join(', ')}`)
+      return span
     }
-    // The forwarded records keep the trace context they arrived with, not the hop's.
-    const expected = new RegExp(`^00-${send.spanContext().traceId}-${send.spanContext().spanId}-01$`)
-    for (const topic of ['orders-retry-1', 'orders-dlq']) assert.match(String(h.adapter.messages(topic)[0]?.headers.traceparent), expected)
-    assert.match(String(h.adapter.messages('orders')[1]?.headers.traceparent), expected, 'the redriven record too')
+    const send = named('orders send', 'send')
+    const firstAttempt = named('orders process')
+    const retryAttempt = named('orders-retry-1 process')
+    const hops = [
+      { span: named('orders-retry-1 send', 'retry'), parent: firstAttempt, record: h.adapter.messages('orders-retry-1')[0] },
+      { span: named('orders-dlq send', 'dead-letter'), parent: retryAttempt, record: h.adapter.messages('orders-dlq')[0] },
+      { span: named('orders send', 'redrive'), parent: named('orders-dlq send', 'dead-letter'), record: h.adapter.messages('orders')[1] }
+    ]
+    for (const { span, parent, record } of hops) {
+      assert.equal(span.kind, SpanKind.PRODUCER)
+      assert.equal(span.spanContext().traceId, send.spanContext().traceId, 'one chain in the trace of the message')
+      assert.equal(span.parentSpanContext?.spanId, parent.spanContext().spanId, `${span.name} is the child of what forwarded it`)
+      assert.equal(span.attributes['messaging.batch.message_count'], undefined)
+      assert.deepEqual(span.links, [], 'a hop of one message links nothing')
+      assert.match(String(record?.headers.traceparent), new RegExp(`^00-${span.spanContext().traceId}-${span.spanContext().spanId}-01$`), 'the forwarded record carries the hop')
+    }
+    await h.harbor.shutdown()
+  })
+
+  test('a hop of a message handled in a batch stays in the trace that produced the message, linked to the batch run', async () => {
+    const { exporter, instrumentation } = tracing()
+    const h = harness({ instrumentation })
+    const consumer = h.harbor.consumer({ groupId: 'g', fromBeginning: true, autoCreateTopics: true, retry: { levels: [{ delay: 0 }] } })
+    consumer.subscribeBatch('orders', () => { throw new Error('the batch fails') }, { size: 1 })
+    await consumer.start()
+    await h.harbor.producer().send('orders', { value: 1 })
+    await until(() => h.adapter.messages('orders-retry-1').length === 1)
+    await until(() => exporter.getFinishedSpans().some((span) => span.name === 'orders-retry-1 send'))
+    const spans = exporter.getFinishedSpans()
+    const send = spans.find((span) => span.name === 'orders send')
+    const batchRun = spans.find((span) => span.name === 'orders process')
+    const hop = spans.find((span) => span.name === 'orders-retry-1 send')
+    assert.ok(send !== undefined && batchRun !== undefined && hop !== undefined)
+    assert.equal(hop.spanContext().traceId, send.spanContext().traceId, 'in the producer\'s trace, not the batch run\'s')
+    assert.equal(hop.parentSpanContext?.spanId, send.spanContext().spanId)
+    assert.deepEqual(hop.links.map((link) => link.context.spanId), [batchRun.spanContext().spanId])
+    assert.match(String(h.adapter.messages('orders-retry-1')[0]?.headers.traceparent), new RegExp(`^00-${hop.spanContext().traceId}-${hop.spanContext().spanId}-01$`))
+    await h.harbor.shutdown()
+  })
+
+  test('a send of several records carries the batch size; one of a single record does not', async () => {
+    const { exporter, instrumentation } = tracing()
+    const h = harness({ instrumentation })
+    await h.harbor.producer().sendBatch('orders', [{ value: 1 }, { value: 2 }])
+    const [span] = exporter.getFinishedSpans()
+    assert.equal(span?.attributes['messaging.batch.message_count'], 2)
     await h.harbor.shutdown()
   })
 

@@ -9,7 +9,7 @@ describe('consumer.lag() and harbor.lag()', () => {
   test('reports high watermark, committed offset and lag per consumed partition, retry topics included', async () => {
     const h = harness({}, { partitions: 2 })
     const held = gate()
-    const consumer = h.harbor.consumer({ groupId: 'g', fromBeginning: true, autoCreateTopics: true, retry: { levels: [{ delay: 60_000 }] } })
+    const consumer = h.harbor.consumer({ groupId: 'g', fromBeginning: true, autoCreateTopics: true, retry: { levels: [{ delay: 60_000 }] }, topicDefaults: { partitions: 1 } })
     let handled = 0
     consumer.subscribe<number>('orders', async (message) => {
       await held.wait

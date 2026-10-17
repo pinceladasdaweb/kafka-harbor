@@ -10,8 +10,8 @@
  */
 import { randomUUID } from 'node:crypto'
 
-import { confluentAdapter } from '../src/adapters/confluent/index'
-import { createHarbor } from '../src/index'
+import { confluentAdapter } from 'kafka-harbor/adapters/confluent'
+import { createHarbor } from 'kafka-harbor'
 
 interface Order { id: string }
 

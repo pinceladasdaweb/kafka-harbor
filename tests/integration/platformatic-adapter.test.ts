@@ -46,8 +46,8 @@ runAdapterContract('platformatic', async () => {
     throw Object.assign(new Error('Kafka container not available'), { skip: true })
   }
   const adapter = platformaticAdapter(fastGroup)
-  await adapter.connect({ clientId: 'contract-platformatic', brokers: kafka.brokers })
   const run = randomUUID().slice(0, 8)
+  await adapter.connect({ clientId: 'contract-platformatic', brokers: kafka.brokers, transactionalId: `contract-platformatic-${run}` })
   return {
     adapter,
     topic: async (label, partitions = 1) => {

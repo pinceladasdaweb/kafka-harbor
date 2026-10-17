@@ -29,7 +29,12 @@ export async function startKafka (): Promise<KafkaFixture | undefined> {
       // One broker: the transaction coordinator's log cannot be replicated
       // three times, and without it every transactional producer hangs on
       // its first init.
-      .withEnvironment({ KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: '1', KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: '1' })
+      .withEnvironment({
+        KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: '1',
+        KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: '1',
+        // A transaction past its timeout is aborted within a second, not ten.
+        KAFKA_TRANSACTION_ABORT_TIMED_OUT_TRANSACTION_CLEANUP_INTERVAL_MS: '1000'
+      })
       .withWaitStrategy(Wait.forLogMessage(/Kafka Server started/))
       .withStartupTimeout(180_000)
       .start()

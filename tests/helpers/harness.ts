@@ -38,6 +38,21 @@ export function harness (config: Partial<HarborConfig> = {}, adapterOptions: Mem
   return { adapter, clock, harbor, logs }
 }
 
+/**
+ * The options the core hands to the adapter for the consumption of `topic`:
+ * its revocation callback and its entry point, which a test calls as the
+ * client would. Read it once the consumer started.
+ */
+export const tapConsumption = (h: Harness, topic: string): () => ConsumeOptions => {
+  let captured: ConsumeOptions | undefined
+  const original = h.adapter.consume
+  h.adapter.consume = async (options: ConsumeOptions): Promise<ConsumerHandle> => {
+    if (options.topics.includes(topic)) captured = options
+    return await original(options)
+  }
+  return () => captured as ConsumeOptions
+}
+
 /** Strips pause/resume from every consumption the adapter opens: what an adapter without them looks like to the core. */
 export const withoutPause = (h: Harness): void => {
   const original = h.adapter.consume

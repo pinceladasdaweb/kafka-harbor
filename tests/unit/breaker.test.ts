@@ -3,8 +3,9 @@ import { describe, test } from 'node:test'
 
 import { circuitBreaker, type BreakerState, type CircuitBreakerPolicy } from 'breakwater'
 
-import { AbortProcessingError, BatchFailedError, ERROR_CODES, defaultFailureIf, isHoldExpiredError, type HoldExpiredError, type HarborEvents } from '../../src/index'
-import { captureEvents, harness, text, withoutPause } from '../helpers/harness'
+import { AbortProcessingError, BatchFailedError, ERROR_CODES, FencedError, isHoldExpiredError, type ConsumeOptions, type HoldExpiredError, type HarborEvents } from '../../src/index'
+import { defaultFailureIf } from '../../src/breaker'
+import { captureEvents, gate, harness, tapConsumption, text, withoutPause } from '../helpers/harness'
 import { settle, until } from '../helpers/manual-clock'
 
 interface StateChange { from: BreakerState, to: BreakerState }
@@ -197,6 +198,23 @@ describe('consumer circuit breaker', () => {
     assert.equal(batchFailed.length, 0)
   })
 
+  test('a stop during the hold lets the message go even when the circuit closes at the same moment: the handler never runs', async () => {
+    const h = harness()
+    const { policy, setOpen } = fakeBreaker()
+    let ran = 0
+    const consumer = h.harbor.consumer({ groupId: 'g', fromBeginning: true, autoCreateTopics: true, breaker: { policy } })
+    consumer.subscribe('orders', () => { ran++ })
+    await consumer.start()
+    setOpen(true)
+    await h.harbor.producer().send('orders', { value: 'a' })
+    await until(() => h.clock.waiting === 1)
+    setOpen(false)
+    await consumer.stop()
+    assert.equal(ran, 0)
+    assert.equal(h.adapter.committed('g', 'orders', 0), undefined)
+    await h.harbor.shutdown()
+  })
+
   test('a batch handler is guarded the same way: held while open, down the ladder when the hold runs out', async () => {
     const h = harness()
     const { policy, setOpen, executions } = fakeBreaker()
@@ -296,6 +314,7 @@ describe('consumer circuit breaker', () => {
     assert.equal(defaultFailureIf(new Error('transient')), true)
     assert.equal(defaultFailureIf(Object.assign(new Error('deterministic'), { retryable: false })), false)
     assert.equal(defaultFailureIf(new AbortProcessingError(new Error('stop'))), false)
+    assert.equal(defaultFailureIf(new FencedError('tx-1')), false, 'another producer holding the id is no outage')
     assert.equal(defaultFailureIf(new BatchFailedError([], new Error('one straggler'))), false, 'a batch that resolved for the rest reached the dependency')
     assert.equal(defaultFailureIf('a string'), true)
   })
@@ -357,8 +376,39 @@ describe('consumer circuit breaker', () => {
     // The hold notices at its next look, one second at most.
     h.clock.advance(1_000)
     await revoking
+    await settle()
+    assert.equal(h.clock.waiting, 0, 'the hold ended, not left sleeping')
+    // Long past the hold's deadline: the message was let go, never failed.
+    h.clock.advance(600_000)
+    await settle()
     assert.equal(h.adapter.committed('g', 'orders', 0), undefined)
     assert.equal(failed.length, 0)
+    await h.harbor.shutdown()
+  })
+
+  test('a rebalance during the hold lets the message go even when the circuit closes at the same moment: the handler never runs on a partition gone', async () => {
+    const h = harness({}, { partitions: 2 })
+    const { policy, setOpen } = fakeBreaker()
+    let ran = 0
+    let revoke: ((partitions: Array<{ topic: string, partition: number }>) => Promise<void>) | undefined
+    const original = h.adapter.consume
+    h.adapter.consume = async (options) => {
+      revoke = options.onPartitionsRevoked as typeof revoke
+      return await original(options)
+    }
+    const consumer = h.harbor.consumer({ groupId: 'g', fromBeginning: true, autoCreateTopics: true, breaker: { policy } })
+    consumer.subscribe('orders', () => { ran++ })
+    await consumer.start()
+    setOpen(true)
+    await h.harbor.producer().send('orders', { value: 'a', partition: 0 })
+    await until(() => h.clock.waiting === 1)
+    const revoking = (revoke as NonNullable<typeof revoke>)([{ topic: 'orders', partition: 0 }])
+    setOpen(false)
+    h.clock.advance(1_000)
+    await revoking
+    await settle()
+    assert.equal(ran, 0)
+    assert.equal(h.adapter.committed('g', 'orders', 0), undefined)
     await h.harbor.shutdown()
   })
 
@@ -441,5 +491,68 @@ describe('consumer circuit breaker', () => {
     assert.equal(disposed(), 0)
     setOpen(false)
     assert.equal(changes.length, 2, 'nothing reported after the stop')
+  })
+
+  test('a stop that begins while the message is decoded ends the hold before it starts: no look at the circuit, nothing committed', async () => {
+    const h = harness()
+    const { policy, setOpen } = fakeBreaker()
+    const failed = captureEvents(h.harbor, 'messageFailed')
+    let release!: () => void
+    const decoding = new Promise<void>((resolve) => { release = resolve })
+    let decodes = 0
+    const slow = {
+      serialize: (value: unknown): Buffer => Buffer.from(JSON.stringify(value)),
+      deserialize: async (bytes: Buffer): Promise<unknown> => {
+        decodes++
+        await decoding
+        return JSON.parse(bytes.toString('utf8'))
+      }
+    }
+    let handled = 0
+    const consumer = h.harbor.consumer({ groupId: 'g', fromBeginning: true, autoCreateTopics: true, serializer: slow })
+    consumer.subscribe('orders', () => { handled++ }, { breaker: { policy } })
+    await consumer.start()
+    setOpen(true)
+    await h.harbor.producer().send('orders', { value: 'a' })
+    await until(() => decodes === 1)
+    const stopping = consumer.stop()
+    await settle()
+    release()
+    await stopping
+    assert.equal(handled, 0)
+    assert.equal(h.adapter.committed('g', 'orders', 0), undefined)
+    assert.equal(failed.length, 0)
+    assert.ok(!h.clock.sleeps.includes(1_000), 'the hold never slept: the stop was already under way')
+    await h.harbor.shutdown()
+  })
+
+  test('a hold that began after a revocation is not ended by it: the client delivered the message, so the partition is this member\'s', async () => {
+    const h = harness({}, { partitions: 2 })
+    const tap = tapConsumption(h, 'orders')
+    const { policy, setOpen } = fakeBreaker()
+    const held = gate()
+    const seen: unknown[] = []
+    const consumer = h.harbor.consumer({ groupId: 'g', fromBeginning: true, autoCreateTopics: true, concurrency: 2 })
+    consumer.subscribe<string>('orders', async (message) => {
+      seen.push(message.value)
+      if (message.value === 'slow') await held.wait
+    }, { breaker: { policy } })
+    await h.harbor.producer<string>().send('orders', { value: 'slow', partition: 1 })
+    await consumer.start()
+    await until(() => seen.length === 1)
+    const revoke = tap().onPartitionsRevoked as NonNullable<ConsumeOptions['onPartitionsRevoked']>
+    const settling = revoke([{ topic: 'orders', partition: 0 }, { topic: 'orders', partition: 1 }])
+    setOpen(true)
+    const late = tap().eachMessage({ topic: 'orders', partition: 0, offset: '0', key: null, value: Buffer.from('"late"'), headers: {}, timestamp: h.clock.now() })
+    // The settlement's wait and the hold's first look.
+    await until(() => h.clock.waiting === 2)
+    held.release()
+    await settling
+    setOpen(false)
+    h.clock.advance(1_000)
+    await late
+    assert.deepEqual(seen, ['slow', 'late'])
+    assert.equal(h.adapter.committed('g', 'orders', 0), '1')
+    await h.harbor.shutdown()
   })
 })

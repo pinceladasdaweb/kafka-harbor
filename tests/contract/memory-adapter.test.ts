@@ -7,8 +7,8 @@ import { memoryAdapter, runAdapterContract } from '../../src/testing/index'
 
 runAdapterContract('memory', async () => {
   const adapter = memoryAdapter()
-  await adapter.connect({ clientId: 'contract', brokers: ['memory:9092'] })
   const run = randomUUID().slice(0, 8)
+  await adapter.connect({ clientId: 'contract', brokers: ['memory:9092'], transactionalId: `contract-${run}` })
   return {
     adapter,
     topic: async (label, partitions = 1) => {
@@ -130,7 +130,7 @@ describe('memoryAdapter specifics', () => {
     await adapter.disconnect()
   })
 
-  test('a rejecting eachMessage is reported through onError and redelivered without a tight loop', async () => {
+  test('a rejecting eachMessage is reported through onError and settled: the partition moves on, nothing is redelivered', async () => {
     const adapter = memoryAdapter()
     await adapter.connect({ clientId: 'c', brokers: ['memory'] })
     await adapter.produce([{ topic: 't', key: null, value: Buffer.from('x'), headers: {} }])
@@ -143,12 +143,12 @@ describe('memoryAdapter specifics', () => {
       onError: (error) => { errors.push(error) },
       eachMessage: async () => {
         attempts++
-        if (attempts < 3) throw new Error('flaky')
+        throw new Error('flaky')
       }
     })
     await adapter.whenDrained('g', 't')
-    assert.equal(attempts, 3)
-    assert.equal(errors.length, 2)
+    assert.equal(attempts, 1)
+    assert.equal(errors.length, 1)
     await handle.stop()
     assert.deepEqual(adapter.paused('g'), [])
     assert.equal(adapter.connected, true)
@@ -356,14 +356,14 @@ describe('memoryAdapter bookkeeping', () => {
     await adapter.disconnect()
   })
 
-  test('a rejecting eachMessage without onError is still redelivered', async () => {
+  test('a rejecting eachMessage without onError is settled all the same', async () => {
     const adapter = memoryAdapter()
     await adapter.connect({ clientId: 'c', brokers: ['memory'] })
-    await adapter.produce([{ topic: 't', key: null, value: Buffer.from('x'), headers: {} }])
+    await adapter.produce([{ topic: 't', key: null, value: Buffer.from('x'), headers: {} }, { topic: 't', key: null, value: Buffer.from('y'), headers: {} }])
     let attempts = 0
     const handle = await adapter.consume({ groupId: 'g', topics: ['t'], fromBeginning: true, eachMessage: async () => { if (++attempts < 2) throw new Error('once') } })
     await adapter.whenDrained('g', 't')
-    assert.equal(attempts, 2)
+    assert.equal(attempts, 2, 'each message once')
     await handle.stop()
     await adapter.disconnect()
   })

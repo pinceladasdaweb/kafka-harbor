@@ -1,3 +1,4 @@
+import { globalIgnores } from 'eslint/config'
 import neostandard from 'neostandard'
 
 // English-only source: flags non-ASCII characters in identifiers and
@@ -46,10 +47,9 @@ const englishOnlyPlugin = {
 }
 
 export default [
-  ...neostandard({
-    ts: true,
-    ignores: ['dist', 'reports', '.stryker-tmp', 'temp', 'coverage']
-  }),
+  // Build output and tool scratch: never linted, by any layer.
+  globalIgnores(['dist', 'reports', '.stryker-tmp', 'temp', 'coverage']),
+  ...neostandard({ ts: true }),
   {
     plugins: {
       harbor: englishOnlyPlugin

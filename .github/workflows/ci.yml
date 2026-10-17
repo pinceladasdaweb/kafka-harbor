@@ -19,9 +19,9 @@ jobs:
       matrix:
         node: [22, 24, 26]
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version: ${{ matrix.node }}
           cache: npm
@@ -29,8 +29,9 @@ jobs:
       # --ignore-scripts keeps this job hermetic and fast: the only install
       # script in the tree is the Confluent client's native binary fetch (or
       # a librdkafka compile on a Node ABI without a prebuilt binary). The
-      # unit and contract suites never load the native module; the adapter
-      # is exercised against a real broker in the integration job below.
+      # unit and contract suites run without the native module (the one test
+      # that loads it skips itself); the adapter is exercised against a real
+      # broker in the integration job below.
       - name: Install dependencies
         run: npm ci --ignore-scripts
 
@@ -69,18 +70,30 @@ jobs:
       - name: Consumer type check (built declarations)
         run: npx tsc -p tests/consumer/tsconfig.json
 
-      # The public API is frozen: the build fails when exports drift from
-      # the committed API report (etc/kafka-harbor.api.md).
+      # What only shows across the built entry points at runtime: the NestJS
+      # bundle imports the decorators bundle instead of a copy, in ESM, CJS
+      # and both at once.
+      - name: Built bundles at runtime
+        run: node scripts/check-dist-runtime.mjs
+
+      # The package as npm packs it, unpacked as the dependency of an ESM and
+      # a CommonJS project: compiled under nodenext with every declaration of
+      # the package checked, and every entry point loaded both ways.
+      - name: Packed package as a consumer installs it
+        run: node scripts/check-package.mjs
+
+      # The public API is frozen: the build fails when the exports of any
+      # entry point drift from its committed report in etc/.
       - name: API report check
-        run: npx api-extractor run
+        run: node scripts/api-report.mjs check
 
   integration:
     name: Integration tests (Testcontainers)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           # Node 22 has a prebuilt Confluent binary; the compile-from-source
           # path is not what this job is here to prove.

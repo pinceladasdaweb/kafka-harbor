@@ -8,8 +8,8 @@
 import assert from 'node:assert/strict'
 import { describe, test } from 'node:test'
 
-import { createHarbor, type Handler, type HarborEvents } from '../src/index'
-import { memoryAdapter } from '../src/testing/index'
+import { createHarbor, type Handler, type HarborEvents } from 'kafka-harbor'
+import { memoryAdapter } from 'kafka-harbor/testing'
 
 interface Order { id: string, total: number }
 

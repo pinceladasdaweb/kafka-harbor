@@ -10,7 +10,7 @@ import { after, before, describe, test } from 'node:test'
 
 import { confluentAdapter } from '../../src/adapters/confluent/index'
 import { platformaticAdapter } from '../../src/adapters/platformatic/index'
-import { createHarbor, type ClientAdapter, type HarborEvents } from '../../src/index'
+import { createHarbor, type ClientAdapter, type Harbor, type HarborEvents } from '../../src/index'
 import { silentLogger } from '../helpers/harness'
 import { startKafka, type KafkaFixture } from '../helpers/kafka'
 
@@ -43,7 +43,7 @@ const connectWithPatience = async (harbor: { connect: () => Promise<void> }): Pr
   }
 }
 
-const suite = (name: string, build: () => ClientAdapter): Promise<void> => describe(`transactions on a real broker (${name})`, () => {
+const suite = (name: string, build: (transactionTimeoutMs?: number) => ClientAdapter): Promise<void> => describe(`transactions on a real broker (${name})`, () => {
   test('what a transaction produced shows up all at once on commit and never after an abort', async (t) => {
     if (kafka === undefined) return t.skip('no Kafka container')
     const run = randomUUID().slice(0, 8)
@@ -110,7 +110,82 @@ const suite = (name: string, build: () => ClientAdapter): Promise<void> => descr
       await harbor.shutdown('20s')
     }
   })
+
+  test('a transaction the broker aborted on timeout fails retryably, not as fenced, and the next one runs', async (t) => {
+    if (kafka === undefined) return t.skip('no Kafka container')
+    const run = randomUUID().slice(0, 8)
+    const topic = `tx-timeout-${run}`
+    const harbor = createHarbor({ clientId: `tx-timeout-${run}`, brokers: kafka.brokers, adapter: build(3_000), logger: silentLogger, transactionalId: `tx-timeout-${run}` })
+    const readers = createHarbor({ clientId: `tx-timeout-readers-${run}`, brokers: kafka.brokers, adapter: build(), logger: silentLogger })
+    try {
+      await connectWithPatience(harbor)
+      await harbor.config.adapter.admin.createTopics([{ topic, partitions: 1, replicationFactor: 1 }])
+      await assert.rejects(harbor.transaction(async (tx) => {
+        await tx.send(topic, { value: 'outlived its timeout' })
+        await new Promise((resolve) => setTimeout(resolve, 8_000))
+      }), (error: unknown) => {
+        assert.notEqual((error as { code?: unknown }).code, 'FENCED', String(error))
+        assert.equal((error as { retryable?: unknown }).retryable, true, String(error))
+        return true
+      })
+      await harbor.transaction(async (tx) => { await tx.send(topic, { value: 'after the timeout' }) })
+      const seen: unknown[] = []
+      const consumer = readers.consumer({ groupId: `tx-timeout-readers-${run}`, fromBeginning: true, autoCreateTopics: true })
+      consumer.subscribe(topic, (message) => { seen.push(message.value) })
+      await consumer.start()
+      await waitFor(() => seen.includes('after the timeout'), 30_000, 'the transaction after the timeout')
+      assert.ok(!seen.includes('outlived its timeout'), 'what the aborted transaction produced never shows')
+    } finally {
+      await readers.shutdown('20s')
+      await harbor.shutdown('20s')
+    }
+  })
+
+  test('a process that restarts with its transactionalId takes it back, and fences an instance still alive under it', async (t) => {
+    if (kafka === undefined) return t.skip('no Kafka container')
+    const run = randomUUID().slice(0, 8)
+    const topic = `tx-reuse-${run}`
+    const transactionalId = `tx-reuse-${run}`
+    const open = async (): Promise<Harbor> => {
+      const harbor = createHarbor({ clientId: `tx-reuse-${run}`, brokers: kafka!.brokers, adapter: build(), logger: silentLogger, transactionalId })
+      await connectWithPatience(harbor)
+      return harbor
+    }
+    const first = await open()
+    const second = await open().catch(async (error: unknown) => { await first.shutdown('20s'); throw error })
+    // A reader of its own, without the id: initializing it would fence the second instance in turn.
+    const readers = createHarbor({ clientId: `tx-reuse-readers-${run}`, brokers: kafka.brokers, adapter: build(), logger: silentLogger })
+    try {
+      await first.config.adapter.admin.createTopics([{ topic, partitions: 1, replicationFactor: 1 }])
+      await first.transaction(async (tx) => { await tx.send(topic, { value: 'before the restart' }) }).catch(() => undefined)
+      // The second instance initializes the same id (at connect on Confluent, at its first transaction on platformatic): it fences the first, which is the zombie now.
+      await second.transaction(async (tx) => { await tx.send(topic, { value: 'after the restart' }) })
+      // Fenced before any timeout could explain it: the zombie runs no more transactions, and opens no producer to fence back.
+      await assert.rejects(first.transaction(async (tx) => { await tx.send(topic, { value: 'from the zombie' }) }), { code: 'FENCED' })
+      await assert.rejects(first.transaction(async (tx) => { await tx.send(topic, { value: 'from the zombie again' }) }), { code: 'FENCED' })
+      await second.transaction(async (tx) => { await tx.send(topic, { value: 'still going' }) })
+      const seen: unknown[] = []
+      const consumer = readers.consumer({ groupId: `tx-reuse-readers-${run}`, fromBeginning: true, autoCreateTopics: true })
+      consumer.subscribe(topic, (message) => { seen.push(message.value) })
+      await consumer.start()
+      await waitFor(() => seen.includes('still going'), 30_000, 'the restarted instance\'s records')
+      await new Promise((resolve) => setTimeout(resolve, 1_000))
+      assert.ok(seen.includes('after the restart'))
+      assert.ok(!seen.includes('from the zombie') && !seen.includes('from the zombie again'), 'nothing of the fenced instance after the fencing')
+    } finally {
+      await readers.shutdown('20s')
+      await second.shutdown('20s')
+      await first.shutdown('20s').catch(() => undefined)
+    }
+  })
 })
 
-suite('confluent', () => confluentAdapter({ consumer: { 'session.timeout.ms': 10_000, 'heartbeat.interval.ms': 3_000 } }))
-suite('platformatic', () => platformaticAdapter({ consumer: { sessionTimeout: 10_000, heartbeatInterval: 1_000, rebalanceTimeout: 30_000 } }))
+suite('confluent', (transactionTimeoutMs) => confluentAdapter({
+  consumer: { 'session.timeout.ms': 10_000, 'heartbeat.interval.ms': 3_000 },
+  // librdkafka wants socket.timeout.ms at most the transaction timeout plus 100ms.
+  ...(transactionTimeoutMs !== undefined && { producer: { 'transaction.timeout.ms': transactionTimeoutMs, 'socket.timeout.ms': transactionTimeoutMs } })
+}))
+suite('platformatic', (transactionTimeoutMs) => platformaticAdapter({
+  consumer: { sessionTimeout: 10_000, heartbeatInterval: 1_000, rebalanceTimeout: 30_000 },
+  ...(transactionTimeoutMs !== undefined && { transactionTimeout: transactionTimeoutMs })
+}))

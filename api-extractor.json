@@ -16,10 +16,19 @@
     "enabled": false
   },
   "messages": {
+    "tsdocMessageReporting": {
+      "default": {
+        "logLevel": "none"
+      }
+    },
     "extractorMessageReporting": {
       "default": {
         "logLevel": "warning",
         "addToApiReportFile": true
+      },
+      "ae-missing-release-tag": {
+        "logLevel": "none",
+        "addToApiReportFile": false
       }
     }
   }

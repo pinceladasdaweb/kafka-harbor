@@ -42,7 +42,7 @@ Reject when any record was not acknowledged.
 
 ### consume
 
-`eachMessage` is called once per message, in order within a partition. Two
+`eachMessage` is called once per message, in order within a partition. Three
 rules the core relies on:
 
 1. Do not deliver the next message of a partition until the previous
@@ -52,20 +52,28 @@ rules the core relies on:
    A settled `eachMessage` promise says nothing about the offset: with
    `subscribeBatch` the core settles deliveries it has not committed yet;
    only `commit` moves the offset.
+3. A rejected `eachMessage` promise is settled like a resolved one: report
+   the error through `onError` and move on to the next message of the
+   partition. Never deliver it again on your own (a client that rewinds on a
+   rejection, as the KafkaJS-style ones do, needs the rejection caught). The
+   core's promise never rejects; the rule is for whatever else drives an
+   adapter.
 
 `concurrency` is the number of partitions processed at once; `fromBeginning`
 is where a brand-new group starts; `maxProcessingTimeMs` is the longest one
 `eachMessage` call may take, retry delay included, for the client setting
 that decides how long a member may go without polling (`max.poll.interval.ms`
 in librdkafka; ignore it if your client has no such knob); `onError` reports
-fetch-loop errors that belong to no message.
+fetch-loop errors that belong to no message, and rejected deliveries (rule 3).
 
-`onPartitionsRevoked` (optional) is called when a rebalance is about to take
-partitions away, and the adapter must **await it before releasing them**: the
-core uses that time to let the handlers still running on those partitions
-finish and commit, so the next owner does not repeat their work. The core
-bounds the wait by `maxProcessingTimeMs`; an adapter whose client cannot
-delay a revocation simply does not call it.
+`onPartitionsRevoked` (optional) is called when a rebalance takes partitions
+away. When the client can delay the release, the adapter **awaits it before
+releasing them**: the core uses that time to let the handlers still running
+on those partitions finish and commit, so the next owner does not repeat
+their work, and bounds the wait by `maxProcessingTimeMs`. When the client
+has released them already (a client that rebalances on its own), the
+adapter calls it after the fact without awaiting it: the core then drops what it still holds
+for those partitions, such as a retry message parked in memory.
 
 The core may call `consume` more than once for the same group with disjoint
 topic sets (one call per retry level), so an adapter must not assume a
@@ -83,7 +91,9 @@ that waits for in-flight `eachMessage` calls does not deadlock.
 ### admin
 
 `createTopics` treats an already-existing topic as success (the outcome is
-what was asked for) and resolves only once the topics are **visible**: a
+what was asked for), leaves a spec's missing `partitions` or
+`replicationFactor` to the broker's defaults (`-1` on the wire), and
+resolves only once the topics are **visible**: a
 broker acknowledges a creation before every replica serves the new metadata,
 and a `consume` or `topicExists` issued right after must find the topic.
 Poll the metadata until it does, bounded by your admin timeout. `topicExists`
@@ -153,7 +163,7 @@ runAdapterContract('mine', async () => {
 })
 ```
 
-The suite is a `node:test` suite; run the file with `node --test`. The ten invariants are listed in its header. An adapter that
+The suite is a `node:test` suite; run the file with `node --test`. The thirteen invariants are listed in its header; the transactions one runs when the adapter implements `transaction` and the setup connected with a `transactionalId`, and is skipped otherwise. An adapter that
 passes them can be dropped into any harbor; an adapter that needs one of them
 relaxed has found either a bug in the client or a leak in the contract, and
 both are worth an issue.

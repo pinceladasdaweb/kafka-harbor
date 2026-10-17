@@ -15,28 +15,27 @@
 export { Harbor, abortProcessing, createHarbor } from './harbor'
 export type { ConsumerHealth, ExposedHarborConfig, HarborConfig, HarborEvents, HarborHealth, HarborState, HeaderOptions } from './harbor'
 
-export type { CoreContext, HarborErrorEvent } from './context'
+export type { HarborErrorEvent } from './context'
 
 export type { Instrumentation, OutgoingRecord, ProduceBatch, ProduceKind } from './instrumentation'
 export { defaultIdempotencyKey } from './idempotency'
 
-export type { Transaction, TransactionEvents, TransactionOffsets, TransactionOptions } from './transaction'
+export type { Transaction, TransactionEvents, TransactionOptions } from './transaction'
 
-export { defaultFailureIf } from './breaker'
 export type { ConsumerBreakerOptions } from './breaker'
 export type { IdempotencyEngine, IdempotencyInput, IdempotencyOptions } from './idempotency'
 export type { ProduceEvents, ProducedEvent } from './produce'
 
 export type { RedriveEvents, RedriveOptions, RedriveResult } from './redrive'
 
-export { Producer } from './producer'
-export type { ProducerContext, ProducerEvents, ProducerOptions, ProducerRetryOptions } from './producer'
+// The pipelines are built by the harbor (`harbor.producer()`,
+// `harbor.consumer()`): their classes are types here, not constructors.
+export type { Producer, ProducerEvents, ProducerOptions, ProducerRetryOptions } from './producer'
 
-export { Consumer } from './consumer'
 export type {
   BatchContext,
   BatchHandler,
-  ConsumerContext,
+  Consumer,
   ConsumerDlqOptions,
   ConsumerEvents,
   ConsumerOptions,
@@ -46,6 +45,7 @@ export type {
   Handler,
   HandlerContext,
   PartitionLag,
+  RetryContext,
   StopReason,
   SubscribeBatchOptions,
   SubscribeOptions,
@@ -62,13 +62,18 @@ export {
   ClosedError,
   ConfigError,
   ERROR_CODES,
+  FencedError,
   HarborError,
   SerializationError,
   ShutdownTimeoutError,
   TopicMissingError,
   describeError,
   isAbortProcessingError,
+  isAdapterError,
   isBatchFailedError,
+  isClosedError,
+  isConfigError,
+  isFencedError,
   isHoldExpiredError,
   isDeclaredRetryable,
   isHarborError,
@@ -84,7 +89,7 @@ export type { Serializer, SyncSerializer } from './serializer'
 
 export { MAX_DURATION_MS, parseDuration } from './duration'
 
-export { OFFSET_PATTERN, offsetAfter, offsetDistance } from './commit'
+export { OFFSET_PATTERN } from './commit'
 
 export { partitionKey, splitPartitionKey } from './topic-partition'
 
@@ -98,7 +103,7 @@ export type { DlqTopicNaming, RetryLevel, RetryTopicNaming } from './retry-topic
 // Adapter authoring surface. Everything an adapter (in-tree or external)
 // needs is exported here: the contract and the header helpers, with the
 // error identity the core expects.
-export { decodeHeaders, headerNames, stampProducer } from './headers'
+export { decodeHeaders } from './headers'
 export type { HeaderNames } from './headers'
 export type {
   AdminApi,
@@ -117,8 +122,6 @@ export type {
   TopicSpec,
   TransactionHandle
 } from './adapter'
-
-export { systemClock } from './clock'
 
 export { subscribe } from './events'
 export type { EventMap, Listener, Listeners, Observable } from './events'

@@ -25,9 +25,9 @@ export const MAX_DURATION_MS = 2_147_483_647
  * unit forgotten than five milliseconds meant.
  *
  * `name` is the option the value came from, so the error names what the
- * caller actually passed instead of an internal default.
+ * caller actually passed instead of an internal default. Default: 'duration'.
  */
-export function parseDuration (value: Duration, name: string): number {
+export function parseDuration (value: Duration, name = 'duration'): number {
   if (typeof value === 'number') {
     if (!Number.isFinite(value) || value < 0) {
       throw new ConfigError(`${name} must be a finite, non-negative number of milliseconds; got ${String(value)}`)

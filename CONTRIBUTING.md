@@ -14,9 +14,11 @@ npm run hooks   # once per clone: enables lint and commit-message hooks
 Node.js >= 22 is required. The integration suite manages its own Kafka
 through Testcontainers, so the only external requirement is a running Docker.
 `@confluentinc/kafka-javascript` has prebuilt binaries for Node 22 and 24; on
-Node 26 `npm install` compiles librdkafka from source (a few minutes, needs a
-C++ toolchain). `npm install --ignore-scripts` skips that when you only need
-the unit suite.
+Node 26 `npm install` compiles librdkafka from source, which needs a C++
+toolchain and the tools the build downloads with (it works on a macOS with
+Xcode, a few minutes; see the README's Docker images section for Linux).
+`npm install --ignore-scripts` skips that when you only need the unit
+suite.
 
 ## The checks
 
@@ -28,7 +30,7 @@ npm run test:mutation:changed # the mutation gate on the files this branch chang
 npm run lint                  # neostandard + the project rules
 npm run check:types           # TypeScript 6
 npm run check:types:next      # the same surface under TypeScript 7
-npm run check:dist            # build, then compile tests/consumer against dist/
+npm run check:dist            # build; compile tests/consumer against dist/; load the bundles; pack and install as ESM and CJS
 npm run check:docs            # every ```ts block in README and docs/ type-checks against src/
 npm run api:check             # build + public API report comparison
 npm run examples              # the runnable examples assert their own outcomes
@@ -96,11 +98,13 @@ extracted and type-checked against `src/` by `npm run check:docs`, and every
 in-page link must point at a real heading. Identifiers the prose leaves
 undefined on purpose (`Order`, `fulfill`, `harbor`) are declared once in
 `scripts/doc-snippets.globals.d.ts`; add to that file rather than weakening a
-snippet. Nothing may be described as planned once it is delivered.
+snippet. Public docs describe what exists; nothing is described as planned.
 
-**The public API is frozen by the report in `etc/`.** `npm run api:check`
-fails when exports drift; if the change is deliberate, run `npm run
-api:update` and commit the report. The diff is part of the review.
+**The public API is frozen by the reports in `etc/`,** one per entry point.
+`npm run api:check` fails when the exports of any entry point drift; if the
+change is deliberate, run `npm run api:update` and commit the reports. The
+diff is part of the review. `npm run check:dist` also packs the package and
+compiles and loads it as an ESM and a CommonJS consumer would.
 
 ## Tests
 
@@ -135,13 +139,25 @@ Open pull requests against `development`, not `main`.
 
 ## How a release happens
 
-Merging to `main` publishes, once the `NPM_PUBLISH_ENABLED` repository
-variable is set to `true`; without it the publish job is skipped, so `main`
-can move before the npm side (trusted publisher) is configured. The workflow reads the version already on the
-registry, bumps it from the merge commit message, publishes to npm through
-OIDC trusted publishing (no token secret, provenance attached), then writes
-`CHANGELOG.md`, tags `vX.Y.Z` and opens the GitHub release.
+Merging to `main` publishes once the CI run of that merge passed, and once
+the `NPM_PUBLISH_ENABLED` repository variable is set to `true`; without it
+the publish job is skipped, so `main` can move before the npm side (trusted
+publisher) is configured. The workflow works on the commit CI tested: it
+reads the version already on the registry, bumps it from the merge commit's
+subject, writes `CHANGELOG.md`, commits the bumped files and tags that
+commit `vX.Y.Z`, publishes to npm through OIDC trusted publishing (no token
+secret, provenance attached), pushes the commit and the tag together, and
+opens the GitHub release.
 
-The bump follows the commit subject: `BREAKING CHANGE` or `major` for a
-major, `minor` for a minor, anything else for a patch. Commit subjects are
-the release notes, so write them for the person reading them later.
+The bump follows the subject of the merge commit and nothing else: `major
+release` for a major, `minor release` for a minor (`Merge development into
+main: minor release X.Y.Z`, where X.Y.Z is for the reader: the number comes
+from the registry), anything else for a patch. A subject that only mentions
+one of the words decides nothing, and the body never does. Only the commit
+main points at is released, once: a re-run of an older CI run, or of a
+publish whose release commit already landed, publishes nothing. If a run
+publishes and then fails to push (main moved meanwhile), the version is on
+npm without its tag, its CHANGELOG section and its GitHub release; the next
+release bumps from the registry, so nothing is published twice under one
+number. Commit subjects are the
+release notes, so write them for the person reading them later.

@@ -11,7 +11,7 @@ import { describe, test } from 'node:test'
 import type { GroupAssignment, Message } from '@platformatic/kafka'
 
 import { partitionAssignerBySubscription, platformaticAdapter, type PlatformaticClientModule } from '../../src/adapters/platformatic/index'
-import { AdapterError, ERROR_CODES, type ConsumerHandle, type RawMessage } from '../../src/index'
+import { AdapterError, ERROR_CODES, isFencedError, type ConsumerHandle, type FencedError, type RawMessage } from '../../src/index'
 
 type ClientMessage = Message<Buffer, Buffer, Buffer, Buffer>
 
@@ -35,9 +35,15 @@ interface Behavior {
   offsetsError?: unknown
   committed?: Array<{ groupId: string, topics: Array<{ name: string, partitions: Array<{ partitionIndex: number, committedOffset: bigint }> }> }>
   beginError?: unknown
+  /** One per begin, shifted in order, before beginError; undefined lets it begin. */
+  beginFailures?: unknown[]
   txCommitError?: unknown
   txAbortError?: unknown
   addOffsetError?: unknown
+  /** Held by the admin's connect while set. */
+  connectGate?: Promise<void>
+  /** How long a producer's close takes, ms. */
+  producerCloseMs?: number
 }
 
 class FakeStream extends Readable {
@@ -119,6 +125,8 @@ const fakeClient = (behavior: Behavior = {}) => {
 
     async beginTransaction (): Promise<unknown> {
       calls.transactions.push('begin')
+      const failure = behavior.beginFailures?.shift()
+      if (failure !== undefined) throw failure
       if (behavior.beginError !== undefined) throw behavior.beginError
       let completed = false
       return {
@@ -137,6 +145,7 @@ const fakeClient = (behavior: Behavior = {}) => {
     }
 
     async close (): Promise<void> {
+      if (behavior.producerCloseMs !== undefined) await new Promise((resolve) => setTimeout(resolve, behavior.producerCloseMs))
       calls.closed.push('producer')
       if (behavior.producerCloseError !== undefined) throw behavior.producerCloseError
     }
@@ -153,7 +162,9 @@ const fakeClient = (behavior: Behavior = {}) => {
       calls.adminOptions = options
     }
 
-    async connectToBrokers (): Promise<void> {}
+    async connectToBrokers (): Promise<void> {
+      await behavior.connectGate
+    }
 
     async close (): Promise<void> {
       calls.closed.push('admin')
@@ -284,10 +295,11 @@ describe('platformaticAdapter', () => {
     for (const [name, value] of [['bufferedMessages', 0], ['reconnectDelayMs', -1], ['adminTimeoutMs', 1.5]] as const) {
       assert.throws(() => platformaticAdapter({ [name]: value }), (error: unknown) => {
         assert.equal((error as { code: string }).code, ERROR_CODES.CONFIG_INVALID)
-        assert.match((error as Error).message, new RegExp(`${name} must be a positive integer`))
+        assert.match((error as Error).message, new RegExp(name))
         return true
       })
     }
+    assert.doesNotThrow(() => platformaticAdapter({ adminTimeoutMs: '2s', reconnectDelayMs: '500ms' }), 'durations as strings')
   })
 
   test('connect maps the harbor config, pins acks, idempotence and bounded retries, and lets the passthrough tune the rest', async () => {
@@ -411,7 +423,8 @@ describe('platformaticAdapter: transactions', () => {
     const adapter = platformaticAdapter({ client: module, producer: { compression: 'gzip' } })
     await adapter.connect({ ...broker, transactionalId: 'orders-service-1' })
     assert.equal(calls.producerOptionsList.length, 2)
-    assert.deepEqual(calls.producerOptionsList[1], { clientId: 'app', bootstrapBrokers: ['b:9092'], retries: 3, timeout: 60_000, compression: 'gzip', acks: -1, idempotent: true, transactionalId: 'orders-service-1' })
+    // A new producer for its id (-1, -1): the broker fences whoever held it before instead of fencing this one.
+    assert.deepEqual(calls.producerOptionsList[1], { clientId: 'app', bootstrapBrokers: ['b:9092'], retries: 3, timeout: 60_000, compression: 'gzip', acks: -1, idempotent: true, transactionalId: 'orders-service-1', producerId: -1n, producerEpoch: -1 })
     const handle = await adapter.consume({ groupId: 'g', topics: ['t'], eachMessage: async () => {} })
     const tx = await adapter.transaction!()
     await tx.produce([{ topic: 'out', key: null, value: Buffer.from('v'), headers: { h: '1' } }])
@@ -432,7 +445,7 @@ describe('platformaticAdapter: transactions', () => {
   })
 
   test('refused without a transactionalId and for a consumption this adapter did not open; client failures are wrapped', async () => {
-    const { module } = fakeClient({ addOffsetError: networkError(), txCommitError: Object.assign(new Error('fenced'), { code: 'PLT_KFK_PROTOCOL', apiId: 'INVALID_PRODUCER_EPOCH', canRetry: false }) })
+    const { module } = fakeClient({ addOffsetError: networkError(), txCommitError: Object.assign(new Error('lost'), { code: 'PLT_KFK_PROTOCOL', apiId: 'INVALID_TXN_STATE', canRetry: false }) })
     const adapter = platformaticAdapter({ client: module })
     await adapter.connect(broker)
     await assert.rejects(adapter.transaction!(), { code: ERROR_CODES.CONFIG_INVALID, message: /transactionalId/ })
@@ -442,25 +455,191 @@ describe('platformaticAdapter: transactions', () => {
     const tx = await adapter.transaction!()
     await assert.rejects(tx.sendOffsets({ commit: async () => {}, stop: async () => {} }, []), { code: ERROR_CODES.CONFIG_INVALID, message: /did not open/ })
     await assert.rejects(tx.sendOffsets(handle, [{ topic: 't', partition: 0, offset: '1' }]), { message: /sendOffsets failed: connection refused/, retryable: true })
-    await assert.rejects(tx.commit(), { message: /transaction commit failed: fenced/, retryable: false })
+    await assert.rejects(tx.commit(), { message: /transaction commit failed: lost/, retryable: false })
     await adapter.disconnect()
 
-    const refusing = fakeClient({ beginError: new Error('busy') })
+    const refusing = fakeClient({ beginError: protocolError('TRANSACTIONAL_ID_AUTHORIZATION_FAILED', false) })
     const second = platformaticAdapter({ client: refusing.module })
     await second.connect({ ...broker, transactionalId: 'x' })
-    await assert.rejects(second.transaction!(), { message: /transaction begin failed: busy/ })
+    await assert.rejects(second.transaction!(), { message: /transaction begin failed: TRANSACTIONAL_ID_AUTHORIZATION_FAILED/, retryable: false })
+    assert.deepEqual(refusing.calls.transactions, ['begin'], 'a definitive refusal is not tried again')
     await second.disconnect()
 
-    const broken = fakeClient({ sendError: protocolError('MESSAGE_TOO_LARGE', false), txAbortError: new Error('too late') })
+    const behavior: Behavior = { sendError: protocolError('MESSAGE_TOO_LARGE', false), txAbortError: new Error('too late') }
+    const broken = fakeClient(behavior)
     const third = platformaticAdapter({ client: broken.module })
     await third.connect({ ...broker, transactionalId: 'x' })
     const open = await third.transaction!()
     await assert.rejects(open.produce([{ topic: 'out', key: null, value: Buffer.from('v'), headers: {} }]), { message: /produce failed: MESSAGE_TOO_LARGE/, retryable: false })
     await assert.rejects(open.abort(), { message: /transaction abort failed: too late/ })
-    // The client would keep the transaction as the producer's active one: cancelled, so the next one can begin.
-    assert.deepEqual(broken.calls.transactions.slice(-2), ['abort', 'cancel'])
+    // The broker may still hold the transaction under this producer's epoch: the producer is closed, never cancelled and reused.
+    assert.deepEqual(broken.calls.closed, ['producer'])
+    assert.ok(!broken.calls.transactions.includes('cancel'))
+    // The coordinator does not answer at first: the begin is tried again on a new producer, the failed one released.
+    behavior.beginFailures = [networkError()]
+    delete behavior.sendError
     await third.transaction!()
+    assert.deepEqual(broken.calls.closed, ['producer', 'producer'])
+    assert.equal(broken.calls.producerOptionsList.length, 4, 'the producer, the transactional one, the reopen that failed to begin and the new one')
+    assert.deepEqual(broken.calls.producerOptionsList[3], broken.calls.producerOptionsList[1], 'opened the way the first one was')
     await third.disconnect()
+  })
+
+  test('a producer fenced before transactionTimeout is not opened again: every transaction on the connection fails with FencedError', async () => {
+    const fenced = (): Error => multiple([protocolError('PRODUCER_FENCED', false)])
+    const behavior: Behavior = { txCommitError: fenced() }
+    const { module, calls } = fakeClient(behavior)
+    const adapter = platformaticAdapter({ client: module })
+    await adapter.connect({ ...broker, transactionalId: 'x' })
+    const open = await adapter.transaction!()
+    await assert.rejects(open.commit(), (error: unknown) => {
+      assert.equal(isFencedError(error), true)
+      assert.equal((error as FencedError).transactionalId, 'x')
+      assert.equal((error as FencedError).retryable, false)
+      return true
+    })
+    assert.deepEqual(calls.closed, ['producer'], 'the fenced producer is closed')
+    await open.abort()
+    assert.ok(!calls.transactions.includes('abort'), 'nothing left to abort on a closed producer')
+    await assert.rejects(adapter.transaction!(), { code: ERROR_CODES.FENCED })
+    assert.equal(calls.producerOptionsList.length, 2, 'no producer opened to fence the live one back')
+    await adapter.disconnect()
+    delete behavior.txCommitError
+    await adapter.connect({ ...broker, transactionalId: 'x' })
+    await (await adapter.transaction!()).commit()
+    await adapter.disconnect()
+
+    for (const step of ['produce', 'sendOffsets', 'abort'] as const) {
+      const failing = fakeClient({ sendError: fenced(), addOffsetError: protocolError('INVALID_PRODUCER_EPOCH', false), txAbortError: fenced() })
+      const other = platformaticAdapter({ client: failing.module })
+      await other.connect({ ...broker, transactionalId: 'x' })
+      const handle = await other.consume({ groupId: 'g', topics: ['t'], eachMessage: async () => {} })
+      const tx = await other.transaction!()
+      const run = step === 'produce'
+        ? tx.produce([{ topic: 'out', key: null, value: null, headers: {} }])
+        : step === 'sendOffsets' ? tx.sendOffsets(handle, [{ topic: 't', partition: 0, offset: '1' }]) : tx.abort()
+      await assert.rejects(run, { code: ERROR_CODES.FENCED }, step)
+      await assert.rejects(other.transaction!(), { code: ERROR_CODES.FENCED }, step)
+      await other.disconnect()
+    }
+
+    // Refused at begin: the identity the producer introduced itself with is someone else's now.
+    const atBegin = fakeClient({ beginError: fenced() })
+    const second = platformaticAdapter({ client: atBegin.module })
+    await second.connect({ ...broker, transactionalId: 'x' })
+    await assert.rejects(second.transaction!(), { code: ERROR_CODES.FENCED })
+    await assert.rejects(second.transaction!(), { code: ERROR_CODES.FENCED })
+    assert.deepEqual(atBegin.calls.transactions, ['begin'])
+    await second.disconnect()
+  })
+
+  test('a fenced producer after transactionTimeout is taken for a transaction the broker aborted: retryable, and the next one opens a new producer', async () => {
+    const fenced = (): Error => multiple([protocolError('PRODUCER_FENCED', false)])
+    const behavior: Behavior = { txCommitError: fenced() }
+    const { module, calls } = fakeClient(behavior)
+    const adapter = platformaticAdapter({ client: module, transactionTimeout: 1 })
+    await adapter.connect({ ...broker, transactionalId: 'x' })
+    const open = await adapter.transaction!()
+    await new Promise((resolve) => setTimeout(resolve, 5))
+    await assert.rejects(open.commit(), { code: ERROR_CODES.ADAPTER, retryable: true, message: /transaction commit failed: the broker aborted the transaction/ })
+    await open.abort()
+    delete behavior.txCommitError
+    await (await adapter.transaction!()).commit()
+    assert.equal(calls.producerOptionsList.length, 3)
+    assert.deepEqual(calls.producerOptionsList[2], calls.producerOptionsList[1], 'a new producer for the id, which fences and aborts the old one')
+    assert.deepEqual(calls.closed, ['producer'])
+    await adapter.disconnect()
+  })
+
+  test('the time is read when the fence arrives, not after the slow close of the producer', async () => {
+    const { module } = fakeClient({ txCommitError: multiple([protocolError('PRODUCER_FENCED', false)]), producerCloseMs: 60 })
+    const adapter = platformaticAdapter({ client: module, transactionTimeout: 30 })
+    await adapter.connect({ ...broker, transactionalId: 'x' })
+    await assert.rejects((await adapter.transaction!()).commit(), { code: ERROR_CODES.FENCED })
+  })
+
+  test('a disconnect while the client module loads leaves nothing connected', async () => {
+    const { module, calls } = fakeClient()
+    let loaded!: () => void
+    const loading = new Promise<void>((resolve) => { loaded = resolve })
+    const adapter = platformaticAdapter({ client: async () => { await loading; return module } })
+    const connecting = adapter.connect(broker)
+    await adapter.disconnect()
+    loaded()
+    await assert.rejects(connecting, { code: ERROR_CODES.ADAPTER, message: /disconnected while connecting/ })
+    assert.equal(calls.producerOptionsList.length, 0, 'no client opened')
+    await assert.rejects(adapter.produce([]), { message: /not connected/ })
+  })
+
+  test('a disconnect while the connect is opening its clients releases them', async () => {
+    let admit!: () => void
+    const { module, calls } = fakeClient({ connectGate: new Promise((resolve) => { admit = resolve }) })
+    const adapter = platformaticAdapter({ client: module })
+    const connecting = adapter.connect({ ...broker, transactionalId: 'x' })
+    await new Promise((resolve) => setImmediate(resolve))
+    await adapter.disconnect()
+    admit()
+    await assert.rejects(connecting, { code: ERROR_CODES.ADAPTER, message: /disconnected while connecting/ })
+    assert.deepEqual(calls.closed.sort(), ['admin', 'producer', 'producer'])
+    await assert.rejects(adapter.produce([]), { message: /not connected/ })
+  })
+
+  test('a begin that keeps failing gives up at adminTimeoutMs, and a disconnect ends the wait between attempts', async () => {
+    const late = fakeClient({ beginError: networkError() })
+    const adapter = platformaticAdapter({ client: late.module, adminTimeoutMs: 1 })
+    await adapter.connect({ ...broker, transactionalId: 'x' })
+    await assert.rejects(adapter.transaction!(), { message: /transaction begin failed: connection refused/, retryable: true })
+    await adapter.disconnect()
+
+    const waiting = fakeClient({ beginError: networkError() })
+    const patient = platformaticAdapter({ client: waiting.module, adminTimeoutMs: 60_000 })
+    await patient.connect({ ...broker, transactionalId: 'x' })
+    const attempt = patient.transaction!()
+    await until(() => waiting.calls.transactions.length === 1, 'the first begin')
+    // Into the pause between two attempts (a quarter of a second).
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    const startedAt = Date.now()
+    await patient.disconnect()
+    await assert.rejects(attempt, { message: /not connected/ })
+    assert.ok(Date.now() - startedAt < 1_000)
+  })
+
+  test('connect is single-flight: concurrent calls open one set of clients', async () => {
+    const { module, calls } = fakeClient()
+    const adapter = platformaticAdapter({ client: module })
+    await Promise.all([adapter.connect(broker), adapter.connect(broker)])
+    assert.equal(calls.producerOptionsList.length, 1)
+    await adapter.disconnect()
+  })
+
+  test('the transactional producer takes its timeout from transactionTimeout, else from the passthrough\'s, else a minute', async () => {
+    const { calls } = await connected({}, { producer: { timeout: 5_000 } })
+    const { calls: transactional } = await connected({}, { producer: { timeout: 5_000 }, transactionTimeout: '5m' })
+    assert.equal((calls.producerOptionsList[0] as { timeout: number }).timeout, 5_000, 'the passthrough reaches the producer')
+    const timeoutOf = async (options: Parameters<typeof platformaticAdapter>[0]): Promise<number> => {
+      const fake = fakeClient()
+      await platformaticAdapter({ client: fake.module, ...options }).connect({ ...broker, transactionalId: 'x' })
+      return (fake.calls.producerOptionsList[1] as { timeout: number }).timeout
+    }
+    assert.equal(await timeoutOf({}), 60_000, 'a minute by default')
+    assert.equal(await timeoutOf({ producer: { timeout: 5_000 } }), 5_000)
+    assert.equal(await timeoutOf({ global: { timeout: 7_000 } }), 7_000)
+    assert.equal(await timeoutOf({ global: { timeout: 7_000 }, producer: { timeout: 5_000 } }), 5_000)
+    assert.equal(await timeoutOf({ producer: { timeout: 5_000 }, transactionTimeout: '5m' }), 300_000)
+    assert.equal(transactional.producerOptionsList.length, 1, 'no transactional producer without transactionalId')
+    assert.throws(() => platformaticAdapter({ transactionTimeout: 'soon' as never }), { code: ERROR_CODES.CONFIG_INVALID, message: /transactionTimeout/ })
+    assert.throws(() => platformaticAdapter({ transactionTimeout: 0 }), { code: ERROR_CODES.CONFIG_INVALID, message: /transactionTimeout, the transaction timeout, must be positive/ })
+    assert.throws(() => platformaticAdapter({ producer: { timeout: 0 } }), { code: ERROR_CODES.CONFIG_INVALID, message: /producer\.timeout, the transaction timeout, must be positive/ })
+    assert.throws(() => platformaticAdapter({ global: { timeout: 'soon' as never } }), { code: ERROR_CODES.CONFIG_INVALID, message: /global\.timeout/ })
+  })
+
+  test('producer retries the client would turn into retrying forever are refused', () => {
+    for (const options of [{ producer: { retries: 0 } }, { producer: { retries: 1 } }, { producer: { retries: true } }, { global: { retries: 1 } }]) {
+      assert.throws(() => platformaticAdapter(options), { code: ERROR_CODES.CONFIG_INVALID, message: /retry forever/ }, JSON.stringify(options))
+    }
+    for (const options of [{ producer: { retries: 2 } }, { producer: { retries: false } }, { global: { retries: 0 }, producer: { retries: 3 } }]) {
+      assert.doesNotThrow(() => platformaticAdapter(options), JSON.stringify(options))
+    }
   })
 })
 
@@ -472,7 +651,7 @@ describe('platformaticAdapter: consume', () => {
     await adapter.consume({ groupId: 'g', topics: ['a'], fromBeginning: true, eachMessage: async () => {} })
     await adapter.consume({ groupId: 'g', topics: ['a-retry-1'], eachMessage: async () => {} })
     assert.equal(calls.consumers.length, 2)
-    assert.deepEqual(calls.consumers[0]!.options, { clientId: 'app', bootstrapBrokers: ['b:9092'], tls: {}, timeout: 1000, sessionTimeout: 10_000, groupId: 'g', autocommit: false })
+    assert.deepEqual(calls.consumers[0]!.options, { clientId: 'app', bootstrapBrokers: ['b:9092'], tls: {}, timeout: 1000, sessionTimeout: 10_000, partitionAssigner: partitionAssignerBySubscription, groupId: 'g', autocommit: false }, 'the assigner on the consumer too, for a rejoin the client starts on its own')
     assert.deepEqual(calls.consumeOptions, [
       { topics: ['a'], autocommit: false, mode: 'committed', fallbackMode: 'earliest', partitionAssigner: partitionAssignerBySubscription },
       { topics: ['a-retry-1'], autocommit: false, mode: 'committed', fallbackMode: 'latest', partitionAssigner: partitionAssignerBySubscription }
@@ -485,6 +664,7 @@ describe('platformaticAdapter: consume', () => {
     const custom = await connected({}, { consumer: { partitionAssigner: own } })
     await custom.adapter.consume({ groupId: 'g', topics: ['a'], eachMessage: async () => {} })
     assert.equal((custom.calls.consumeOptions[0] as { partitionAssigner: unknown }).partitionAssigner, own)
+    assert.equal((custom.calls.consumers[0]!.options as { partitionAssigner: unknown }).partitionAssigner, own)
     await custom.adapter.disconnect()
   })
 
@@ -504,6 +684,17 @@ describe('platformaticAdapter: consume', () => {
       // A member whose subscription could not be read is offered every subscribed topic, the way the client would.
       ['c', ['orders:2', 'orders-retry-1:1']]
     ])
+  })
+
+  test('the round-robin carries on across topics, so the odd partition of each topic does not always land on the same member', () => {
+    const members = new Map([
+      ['a', { memberId: 'a', version: 1, topics: ['orders', 'payments'] }],
+      ['b', { memberId: 'b', version: 1, topics: ['orders', 'payments'] }]
+    ])
+    const metadata = { topics: new Map([['orders', { partitionsCount: 3 }], ['payments', { partitionsCount: 3 }]]) }
+    const assigned = partitionAssignerBySubscription('a', members as never, new Set(['orders', 'payments']), metadata as never)
+    const counts = assigned.map(({ memberId, assignments }) => [memberId, [...assignments.values()].reduce((total, { partitions }) => total + partitions.length, 0)])
+    assert.deepEqual(counts, [['a', 3], ['b', 3]])
   })
 
   test('a consume that fails closes the consumer it opened and wraps the error', async () => {
@@ -875,12 +1066,14 @@ describe('platformaticAdapter: consume', () => {
     await adapter.disconnect()
   })
 
-  test('a rejected eachMessage does not stop the partition', async () => {
+  test('a rejected eachMessage is reported and settled: the partition moves on', async () => {
     const { adapter, calls } = await connected()
     const seen: string[] = []
+    const reported: unknown[] = []
     const handle = await adapter.consume({
       groupId: 'g',
       topics: ['t'],
+      onError: (error) => { reported.push(error) },
       eachMessage: async (raw) => {
         seen.push(raw.offset)
         if (raw.offset === '0') throw new Error('handler blew up')
@@ -890,6 +1083,8 @@ describe('platformaticAdapter: consume', () => {
     stream.push(message({ offset: 0 }))
     stream.push(message({ offset: 1 }))
     await until(() => seen.length === 2, 'both deliveries')
+    assert.match(String(reported[0]), /handler blew up/)
+    assert.equal(reported.length, 1)
     await handle.stop()
     await adapter.disconnect()
   })
@@ -905,7 +1100,8 @@ describe('platformaticAdapter: admin', () => {
     ])
     assert.deepEqual(calls.created, [
       { topics: [{ topic: 'a', partitions: 3, replicas: 2 }], configs: [{ name: 'retention.ms', value: '1000' }] },
-      { topics: [{ topic: 'b', partitions: 1, replicas: 1 }] }
+      // Left out, the broker's defaults: the client sends -1 for both.
+      { topics: [{ topic: 'b', partitions: undefined, replicas: undefined }] }
     ])
     assert.equal(calls.listTopicsCalls, 3)
     await adapter.disconnect()
@@ -1023,5 +1219,125 @@ describe('platformaticAdapter: admin', () => {
       assert.match(error.message, /disconnect failed: socket gone/)
       return true
     })
+  })
+
+  test('a failed connect with a transactionalId closes the transactional producer too', async () => {
+    const { module, calls } = fakeClient({ connectError: networkError() })
+    const adapter = platformaticAdapter({ client: module })
+    await assert.rejects(adapter.connect({ ...broker, transactionalId: 'orders-service-1' }), { code: ERROR_CODES.ADAPTER, retryable: true })
+    assert.deepEqual(calls.closed.sort(), ['admin', 'producer', 'producer'])
+  })
+
+  test('without a client option the adapter loads @platformatic/kafka itself', async () => {
+    const adapter = platformaticAdapter({ admin: { retries: 0 }, producer: { retries: 2 } })
+    await assert.rejects(adapter.connect({ clientId: 'probe', brokers: ['127.0.0.1:1'] }), { code: ERROR_CODES.ADAPTER, message: /connect failed/ })
+  })
+
+  test('a topic the metadata does not know has no partitions to ask about', async () => {
+    const { adapter, calls } = await connected({ metadata: { a: [1] }, offsets: () => [{ name: 'a', partitions: [{ partitionIndex: 0, offset: 3n, timestamp: 0n, leaderEpoch: 0 }] }] })
+    assert.deepEqual(await adapter.admin.fetchTopicOffsets!(['missing', 'a']), [{ topic: 'a', partition: 0, low: '3', high: '3' }])
+    const [query] = calls.offsetQueries as [{ topics: unknown[] }]
+    assert.deepEqual(query.topics, [{ name: 'a', partitions: [{ partitionIndex: 0, timestamp: -1n }] }])
+    await adapter.disconnect()
+  })
+
+  test('a reopen that fails after the stop is neither reported nor retried', async () => {
+    const { handle, errors, consumer, stream } = await consuming({}, { reconnectDelayMs: 5 })
+    let refuse!: () => void
+    const pending = new Promise<void>((resolve) => { refuse = resolve })
+    let reopening = false
+    consumer.consume = async () => {
+      reopening = true
+      await pending
+      throw new Error('late refusal')
+    }
+    stream().destroy(new Error('fetch gave up'))
+    await until(() => reopening, 'the reopen under way')
+    const stopping = handle.stop()
+    refuse()
+    await stopping
+    await settle()
+    assert.equal(errors.length, 1, 'the late refusal is not a failure of a consumption that stopped')
+  })
+
+  test('a partition regained while no stream is open rotates nothing: the next stream starts fresh anyway', async () => {
+    const { handle, received, errors, consumer, stream } = await consuming({}, { reconnectDelayMs: 60_000 })
+    consumer.assignments = [{ topic: 't', partitions: [0] }]
+    consumer.emit('consumer:group:join', { groupId: 'g', memberId: 'm' })
+    stream().push(message({ offset: 0 }))
+    await until(() => received.length === 1, 'a delivery')
+    consumer.assignments = []
+    consumer.emit('consumer:group:join', { groupId: 'g', memberId: 'm' })
+    stream().destroy(new Error('fetch gave up'))
+    await until(() => errors.length === 1, 'the failure reported')
+    consumer.assignments = [{ topic: 't', partitions: [0] }]
+    consumer.emit('consumer:group:join', { groupId: 'g', memberId: 'm' })
+    await settle()
+    assert.equal(consumer.streams.length, 1, 'nothing to rotate while the reconnect wait runs')
+    // The dead stream is forgotten: a client error in the wait is reported, not dropped on a stream that is gone.
+    consumer.emit('error', new Error('rejoin gave up'))
+    assert.equal(errors.length, 2)
+    assert.match((errors[1] as Error).message, /consumer failed: rejoin gave up/)
+    await handle.stop()
+  })
+
+  test('a client error that is not an Error still drops the stream, described', async () => {
+    const { handle, errors, consumer } = await consuming({}, { reconnectDelayMs: 5 })
+    consumer.emit('error', 'not even an error')
+    await until(() => consumer.streams.length === 2, 'a new stream after the client error')
+    assert.match((errors[0] as Error).message, /consume failed: not even an error/)
+    await handle.stop()
+  })
+
+  test('a partition paused while it waits for a worker slot is skipped at its turn and comes back on resume', async () => {
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => { release = resolve })
+    const { handle, received, stream } = await consuming({}, {}, { hold: async (raw) => { if (raw.partition === 0) await gate } })
+    stream().push(message({ partition: 0, offset: 0 }))
+    stream().push(message({ partition: 1, offset: 0 }))
+    await settle()
+    handle.pause!([{ topic: 't', partition: 1 }])
+    release()
+    await until(() => received.length === 1, 'the first delivery')
+    await settle()
+    assert.deepEqual(received.map((raw) => raw.partition), [0], 'the paused partition did not take the slot')
+    handle.resume!([{ topic: 't', partition: 1 }])
+    await until(() => received.length === 2, 'the resumed delivery')
+    await handle.stop()
+  })
+
+  test('a join that keeps everything leaves the stream waiting for room; a stop lets it go', async () => {
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => { release = resolve })
+    const { handle, received, stream, consumer } = await consuming({}, { bufferedMessages: 1 }, { hold: async (raw) => { if (raw.offset === '0') await gate } })
+    consumer.assignments = [{ topic: 't', partitions: [0] }]
+    consumer.emit('consumer:group:join', { groupId: 'g', memberId: 'm' })
+    for (const offset of [0, 1, 2, 3]) stream().push(message({ offset }))
+    await settle()
+    assert.equal(stream().readableLength, 1, 'one in flight, one queued, one waiting for room, one unread')
+    consumer.emit('consumer:group:join', { groupId: 'g', memberId: 'm' })
+    await settle()
+    assert.equal(stream().readableLength, 1, 'nothing changed, nothing was read')
+    const stopping = handle.stop()
+    await stopping
+    release()
+    await settle()
+    assert.deepEqual(received.map((raw) => raw.offset), ['0'])
+  })
+
+  test('a stop asked from onError, while a failure is reported, ends the read loop without a reconnect wait', async () => {
+    const { adapter, calls } = await connected()
+    let stopping: Promise<void> | undefined
+    const handle = await adapter.consume({
+      groupId: 'g',
+      topics: ['t'],
+      eachMessage: async () => {},
+      onError: () => { stopping ??= handle.stop() }
+    })
+    calls.consumers[0]!.streams[0]!.destroy(new Error('fetch gave up'))
+    await until(() => stopping !== undefined, 'the stop from onError')
+    await stopping
+    assert.equal(calls.consumeOptions.length, 1, 'no reconnect was tried')
+    await adapter.disconnect()
   })
 })
