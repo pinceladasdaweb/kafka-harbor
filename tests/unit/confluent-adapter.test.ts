@@ -259,8 +259,10 @@ describe('confluentAdapter', () => {
     const eachMessage = calls.runConfig?.eachMessage
     assert.ok(eachMessage)
     const base = { heartbeat: async () => {}, pause: () => () => {} }
-    await eachMessage({ ...base, topic: 't', partition: 2, message: { key: Buffer.from('k'), value: Buffer.from('v'), timestamp: '1700000000000', offset: '41', attributes: 0, headers: { h: Buffer.from('1') } } as KafkaJS.KafkaMessage })
-    await eachMessage({ ...base, topic: 't', partition: 2, message: { key: null, value: null, timestamp: '', offset: '42', attributes: 0, headers: {} } as KafkaJS.KafkaMessage })
+    // What the client fills in when no deserializer is configured.
+    const undecoded = { deserializedKey: { key: null, error: null }, deserializedValue: { value: null, error: null } }
+    await eachMessage({ ...base, topic: 't', partition: 2, message: { ...undecoded, key: Buffer.from('k'), value: Buffer.from('v'), timestamp: '1700000000000', offset: '41', attributes: 0, headers: { h: Buffer.from('1') } } })
+    await eachMessage({ ...base, topic: 't', partition: 2, message: { ...undecoded, key: null, value: null, timestamp: '', offset: '42', attributes: 0, headers: {} } })
     assert.equal(received[0]?.timestamp, 1_700_000_000_000)
     assert.equal(received[0]?.partition, 2)
     assert.deepEqual(received[0]?.headers, { h: Buffer.from('1') })
