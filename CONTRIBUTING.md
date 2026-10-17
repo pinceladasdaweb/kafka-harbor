@@ -159,5 +159,5 @@ publish whose release commit already landed, publishes nothing. If a run
 publishes and then fails to push (main moved meanwhile), the version is on
 npm without its tag, its CHANGELOG section and its GitHub release; the next
 release bumps from the registry, so nothing is published twice under one
-number. While the version is `0.x`, every release is a minor or a patch. Commit subjects are the
+number. Commit subjects are the
 release notes, so write them for the person reading them later.

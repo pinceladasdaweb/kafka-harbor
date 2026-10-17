@@ -8,7 +8,7 @@
 
 Messages cross the sea; the harbor is where they dock safely. Every Kafka client for Node.js stops at the protocol: you get a producer, a consumer, and good luck. Retry with backoff, a dead-letter queue, offsets committed only after your code ran, a shutdown that does not lose or duplicate work: all of it gets rebuilt by hand in every project. kafka-harbor is that layer, done once, on top of the client you already use.
 
-> **Status: 0.x.** The API below is exercised end to end against a real broker. Until `1.0.0`, a minor release may still adjust it; every change is listed in [CHANGELOG.md](CHANGELOG.md), and [Versioning](#versioning) says what the version number covers.
+> The API below is exercised end to end against a real broker. Every change is listed in [CHANGELOG.md](CHANGELOG.md), and [Versioning](#versioning) says what the version number covers.
 
 ```ts
 import { createHarbor } from 'kafka-harbor'
@@ -680,7 +680,7 @@ No Docker, no broker, real pipeline: the same core code that runs in production 
 
 ## Versioning
 
-From `1.0.0` on, the version follows semantic versioning, and what it covers is the package's contract (while the version is `0.x`, a change to it ships as a minor release):
+The version follows semantic versioning, and what it covers is the package's contract:
 
 - every export of the root entry point and of each subpath (`kafka-harbor/adapters/confluent`, `kafka-harbor/adapters/platformatic`, `kafka-harbor/testing`, `kafka-harbor/prometheus`, `kafka-harbor/otel`, `kafka-harbor/schema-registry`, `kafka-harbor/decorators`, `kafka-harbor/nestjs`), frozen by one API report per entry point in `etc/`;
 - the event names and their payloads, the error classes and their `code` values;
@@ -689,7 +689,7 @@ From `1.0.0` on, the version follows semantic versioning, and what it covers is 
 - the `ClientAdapter` contract, and the invariants `runAdapterContract` checks; a member it gains is optional, so an adapter written for an earlier version keeps working;
 - the delivery guarantees in [docs/delivery-semantics.md](docs/delivery-semantics.md).
 
-Not covered: the passthrough option types of the adapters (`global`, `producer`, `consumer`, `admin`), which are the clients' own and change with them; the message text of errors and logs; the shape of the traces beyond the span names and attributes listed above. From `1.0.0` on, a release that raises the minimum Node.js version or a peer dependency's major is a major release.
+Not covered: the passthrough option types of the adapters (`global`, `producer`, `consumer`, `admin`), which are the clients' own and change with them; the message text of errors and logs; the shape of the traces beyond the span names and attributes listed above. A release that raises the minimum Node.js version or a peer dependency's major is a major release.
 
 ## Development
 
