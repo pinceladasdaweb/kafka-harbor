@@ -24,16 +24,31 @@ import {
 // application that loads both must have the decorator write under the key
 // the binder reads. The legacy dialect records on prototypes under them;
 // the standard dialect records per instance, in a side table, so a sealed
-// or frozen instance is no obstacle.
+// or frozen instance is no obstacle. The table is registered the same way:
+// every copy of this module loaded in the process shares one.
 const LISTENERS = Symbol.for('kafka-harbor:listeners')
 const CONSUMER = Symbol.for('kafka-harbor:consumer')
-const instanceListeners = new WeakMap<object, ListenerMetadata[]>()
+const INSTANCE_LISTENERS = Symbol.for('kafka-harbor:instance-listeners')
+
+/** The table every copy shares, or one of its own where the global object takes no new property (a hardened realm). */
+const sharedTable = (): WeakMap<object, ListenerMetadata[]> => {
+  const existing = (globalThis as { [INSTANCE_LISTENERS]?: WeakMap<object, ListenerMetadata[]> })[INSTANCE_LISTENERS]
+  if (existing !== undefined) return existing
+  const table = new WeakMap<object, ListenerMetadata[]>()
+  try {
+    Object.defineProperty(globalThis, INSTANCE_LISTENERS, { value: table, enumerable: false, writable: false, configurable: false })
+  } catch {
+    // A frozen or non-extensible global object: this copy keeps its own.
+  }
+  return table
+}
+const instanceListeners = sharedTable()
 
 /** One decorated method, as `bindListeners()` reads it. */
 export type ListenerMetadata =
   | { readonly kind: 'each', readonly topic: string, readonly method: string | symbol, readonly options: SubscribeOptions }
   | { readonly kind: 'batch', readonly topic: string, readonly method: string | symbol, readonly options: SubscribeBatchOptions }
-  | { readonly kind: 'dlq', readonly original: string, readonly method: string | symbol, readonly options: SubscribeOptions }
+  | { readonly kind: 'dlq', readonly original: string, readonly topic?: string, readonly method: string | symbol, readonly options: SubscribeOptions }
 
 /** `Omit` applied to each member of a union rather than to the union as a whole. */
 type DistributiveOmit<T, K extends PropertyKey> = T extends unknown ? Omit<T, K> : never
@@ -45,14 +60,14 @@ type Declared = DistributiveOmit<ListenerMetadata, 'method'>
 // ones NestJS applications compile with receive (target, key, descriptor)
 // for methods and (constructor) for classes. Both are told apart by the
 // second argument.
-interface DecoratorContext {
+export interface StandardDecoratorContext {
   readonly kind: string
   readonly name: string | symbol
   readonly static?: boolean
   readonly addInitializer: (initializer: (this: unknown) => void) => void
 }
 
-const isContext = (value: unknown): value is DecoratorContext =>
+const isContext = (value: unknown): value is StandardDecoratorContext =>
   typeof value === 'object' && value !== null && typeof (value as { kind?: unknown }).kind === 'string'
 
 /** The value stored under `key` on `holder` itself, not inherited. */
@@ -76,7 +91,7 @@ const recordOnPrototype = (prototype: object, entry: ListenerMetadata): void => 
  * `bindListeners()` reads both.
  */
 const methodDecorator = (name: string, entry: Declared) =>
-  (target: unknown, keyOrContext: string | symbol | DecoratorContext): void => {
+  (target: unknown, keyOrContext: string | symbol | StandardDecoratorContext): void => {
     if (isContext(keyOrContext)) {
       if (keyOrContext.kind !== 'method') throw new ConfigError(`@${name}() decorates methods, not a ${keyOrContext.kind}`)
       if (keyOrContext.static === true) throw new ConfigError(`@${name}() decorates instance methods; ${String(keyOrContext.name)} is static`)
@@ -103,8 +118,11 @@ const classDecorator = (name: string, options: Partial<ConsumerOptions>) =>
     Object.defineProperty(prototype, CONSUMER, { value: { ...previous, ...options }, enumerable: false, configurable: true, writable: false })
   }
 
-/** The consumer the class's handlers run in: the group and any other `ConsumerOptions`. */
-export function KafkaConsumer (options: ConsumerOptions): (target: unknown, context?: unknown) => void {
+/**
+ * The consumer the class's handlers run in: the group and any other
+ * `ConsumerOptions`. The group may come from `bindListeners()` instead.
+ */
+export function KafkaConsumer (options: Partial<ConsumerOptions> = {}): (target: unknown, context?: unknown) => void {
   return classDecorator('KafkaConsumer', options)
 }
 
@@ -114,23 +132,34 @@ export function KafkaRetry (retry: ConsumerRetryOptions): (target: unknown, cont
 }
 
 /** The method handles every message of `topic`, as `consumer.subscribe()` would. */
-export function KafkaListener<T = unknown> (topic: string, options: SubscribeOptions<T> = {}): (target: unknown, keyOrContext: string | symbol | DecoratorContext) => void {
+export function KafkaListener<T = unknown> (topic: string, options: SubscribeOptions<T> = {}): (target: unknown, keyOrContext: string | symbol | StandardDecoratorContext) => void {
   return methodDecorator('KafkaListener', { kind: 'each', topic, options: options as SubscribeOptions })
 }
 
 /** The method handles batches of `topic`, as `consumer.subscribeBatch()` would. */
-export function KafkaBatchListener<T = unknown> (topic: string, options: SubscribeBatchOptions<T> = {}): (target: unknown, keyOrContext: string | symbol | DecoratorContext) => void {
+export function KafkaBatchListener<T = unknown> (topic: string, options: SubscribeBatchOptions<T> = {}): (target: unknown, keyOrContext: string | symbol | StandardDecoratorContext) => void {
   return methodDecorator('KafkaBatchListener', { kind: 'batch', topic, options: options as SubscribeBatchOptions })
+}
+
+/** What `@DLQHandler()` takes besides the subscription options. */
+export interface DLQHandlerOptions<T = unknown> extends SubscribeOptions<T> {
+  /**
+   * The DLQ topic itself. Default: the one the consumer's
+   * `dlq.topicNaming` gives `originalTopic`, which needs the consumer's DLQ
+   * enabled; name it here for a class whose own DLQ is off.
+   */
+  topic?: string
 }
 
 /**
  * The method handles the dead letters of `originalTopic`: it subscribes to
- * that topic's DLQ, named by the consumer's `dlq.topicNaming`. A consumer
- * never consumes the DLQ it fills, so this belongs in a class of its own,
- * with its own group.
+ * that topic's DLQ, named by `options.topic` or by the consumer's
+ * `dlq.topicNaming`. A consumer never consumes the DLQ it fills, so this
+ * belongs in a class of its own, with its own group.
  */
-export function DLQHandler<T = unknown> (originalTopic: string, options: SubscribeOptions<T> = {}): (target: unknown, keyOrContext: string | symbol | DecoratorContext) => void {
-  return methodDecorator('DLQHandler', { kind: 'dlq', original: originalTopic, options: options as SubscribeOptions })
+export function DLQHandler<T = unknown> (originalTopic: string, options: DLQHandlerOptions<T> = {}): (target: unknown, keyOrContext: string | symbol | StandardDecoratorContext) => void {
+  const { topic, ...subscribe } = options
+  return methodDecorator('DLQHandler', { kind: 'dlq', original: originalTopic, ...(topic !== undefined && { topic }), options: subscribe as SubscribeOptions })
 }
 
 /**
@@ -181,10 +210,10 @@ export function bindListeners (harbor: Harbor, instance: object, overrides: Part
       consumer.subscribeBatch(listener.topic, method.bind(instance) as BatchHandler, listener.options)
       continue
     }
-    if (listener.kind === 'dlq' && dlqNaming === undefined) {
-      throw new ConfigError(`${name}.${String(listener.method)} handles the DLQ of "${listener.original}", but the consumer has the DLQ disabled`)
+    if (listener.kind === 'dlq' && listener.topic === undefined && dlqNaming === undefined) {
+      throw new ConfigError(`${name}.${String(listener.method)} handles the DLQ of "${listener.original}", but the consumer has the DLQ disabled; name the DLQ with @DLQHandler(original, { topic })`)
     }
-    const topic = listener.kind === 'dlq' ? (dlqNaming as (topic: string) => string)(listener.original) : listener.topic
+    const topic = listener.kind === 'dlq' ? listener.topic ?? (dlqNaming as (topic: string) => string)(listener.original) : listener.topic
     consumer.subscribe(topic, method.bind(instance) as Handler, listener.options)
   }
   return consumer

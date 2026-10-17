@@ -7,9 +7,9 @@
  * module.
  */
 import { DiscoveryModule, DiscoveryService } from '@nestjs/core'
-import { Module, type DynamicModule, type OnApplicationBootstrap, type OnApplicationShutdown } from '@nestjs/common'
+import { Module, type DynamicModule, type OnApplicationBootstrap, type OnApplicationShutdown, type OnModuleDestroy } from '@nestjs/common'
 
-import { ConfigError, createHarbor, type Consumer, type Harbor, type HarborConfig } from '../index'
+import { ConfigError, createHarbor, parseDuration, type Consumer, type Duration, type Harbor, type HarborConfig } from '../index'
 import { bindListeners, hasListeners } from '../decorators/index'
 
 /** Injection token of the `Harbor` the module builds. */
@@ -17,8 +17,15 @@ export const KAFKA_HARBOR = 'KAFKA_HARBOR'
 /** Injection token of the module options. */
 export const KAFKA_HARBOR_OPTIONS = 'KAFKA_HARBOR_OPTIONS'
 
-/** What `forRoot()` takes: the harbor's configuration. */
-export type KafkaHarborModuleOptions = HarborConfig
+/** What `forRoot()` takes: the harbor's configuration, and how long the application's shutdown waits for running handlers. */
+export interface KafkaHarborModuleOptions extends HarborConfig {
+  /**
+   * How long the consumers wait for running handlers when the application
+   * closes; the ones still running then are abandoned, uncommitted.
+   * Default: 30s.
+   */
+  shutdownTimeout?: Duration
+}
 
 /** What `forRootAsync()` takes: the configuration built from other providers. */
 export interface KafkaHarborModuleAsyncOptions {
@@ -38,15 +45,35 @@ export interface KafkaHarborModuleAsyncOptions {
  * running are shut down with the harbor before the failure propagates, so a
  * failed bootstrap leaves nothing consuming. Constructed by the module
  * through a factory, so it needs no decorator of its own.
+ *
+ * On close the consumers stop first, in `onModuleDestroy`: the running
+ * handlers finish and commit while what they use is still there. That is
+ * before every module's `beforeApplicationShutdown` and
+ * `onApplicationShutdown`, where most libraries close their clients, and
+ * before the `onModuleDestroy` of every module that is not global; a global
+ * module that closes a client in `onModuleDestroy` closes it first when it
+ * is imported after this one. The client disconnects in
+ * `onApplicationShutdown`. `shutdownTimeout` is one deadline for the whole
+ * close, not one per hook. Only the consumers this explorer started drain
+ * early; one created by hand on the injected harbor stops with the harbor.
+ *
+ * A scoped class is recognized by `@KafkaConsumer()` (or `@KafkaRetry()`)
+ * on it or a class it extends, or by legacy method decorators; standard
+ * method decorators record per instance, which a scoped class does not
+ * have here.
  */
-export class KafkaListenersExplorer implements OnApplicationBootstrap, OnApplicationShutdown {
+export class KafkaListenersExplorer implements OnApplicationBootstrap, OnModuleDestroy, OnApplicationShutdown {
   private readonly harbor: Harbor
   private readonly discovery: DiscoveryService
+  private readonly timeoutMs: number
+  /** When the close must be over: set as it begins, so the hooks share one timeout. */
+  private closingBy = Infinity
   private readonly bound: Consumer[] = []
 
-  constructor (harbor: Harbor, discovery: DiscoveryService) {
+  constructor (harbor: Harbor, discovery: DiscoveryService, shutdownTimeout: Duration = '30s') {
     this.harbor = harbor
     this.discovery = discovery
+    this.timeoutMs = parseDuration(shutdownTimeout, 'shutdownTimeout')
   }
 
   async onApplicationBootstrap (): Promise<void> {
@@ -69,13 +96,30 @@ export class KafkaListenersExplorer implements OnApplicationBootstrap, OnApplica
         await consumer.start()
       }
     } catch (error) {
-      await this.harbor.shutdown()
+      await this.harbor.shutdown(this.timeoutMs)
       throw error
     }
   }
 
+  /**
+   * Stops every consumer: no new message, running handlers finish and
+   * commit. Each gets `shutdownTimeout`, the close's one deadline, whatever
+   * its own `stopTimeout`. A handler that outlives it is abandoned here and
+   * reported by the harbor's shutdown in `onApplicationShutdown`, so the
+   * rest of the application still closes.
+   */
+  async onModuleDestroy (): Promise<void> {
+    this.closingBy = this.now() + this.timeoutMs
+    await Promise.allSettled(this.bound.map(async (consumer) => { await consumer.stop(this.timeoutMs) }))
+  }
+
+  /** What is left of the timeout goes to the sends and transactions in flight, then the client disconnects. */
   async onApplicationShutdown (): Promise<void> {
-    await this.harbor.shutdown()
+    await this.harbor.shutdown(Math.max(0, Math.min(this.timeoutMs, this.closingBy - this.now())))
+  }
+
+  private now (): number {
+    return this.harbor.config.clock?.now() ?? Date.now()
   }
 
   /** The consumers bound so far, started in order. */
@@ -84,8 +128,25 @@ export class KafkaListenersExplorer implements OnApplicationBootstrap, OnApplica
   }
 }
 
-const isDecoratedClass = (metatype: unknown): boolean =>
-  typeof metatype === 'function' && Object.getOwnPropertySymbols((metatype as { prototype: object }).prototype ?? {}).some((symbol) => symbol.description?.startsWith('kafka-harbor:') === true)
+/**
+ * Whether a class, or a class it extends, carries a decorator of this
+ * package. A scoped provider's metatype is its class or, for a factory
+ * provider, the factory, which may be an arrow function with no prototype.
+ */
+const isDecoratedClass = (metatype: unknown): boolean => {
+  // Object() so a metatype Nest left null reads as one without a prototype.
+  for (let prototype = (Object(metatype) as { prototype?: object | null }).prototype; prototype !== undefined && prototype !== null && prototype !== Object.prototype; prototype = Object.getPrototypeOf(prototype) as object | null) {
+    if (Object.getOwnPropertySymbols(prototype).some((symbol) => symbol.description?.startsWith('kafka-harbor:') === true)) return true
+  }
+  return false
+}
+
+/** The harbor's configuration without the module's own options; what is not an object goes to `createHarbor` as it is, to be refused there. */
+const harborConfigOf = (options: KafkaHarborModuleOptions): HarborConfig => {
+  if (typeof options !== 'object' || options === null) return options
+  const { shutdownTimeout, ...config } = options
+  return config
+}
 
 type OptionsProvider =
   | { provide: string, useValue: KafkaHarborModuleOptions }
@@ -121,8 +182,12 @@ export class KafkaHarborModule {
       imports: [DiscoveryModule, ...(context.imports ?? [])],
       providers: [
         optionsProvider,
-        { provide: KAFKA_HARBOR, useFactory: (config: KafkaHarborModuleOptions) => createHarbor(config), inject: [KAFKA_HARBOR_OPTIONS] },
-        { provide: KafkaListenersExplorer, useFactory: (harbor: Harbor, discovery: DiscoveryService) => new KafkaListenersExplorer(harbor, discovery), inject: [KAFKA_HARBOR, DiscoveryService] }
+        { provide: KAFKA_HARBOR, useFactory: (options: KafkaHarborModuleOptions) => createHarbor(harborConfigOf(options)), inject: [KAFKA_HARBOR_OPTIONS] },
+        {
+          provide: KafkaListenersExplorer,
+          useFactory: (harbor: Harbor, discovery: DiscoveryService, options: KafkaHarborModuleOptions) => new KafkaListenersExplorer(harbor, discovery, options.shutdownTimeout),
+          inject: [KAFKA_HARBOR, DiscoveryService, KAFKA_HARBOR_OPTIONS]
+        }
       ],
       exports: [KAFKA_HARBOR, KAFKA_HARBOR_OPTIONS, KafkaListenersExplorer]
     }
