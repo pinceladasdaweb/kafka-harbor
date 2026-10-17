@@ -1,5 +1,38 @@
 # CHANGELOG
 
+## 1.0.0 (2026-10-17)
+
+* chore(deps-dev): bump @testcontainers/kafka from 12.1.0 to 12.2.0 by dependabot[bot] [View](https://github.com/pinceladasdaweb/kafka-harbor/commit/38e64aa8242780d6abcf943898f8144c7bfddfa2)
+* chore(deps-dev): bump lint-staged from 17.5.1 to 17.6.0 by dependabot[bot] [View](https://github.com/pinceladasdaweb/kafka-harbor/commit/7d96bfc377bf36c290aaeb44e6b5f59c383eae3c)
+* chore(deps-dev): bump testcontainers from 12.1.0 to 12.2.0 by dependabot[bot] [View](https://github.com/pinceladasdaweb/kafka-harbor/commit/347ef6a5afdeaabedd73c98b3e9599fa6842f16f)
+* chore(deps-dev): bump @types/node from 26.6.2 to 26.6.3 by dependabot[bot] [View](https://github.com/pinceladasdaweb/kafka-harbor/commit/fcdbdaae84ff6f4f00c0988599bf1d6a23f822fa)
+* chore(deps-dev): bump @platformatic/kafka from 2.12.0 to 2.12.1 by dependabot[bot] [View](https://github.com/pinceladasdaweb/kafka-harbor/commit/432ff19dfcb1947ab28c476511402c69ba3602a7)
+* chore(deps-dev): bump @nestjs/testing from 12.1.0 to 12.1.2 by dependabot[bot] [View](https://github.com/pinceladasdaweb/kafka-harbor/commit/6241d844658feb3e1c46748794a79b6309c0adbb)
+* chore(deps-dev): bump @microsoft/api-extractor from 7.59.2 to 7.59.3 by dependabot[bot] [View](https://github.com/pinceladasdaweb/kafka-harbor/commit/cd50095ffa3973e90a24aaf32ae66dc349b8fad0)
+* chore(deps-dev): bump rollup from 4.63.4 to 4.63.5 by dependabot[bot] [View](https://github.com/pinceladasdaweb/kafka-harbor/commit/28bcc8710bfc3ad2506361f5ad81b7f36bb9afe1)
+* chore(deps-dev): bump @nestjs/core from 12.1.0 to 12.1.2 by dependabot[bot] [View](https://github.com/pinceladasdaweb/kafka-harbor/commit/08b51aa2a493d1ee3942ede36291f09146b0b015)
+* chore(deps-dev): bump @nestjs/common from 12.1.0 to 12.1.2 by dependabot[bot] [View](https://github.com/pinceladasdaweb/kafka-harbor/commit/7f3431af7ba11e98e0695b9a33cad3fe30f8b9a7)
+* chore(deps-dev): bump @platformatic/kafka from 2.12.1 to 2.13.0 by dependabot[bot] [View](https://github.com/pinceladasdaweb/kafka-harbor/commit/6783b579b1ba9959321d1785fec0708f1d092ad5)
+* chore(deps-dev): bump rollup from 4.63.5 to 4.64.1 by dependabot[bot] [View](https://github.com/pinceladasdaweb/kafka-harbor/commit/954f9851526a6c4c39c6d070cba0593b6524af7a)
+* chore(deps-dev): bump @types/node from 26.6.3 to 26.6.4 by dependabot[bot] [View](https://github.com/pinceladasdaweb/kafka-harbor/commit/9d5483972c6c7752b4deb38568e600919bd2b002)
+* chore(deps-dev): bump @microsoft/api-extractor from 7.59.3 to 7.59.4 by dependabot[bot] [View](https://github.com/pinceladasdaweb/kafka-harbor/commit/f04bfc71fb0d0b62a5b719136dcb3c5742ebae44)
+* chore(deps-dev): bump @opentelemetry/context-async-hooks by dependabot[bot] [View](https://github.com/pinceladasdaweb/kafka-harbor/commit/3d376dc2c75c640cc10810ea799f40bf76f487a7)
+* chore(deps-dev): bump @opentelemetry/core from 2.11.0 to 2.12.0 by dependabot[bot] [View](https://github.com/pinceladasdaweb/kafka-harbor/commit/7e79840d743a05239fd7986b061738afb98eb766)
+* chore(deps-dev): bump @opentelemetry/sdk-metrics from 2.11.0 to 2.12.0 by dependabot[bot] [View](https://github.com/pinceladasdaweb/kafka-harbor/commit/9a232436c358c68b97496e670bca44a5127965ee)
+* chore(deps-dev): bump @opentelemetry/sdk-trace-base by dependabot[bot] [View](https://github.com/pinceladasdaweb/kafka-harbor/commit/c3f5a4ef1be54cc4b73168e7c6c6e54723dc6c12)
+* chore(deps): upgrade dependencies by Pedro Rogério [View](https://github.com/pinceladasdaweb/kafka-harbor/commit/1284e0dfcabff46bc79cfec5549941aa0c84fe16)
+* test: cover every branch of the consumer core and the two adapters by Pedro Rogério [View](https://github.com/pinceladasdaweb/kafka-harbor/commit/ca923c3ab6e82441f188faa249a0a8d5d2b71d50)
+* test: skip the installed Confluent client test where the binding is absent by Pedro Rogério [View](https://github.com/pinceladasdaweb/kafka-harbor/commit/8643e2076715c247d26d7d8b0bfce321d596da31)
+* fix(core): harden the consumer, shutdown and transactions before 1.0 by Pedro Rogério [View](https://github.com/pinceladasdaweb/kafka-harbor/commit/d0ab4e0dd439aa939823e83523ef5c66abcf18c1)
+* fix(adapters): fencing, transaction timeouts and connection races by Pedro Rogério [View](https://github.com/pinceladasdaweb/kafka-harbor/commit/da88994d6bd09f0dcc64e99e800c0b0b3fcd028f)
+* fix(observability): hop parentage, metric validation and re-attaching by Pedro Rogério [View](https://github.com/pinceladasdaweb/kafka-harbor/commit/f2113f34ed12a5a07889251043fb70d298208d45)
+* fix(nestjs): drain consumers first and share one shutdown deadline by Pedro Rogério [View](https://github.com/pinceladasdaweb/kafka-harbor/commit/134506a524215f3fd82cd20be38d3853a7715ae8)
+* build: per-entry API reports, packaging checks and a guarded publish by Pedro Rogério [View](https://github.com/pinceladasdaweb/kafka-harbor/commit/5ef8aeb69b07f616fba4ce6d776daad4d8965b2a)
+* docs: describe the 1.0 behaviour of shutdown, transactions and adapters by Pedro Rogério [View](https://github.com/pinceladasdaweb/kafka-harbor/commit/5ce03574e70353207a8167f107dcc113ef8b7c4a)
+* docs: drop the 0.x status; the version follows semantic versioning by Pedro Rogério [View](https://github.com/pinceladasdaweb/kafka-harbor/commit/dd034bc587902fffddcb1687042155dff6e23b45)
+* chore(deps): upgrade dependencies by Pedro Rogério [View](https://github.com/pinceladasdaweb/kafka-harbor/commit/40d12d34c542f7414714226b652f3e6ad2ef0cef)
+
+
 ## 0.9.1 (2026-09-28)
 
 * chore(deps-dev): bump @nestjs/testing from 12.0.3 to 12.1.0 by dependabot[bot] [View](https://github.com/pinceladasdaweb/kafka-harbor/commit/06de96baeedf5e3eda6233102bc93c2a2e983248)
