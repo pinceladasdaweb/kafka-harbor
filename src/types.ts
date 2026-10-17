@@ -41,7 +41,8 @@ export interface Message<T = unknown> {
 
 /** A message as the application sends it. */
 export interface OutgoingMessage<T = unknown> {
-  key?: string | null
+  /** The partitioning key: text (sent as UTF-8) or bytes as they are. A handler reads keys as UTF-8 text. */
+  key?: string | Buffer | null
   /** The payload, or `null` for a tombstone (a record with no value, which compaction reads as a delete). */
   value: T | null
   headers?: MessageHeaders

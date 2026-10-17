@@ -4,8 +4,8 @@ import type { Logger, Message, MessageHeaders } from './types'
 
 /**
  * What a batch of records is for: the application's own `send()`, the hop
- * of a failed message to a retry topic or to the DLQ, or a redrive back into
- * service.
+ * of a failed message to a retry topic or to the DLQ, a redrive back into
+ * service, or a send inside a transaction.
  */
 export type ProduceKind = 'send' | 'retry' | 'dead-letter' | 'redrive' | 'transaction'
 
@@ -18,7 +18,8 @@ export interface ProduceBatch {
   /**
    * For a hop (`retry`, `dead-letter`, `redrive`): the consumed message the
    * batch forwards, with the headers it arrived with, so an instrumentation
-   * can tie the hop to the trace that message carries. Absent for `send`.
+   * can tie the hop to the trace that message carries. Absent for `send`
+   * and `transaction`.
    */
   readonly origin?: Pick<Message, 'topic' | 'partition' | 'offset' | 'headers'>
 }
@@ -45,13 +46,24 @@ export interface Instrumentation {
    */
   wrapProduce?: <T>(batch: ProduceBatch, run: () => Promise<T>) => Promise<T>
   /**
-   * Called for every record right before it is produced. Whatever it
-   * returns is added to the record's headers: the place for a trace context
-   * that has to travel with the message. A header the record already
-   * carries wins over the hook's, so a context set by the application, or
-   * copied from the message a hop forwards, is never overwritten.
+   * Called for every record right before it is produced. What it returns
+   * (string values only) is added to the record's headers: the place for a
+   * trace context that has to travel with the message. A header the record
+   * already carries wins over the hook's, so a context set by the
+   * application is never overwritten; on a hop, which copies the headers of
+   * the message it forwards, the ones named by `propagationFields` are the
+   * exception.
    */
   onProduce?: (record: OutgoingRecord) => MessageHeaders | undefined
+  /**
+   * The header names `onProduce` writes a trace context to (an OpenTelemetry
+   * propagator's `fields()`). On a hop these are taken from the hook, never
+   * from the forwarded message: the hop carries a context of its own, and a
+   * stale one does not travel next to it. Every other header the hop copied
+   * stays as it was. Without this member, a hop keeps every header it
+   * copies.
+   */
+  propagationFields?: () => readonly string[]
   /**
    * Wraps one handler invocation. The message carries the headers the
    * producer side wrote, so a trace context extracted here parents the

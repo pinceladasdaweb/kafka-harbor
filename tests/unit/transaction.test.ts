@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { describe, test } from 'node:test'
 
-import { AdapterError, ERROR_CODES, type HarborEvents, type TransactionHandle } from '../../src/index'
+import { AdapterError, ERROR_CODES, FencedError, type HarborEvents, type Transaction, type TransactionHandle } from '../../src/index'
 import { captureEvents, harness, json } from '../helpers/harness'
 import { until } from '../helpers/manual-clock'
 
@@ -12,7 +12,7 @@ describe('harbor.transaction()', () => {
   test('what the function produced lands together on commit, reported as one transaction and as transactional produces', async () => {
     const h = transactional()
     const completed = captureEvents(h.harbor, 'transactionCompleted')
-    const produced = captureEvents(h.harbor, 'messageProduced')
+    const produced = captureEvents(h.harbor, 'batchProduced')
     h.adapter.createTopic('orders')
     h.adapter.createTopic('audit')
     const result = await h.harbor.transaction(async (tx) => {
@@ -76,6 +76,41 @@ describe('harbor.transaction()', () => {
     await assert.rejects(h.harbor.transaction(async (tx) => { await tx.send('orders', { value: 1 }) }), /fenced/)
     assert.equal(completed[0]?.outcome, 'aborted')
     assert.ok(h.logs.some((entry) => entry.level === 'warn' && entry.message.includes('transaction abort failed after') && entry.message.includes('fenced') && entry.message.includes('gone too')))
+    await h.harbor.shutdown()
+  })
+
+  test('a send the broker fenced wins over what the function threw after it: the caller learns it has to stop', async () => {
+    const h = transactional()
+    h.adapter.createTopic('orders')
+    const original = h.adapter.transaction!.bind(h.adapter)
+    h.adapter.transaction = async (): Promise<TransactionHandle> => {
+      const handle = await original()
+      return { ...handle, produce: async () => { throw new FencedError('shop-1') } }
+    }
+    const completed = captureEvents(h.harbor, 'transactionCompleted')
+    await assert.rejects(h.harbor.transaction(async (tx) => {
+      tx.send('orders', { value: 1 }).catch(() => {})
+      throw new Error('the function failed on its own')
+    }), { code: ERROR_CODES.FENCED })
+    assert.equal((completed[0]?.error as { code?: string }).code, ERROR_CODES.FENCED)
+    // Without a fence among the sends, the function's own error stands, whatever else failed or succeeded.
+    h.adapter.transaction = original
+    const own = new Error('the function failed')
+    await assert.rejects(h.harbor.transaction(async (tx) => {
+      await tx.send('orders', { value: 'landed' })
+      throw own
+    }), (error: unknown) => error === own)
+    h.adapter.transaction = async (): Promise<TransactionHandle> => {
+      const handle = await original()
+      return { ...handle, produce: async () => { throw new AdapterError('refused') } }
+    }
+    await assert.rejects(h.harbor.transaction(async (tx) => {
+      tx.send('orders', { value: 'refused' }).catch(() => {})
+      throw own
+    }), (error: unknown) => error === own)
+    // A function that throws the fence itself keeps it as it is.
+    const fence = new FencedError('shop-1')
+    await assert.rejects(h.harbor.transaction(async () => { throw fence }), (error: unknown) => error === fence)
     await h.harbor.shutdown()
   })
 
@@ -240,5 +275,129 @@ describe('ctx.transaction() in a handler', () => {
     await h.harbor.transaction(async () => {})
     assert.deepEqual(events, ['transactionCompleted'])
     await h.harbor.shutdown()
+  })
+})
+
+describe('harbor.transaction(): what outlives the function, and the shutdown', () => {
+  test('a transaction whose function never ends holds the next ones until the shutdown, which refuses them', async () => {
+    const h = transactional()
+    h.adapter.createTopic('orders')
+    let entered = false
+    h.harbor.transaction(async () => {
+      entered = true
+      await new Promise(() => {})
+    }).catch(() => {})
+    await until(() => entered)
+    const queued = h.harbor.transaction(async (tx) => { await tx.send('orders', { value: 'never' }) })
+    const closing = h.harbor.shutdown(1_000)
+    await until(() => h.clock.waiting === 1)
+    h.clock.advance(1_000)
+    await closing
+    await assert.rejects(queued, { code: ERROR_CODES.CLOSED })
+    await assert.rejects(h.harbor.transaction(async () => {}), { code: ERROR_CODES.CLOSED })
+    assert.equal(h.adapter.messages('orders').length, 0)
+    assert.ok(h.logs.some((entry) => entry.level === 'warn' && entry.message.includes('2 send(s) or transaction(s) still in flight after 1000ms')))
+  })
+
+  test('a send the function did not await still lands in the transaction before the commit; one begun after the function ended is refused', async () => {
+    const h = transactional()
+    const completed = captureEvents(h.harbor, 'transactionCompleted')
+    h.adapter.createTopic('orders')
+    let late: Transaction | undefined
+    let pending: Promise<void> | undefined
+    await h.harbor.transaction(async (tx) => {
+      pending = tx.send('orders', { value: 'not awaited' })
+      late = tx
+    })
+    await pending
+    assert.deepEqual(h.adapter.messages('orders').map((message) => json(message.value)), ['not awaited'])
+    assert.deepEqual(completed.map((event) => [event.outcome, event.records]), [['committed', 1]])
+    await assert.rejects((late as Transaction).send('orders', { value: 'late' }), (error: unknown) => {
+      assert.equal((error as { code: string }).code, ERROR_CODES.CLOSED)
+      assert.match((error as Error).message, /transaction is closed/)
+      return true
+    })
+    assert.equal(h.adapter.messages('orders').length, 1)
+    await h.harbor.shutdown()
+  })
+
+  test('a send the function did not await that fails aborts the transaction', async () => {
+    const h = transactional()
+    const completed = captureEvents(h.harbor, 'transactionCompleted')
+    h.adapter.createTopic('orders')
+    h.adapter.failNextProduce(new AdapterError('refused', { retryable: false }))
+    await assert.rejects(h.harbor.transaction(async (tx) => {
+      tx.send('orders', { value: 'x' }).catch(() => {})
+    }), { message: /refused/ })
+    assert.deepEqual(completed.map((event) => [event.outcome, event.records]), [['aborted', 0]])
+    assert.equal(h.adapter.messages('orders').length, 0)
+    await h.harbor.shutdown()
+  })
+
+  test('a transaction begun from a timer the function set up, once it ended, is not taken for a nested one', async () => {
+    const h = transactional()
+    h.adapter.createTopic('orders')
+    let later: Promise<void> | undefined
+    await h.harbor.transaction(async () => {
+      later = new Promise<void>((resolve, reject) => {
+        setImmediate(() => { h.harbor.transaction(async (tx) => { await tx.send('orders', { value: 'later' }) }).then(resolve, reject) })
+      })
+    })
+    await later
+    assert.deepEqual(h.adapter.messages('orders').map((message) => json(message.value)), ['later'])
+    await h.harbor.shutdown()
+  })
+
+  test('a transaction the client cannot begin is reported as aborted, with nothing sent', async () => {
+    const h = transactional()
+    const completed = captureEvents(h.harbor, 'transactionCompleted')
+    h.adapter.transaction = async () => { throw new AdapterError('coordinator away') }
+    await assert.rejects(h.harbor.transaction(async () => {}), { message: /coordinator away/ })
+    assert.deepEqual(completed.map((event) => [event.outcome, event.records, (event.error as Error).message, event.durationMs]), [['aborted', 0, 'coordinator away', 0]])
+    await h.harbor.shutdown()
+  })
+
+  test('a transaction whose function outlives the shutdown timeout is aborted, with ClosedError, when the client is released', async () => {
+    const h = transactional()
+    const completed = captureEvents(h.harbor, 'transactionCompleted')
+    h.adapter.createTopic('orders')
+    let release!: () => void
+    const held = new Promise<void>((resolve) => { release = resolve })
+    let late: Promise<void> | undefined
+    const running = h.harbor.transaction(async (tx) => {
+      await held
+      late = tx.send('orders', { value: 'after the release' })
+      await late.catch(() => {})
+    })
+    await until(() => methods(h).includes('transaction'))
+    const closing = h.harbor.shutdown(1_000)
+    await until(() => h.clock.waiting === 1)
+    h.clock.advance(1_000)
+    await closing
+    release()
+    await assert.rejects(running, { code: ERROR_CODES.CLOSED, message: /harbor is closed/ })
+    await assert.rejects(late as Promise<void>, { code: ERROR_CODES.CLOSED })
+    assert.deepEqual(completed.map((event) => [event.outcome, event.records]), [['aborted', 0]])
+    assert.equal(h.adapter.messages('orders').length, 0)
+  })
+
+  test('a transaction whose function ends after the client was released is not committed through it', async () => {
+    const h = transactional()
+    h.adapter.createTopic('orders')
+    let release!: () => void
+    const held = new Promise<void>((resolve) => { release = resolve })
+    const running = h.harbor.transaction(async (tx) => {
+      await tx.send('orders', { value: 'sent before' })
+      await held
+    })
+    await until(() => methods(h).includes('transactionProduce'))
+    const closing = h.harbor.shutdown(1_000)
+    await until(() => h.clock.waiting === 1)
+    h.clock.advance(1_000)
+    await closing
+    release()
+    await assert.rejects(running, { code: ERROR_CODES.CLOSED })
+    assert.ok(!methods(h).includes('transactionCommit'))
+    assert.equal(h.adapter.messages('orders').length, 0)
   })
 })

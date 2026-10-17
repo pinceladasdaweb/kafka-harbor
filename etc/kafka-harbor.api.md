@@ -8,22 +8,15 @@ import { Backoff } from 'breakwater';
 import { BreakerState } from 'breakwater';
 import { CircuitBreakerOptions } from 'breakwater';
 import { CircuitBreakerPolicy } from 'breakwater';
-import { RetryPolicy } from 'breakwater';
 
-// Warning: (ae-missing-release-tag) "abortProcessing" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
-//
 // @public
 export function abortProcessing(cause: unknown): AbortProcessingError;
 
-// Warning: (ae-missing-release-tag) "AbortProcessingError" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
-//
 // @public
 export class AbortProcessingError extends HarborError {
     constructor(cause: unknown);
 }
 
-// Warning: (ae-missing-release-tag) "AdapterError" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
-//
 // @public (undocumented)
 export class AdapterError extends HarborError {
     constructor(message: string, options?: ErrorOptions & {
@@ -31,8 +24,6 @@ export class AdapterError extends HarborError {
     });
 }
 
-// Warning: (ae-missing-release-tag) "AdminApi" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
-//
 // @public (undocumented)
 export interface AdminApi {
     createTopics: (topics: readonly TopicSpec[]) => Promise<void>;
@@ -42,8 +33,6 @@ export interface AdminApi {
     topicExists: (topic: string) => Promise<boolean>;
 }
 
-// Warning: (ae-missing-release-tag) "BatchContext" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
-//
 // @public
 export interface BatchContext {
     readonly groupId: string;
@@ -56,21 +45,15 @@ export interface BatchContext {
     readonly transaction: <T>(fn: (tx: Transaction) => Promise<T>, options?: TransactionOptions) => Promise<T>;
 }
 
-// Warning: (ae-missing-release-tag) "BatchFailedError" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
-//
 // @public
 export class BatchFailedError extends HarborError {
     constructor(failed: readonly Message[], cause: unknown);
     readonly failed: readonly Message[];
 }
 
-// Warning: (ae-missing-release-tag) "BatchHandler" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
-//
 // @public
 export type BatchHandler<T = unknown> = (messages: Array<Message<T>>, context: BatchContext) => Promise<void> | void;
 
-// Warning: (ae-missing-release-tag) "BrokerConfig" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
-//
 // @public (undocumented)
 export interface BrokerConfig {
     // (undocumented)
@@ -84,8 +67,6 @@ export interface BrokerConfig {
     readonly transactionalId?: string;
 }
 
-// Warning: (ae-missing-release-tag) "ClientAdapter" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
-//
 // @public (undocumented)
 export interface ClientAdapter {
     // (undocumented)
@@ -101,8 +82,6 @@ export interface ClientAdapter {
     transaction?: () => Promise<TransactionHandle>;
 }
 
-// Warning: (ae-missing-release-tag) "Clock" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
-//
 // @public
 export interface Clock {
     // (undocumented)
@@ -111,29 +90,21 @@ export interface Clock {
     sleep: (ms: number, signal?: AbortSignal) => Promise<void>;
 }
 
-// Warning: (ae-missing-release-tag) "ClosedError" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
-//
 // @public (undocumented)
 export class ClosedError extends HarborError {
     constructor(what: string);
 }
 
-// Warning: (ae-missing-release-tag) "CommittedOffset" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
-//
 // @public
 export interface CommittedOffset extends TopicPartition {
     readonly offset: string | null;
 }
 
-// Warning: (ae-missing-release-tag) "ConfigError" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
-//
 // @public (undocumented)
 export class ConfigError extends HarborError {
     constructor(message: string, options?: ErrorOptions);
 }
 
-// Warning: (ae-missing-release-tag) "ConsumeOptions" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
-//
 // @public (undocumented)
 export interface ConsumeOptions {
     readonly concurrency?: number;
@@ -148,38 +119,25 @@ export interface ConsumeOptions {
     readonly topics: readonly string[];
 }
 
-// Warning: (ae-missing-release-tag) "Consumer" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
-//
-// @public (undocumented)
-export class Consumer {
-    constructor(context: ConsumerContext, options: ConsumerOptions);
+// @public
+export interface Consumer {
     // (undocumented)
     readonly groupId: string;
     lag(): Promise<PartitionLag[]>;
     start(): Promise<void>;
-    // (undocumented)
-    get status(): ConsumerState;
-    stop(timeoutMs?: number): Promise<void>;
-    get stoppedBecause(): StopReason | undefined;
+    readonly status: ConsumerState;
+    stop(timeout?: Duration): Promise<void>;
+    readonly stoppedBecause: StopReason | undefined;
     subscribe<T = unknown>(topic: string, handler: Handler<T>, options?: SubscribeOptions<T>): this;
     subscribeBatch<T = unknown>(topic: string, handler: BatchHandler<T>, options?: SubscribeBatchOptions<T>): this;
 }
 
-// Warning: (ae-missing-release-tag) "ConsumerBreakerOptions" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
-//
 // @public
 export interface ConsumerBreakerOptions extends CircuitBreakerOptions {
     hold?: Duration;
     policy?: CircuitBreakerPolicy;
 }
 
-// Warning: (ae-missing-release-tag) "ConsumerContext" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
-//
-// @public
-export type ConsumerContext = CoreContext<ConsumerEvents>;
-
-// Warning: (ae-missing-release-tag) "ConsumerDlqOptions" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
-//
 // @public (undocumented)
 export interface ConsumerDlqOptions {
     enabled?: boolean;
@@ -187,8 +145,6 @@ export interface ConsumerDlqOptions {
     topicNaming?: DlqTopicNaming;
 }
 
-// Warning: (ae-missing-release-tag) "ConsumerEvents" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
-//
 // @public (undocumented)
 export interface ConsumerEvents extends ProduceEvents {
     batchProcessed: {
@@ -259,8 +215,6 @@ export interface ConsumerEvents extends ProduceEvents {
     };
 }
 
-// Warning: (ae-missing-release-tag) "ConsumerHandle" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
-//
 // @public
 export interface ConsumerHandle {
     commit: (offsets: readonly TopicPartitionOffset[]) => Promise<void>;
@@ -270,8 +224,6 @@ export interface ConsumerHandle {
     stop: () => Promise<void>;
 }
 
-// Warning: (ae-missing-release-tag) "ConsumerHealth" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
-//
 // @public (undocumented)
 export interface ConsumerHealth {
     // (undocumented)
@@ -281,8 +233,6 @@ export interface ConsumerHealth {
     readonly stoppedBecause: StopReason | undefined;
 }
 
-// Warning: (ae-missing-release-tag) "ConsumerOptions" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
-//
 // @public (undocumented)
 export interface ConsumerOptions {
     autoCreateTopics?: boolean;
@@ -298,105 +248,49 @@ export interface ConsumerOptions {
     // (undocumented)
     retry?: ConsumerRetryOptions;
     serializer?: Serializer;
+    stopTimeout?: Duration;
     // (undocumented)
     topicDefaults?: TopicDefaults;
 }
 
-// Warning: (ae-missing-release-tag) "ConsumerRetryOptions" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
-//
 // @public (undocumented)
 export interface ConsumerRetryOptions {
     levels?: readonly RetryLevel[];
-    retryIf?: (error: unknown) => boolean;
+    retryIf?: (error: unknown, failure: RetryContext) => boolean;
     // (undocumented)
     topicNaming?: RetryTopicNaming;
 }
 
-// Warning: (ae-missing-release-tag) "ConsumerState" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
-//
 // @public (undocumented)
 export type ConsumerState = 'idle' | 'starting' | 'running' | 'stopping' | 'stopped';
 
-// Warning: (ae-missing-release-tag) "CoreContext" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
-//
-// @public
-export interface CoreContext<E extends object> {
-    // (undocumented)
-    readonly adapter: ClientAdapter;
-    // (undocumented)
-    readonly clientId: string;
-    // (undocumented)
-    readonly clock: Clock;
-    readonly correlationId: () => string;
-    // (undocumented)
-    readonly emit: <K extends keyof E>(event: K, payload: E[K]) => void;
-    // (undocumented)
-    readonly ensureConnected: () => Promise<void>;
-    // (undocumented)
-    readonly headerNames: HeaderNames;
-    readonly instrumentation?: Instrumentation;
-    // (undocumented)
-    readonly isClosed: () => boolean;
-    // (undocumented)
-    readonly logger: Logger;
-    readonly producePolicy: RetryPolicy;
-    // (undocumented)
-    readonly serializer: Serializer;
-    readonly transaction: <T>(fn: (tx: Transaction) => Promise<T>, options?: TransactionOptions, offsets?: TransactionOffsets) => Promise<T>;
-}
-
-// Warning: (ae-missing-release-tag) "createHarbor" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
-//
 // @public (undocumented)
 export function createHarbor(config: HarborConfig): Harbor;
 
-// Warning: (ae-missing-release-tag) "decodeHeaders" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
-//
 // @public
 export function decodeHeaders(raw: RawHeaders): MessageHeaders;
 
-// Warning: (ae-missing-release-tag) "DEFAULT_DURATION_BUCKETS" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
-//
 // @public
 export const DEFAULT_DURATION_BUCKETS: readonly number[];
 
-// Warning: (ae-missing-release-tag) "defaultDlqTopicNaming" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
-//
 // @public (undocumented)
 export const defaultDlqTopicNaming: DlqTopicNaming;
 
-// Warning: (ae-missing-release-tag) "defaultFailureIf" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
-//
-// @public
-export const defaultFailureIf: (error: unknown) => boolean;
-
-// Warning: (ae-missing-release-tag) "defaultIdempotencyKey" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
-//
 // @public
 export const defaultIdempotencyKey: (message: Message, context: HandlerContext) => string;
 
-// Warning: (ae-missing-release-tag) "defaultRetryTopicNaming" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
-//
 // @public
 export const defaultRetryTopicNaming: RetryTopicNaming;
 
-// Warning: (ae-missing-release-tag) "describeError" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
-//
 // @public
 export const describeError: (error: unknown, maxLength?: number) => string;
 
-// Warning: (ae-missing-release-tag) "DlqTopicNaming" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
-//
 // @public (undocumented)
 export type DlqTopicNaming = (topic: string) => string;
 
-// Warning: (ae-missing-release-tag) "Duration" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
-//
 // @public
 export type Duration = number | string;
 
-// Warning: (ae-missing-release-tag) "ERROR_CODES" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
-//
 // @public
 export const ERROR_CODES: {
     readonly CONFIG_INVALID: "CONFIG_INVALID";
@@ -408,32 +302,30 @@ export const ERROR_CODES: {
     readonly SHUTDOWN_TIMEOUT: "SHUTDOWN_TIMEOUT";
     readonly BATCH_FAILED: "BATCH_FAILED";
     readonly HOLD_EXPIRED: "HOLD_EXPIRED";
+    readonly FENCED: "FENCED";
 };
 
-// Warning: (ae-missing-release-tag) "EventMap" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
-//
 // @public
 export type EventMap = object;
 
-// Warning: (ae-missing-release-tag) "ExposedHarborConfig" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
-//
 // @public
 export type ExposedHarborConfig = Readonly<Omit<HarborConfig, 'sasl'> & {
     sasl?: Readonly<Omit<SaslConfig, 'password'>>;
 }>;
 
-// Warning: (ae-missing-release-tag) "FailureOutcome" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
-//
 // @public (undocumented)
 export type FailureOutcome = 'retry' | 'dead-letter' | 'abort' | 'crash';
 
-// Warning: (ae-missing-release-tag) "Handler" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
-//
+// @public
+export class FencedError extends HarborError {
+    constructor(transactionalId: string, options?: ErrorOptions);
+    // (undocumented)
+    readonly transactionalId: string;
+}
+
 // @public (undocumented)
 export type Handler<T = unknown> = (message: Message<T>, context: HandlerContext) => Promise<void> | void;
 
-// Warning: (ae-missing-release-tag) "HandlerContext" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
-//
 // @public
 export interface HandlerContext {
     readonly attempt: number;
@@ -445,8 +337,6 @@ export interface HandlerContext {
     readonly transaction: <T>(fn: (tx: Transaction) => Promise<T>, options?: TransactionOptions) => Promise<T>;
 }
 
-// Warning: (ae-missing-release-tag) "Harbor" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
-//
 // @public
 export class Harbor implements Observable<HarborEvents> {
     constructor(config: HarborConfig);
@@ -475,8 +365,6 @@ export class Harbor implements Observable<HarborEvents> {
     transaction<T>(fn: (tx: Transaction) => Promise<T>, options?: TransactionOptions): Promise<T>;
 }
 
-// Warning: (ae-missing-release-tag) "HarborConfig" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
-//
 // @public (undocumented)
 export interface HarborConfig {
     adapter: ClientAdapter;
@@ -499,8 +387,6 @@ export interface HarborConfig {
     transactionalId?: string;
 }
 
-// Warning: (ae-missing-release-tag) "HarborError" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
-//
 // @public (undocumented)
 export class HarborError extends Error {
     constructor(code: HarborErrorCode, message: string, options?: ErrorOptions & {
@@ -511,13 +397,9 @@ export class HarborError extends Error {
     readonly retryable: boolean;
 }
 
-// Warning: (ae-missing-release-tag) "HarborErrorCode" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
-//
 // @public (undocumented)
 export type HarborErrorCode = (typeof ERROR_CODES)[keyof typeof ERROR_CODES];
 
-// Warning: (ae-missing-release-tag) "HarborErrorEvent" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
-//
 // @public
 export interface HarborErrorEvent {
     // (undocumented)
@@ -530,8 +412,6 @@ export interface HarborErrorEvent {
     topic?: string;
 }
 
-// Warning: (ae-missing-release-tag) "HarborEvents" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
-//
 // @public (undocumented)
 export interface HarborEvents extends ConsumerEvents, RedriveEvents, ProducerEvents, TransactionEvents {
     // (undocumented)
@@ -544,8 +424,6 @@ export interface HarborEvents extends ConsumerEvents, RedriveEvents, ProducerEve
     };
 }
 
-// Warning: (ae-missing-release-tag) "HarborHealth" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
-//
 // @public (undocumented)
 export interface HarborHealth {
     // (undocumented)
@@ -557,13 +435,9 @@ export interface HarborHealth {
     readonly state: HarborState;
 }
 
-// Warning: (ae-missing-release-tag) "HarborState" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
-//
 // @public (undocumented)
 export type HarborState = 'idle' | 'connecting' | 'connected' | 'closing' | 'closed';
 
-// Warning: (ae-missing-release-tag) "HeaderNames" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
-//
 // @public
 export interface HeaderNames {
     readonly correlationId: string;
@@ -579,21 +453,12 @@ export interface HeaderNames {
     readonly retryCount: string;
 }
 
-// Warning: (ae-missing-release-tag) "headerNames" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
-//
-// @public (undocumented)
-export function headerNames(prefix?: string): HeaderNames;
-
-// Warning: (ae-missing-release-tag) "HeaderOptions" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
-//
 // @public (undocumented)
 export interface HeaderOptions {
     correlationId?: () => string;
     prefix?: string;
 }
 
-// Warning: (ae-missing-release-tag) "HoldExpiredError" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
-//
 // @public
 export class HoldExpiredError extends HarborError {
     constructor(topic: string, heldMs: number, options?: ErrorOptions);
@@ -602,8 +467,6 @@ export class HoldExpiredError extends HarborError {
     readonly topic: string;
 }
 
-// Warning: (ae-missing-release-tag) "IdempotencyEngine" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
-//
 // @public
 export interface IdempotencyEngine {
     // (undocumented)
@@ -613,8 +476,6 @@ export interface IdempotencyEngine {
     }>;
 }
 
-// Warning: (ae-missing-release-tag) "IdempotencyInput" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
-//
 // @public
 export interface IdempotencyInput {
     // (undocumented)
@@ -624,88 +485,71 @@ export interface IdempotencyInput {
     readonly resultTtl?: Duration;
 }
 
-// Warning: (ae-missing-release-tag) "IdempotencyOptions" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
-//
 // @public (undocumented)
 export interface IdempotencyOptions<T = unknown> {
     readonly engine: IdempotencyEngine;
     readonly key?: (message: Message<T>, context: HandlerContext) => string | IdempotencyInput;
 }
 
-// Warning: (ae-missing-release-tag) "Instrumentation" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
-//
 // @public
 export interface Instrumentation {
     onProduce?: (record: OutgoingRecord) => MessageHeaders | undefined;
+    propagationFields?: () => readonly string[];
     wrapBatchHandler?: <T>(messages: readonly Message[], context: BatchContext, run: () => Promise<T>) => Promise<T>;
     wrapHandler?: <T>(message: Message, context: HandlerContext, run: () => Promise<T>) => Promise<T>;
     wrapProduce?: <T>(batch: ProduceBatch, run: () => Promise<T>) => Promise<T>;
 }
 
-// Warning: (ae-missing-release-tag) "isAbortProcessingError" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
-//
 // @public (undocumented)
 export const isAbortProcessingError: (error: unknown) => error is AbortProcessingError;
 
-// Warning: (ae-missing-release-tag) "isBatchFailedError" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
-//
+// @public (undocumented)
+export const isAdapterError: (error: unknown) => error is AdapterError;
+
 // @public (undocumented)
 export const isBatchFailedError: (error: unknown) => error is BatchFailedError;
 
-// Warning: (ae-missing-release-tag) "isDeclaredRetryable" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
-//
+// @public (undocumented)
+export const isClosedError: (error: unknown) => error is ClosedError;
+
+// @public (undocumented)
+export const isConfigError: (error: unknown) => error is ConfigError;
+
 // @public
 export const isDeclaredRetryable: (error: unknown) => boolean;
 
-// Warning: (ae-missing-release-tag) "isHarborError" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
-//
+// @public (undocumented)
+export const isFencedError: (error: unknown) => error is FencedError;
+
 // @public (undocumented)
 export const isHarborError: (error: unknown) => error is HarborError;
 
-// Warning: (ae-missing-release-tag) "isHoldExpiredError" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
-//
 // @public (undocumented)
 export const isHoldExpiredError: (error: unknown) => error is HoldExpiredError;
 
-// Warning: (ae-missing-release-tag) "isRetryable" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
-//
 // @public
 export const isRetryable: (error: unknown) => boolean;
 
-// Warning: (ae-missing-release-tag) "isSerializationError" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
-//
 // @public (undocumented)
 export const isSerializationError: (error: unknown) => error is SerializationError;
 
-// Warning: (ae-missing-release-tag) "isShutdownTimeoutError" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
-//
 // @public (undocumented)
 export const isShutdownTimeoutError: (error: unknown) => error is ShutdownTimeoutError;
 
-// Warning: (ae-missing-release-tag) "isTopicMissingError" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
-//
 // @public (undocumented)
 export const isTopicMissingError: (error: unknown) => error is TopicMissingError;
 
-// Warning: (ae-missing-release-tag) "jsonSerializer" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
-//
 // @public
 export function jsonSerializer<T = unknown>(): SyncSerializer<T>;
 
-// Warning: (ae-missing-release-tag) "Listener" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
-//
 // @public (undocumented)
 export type Listener<T> = (payload: T) => void;
 
-// Warning: (ae-missing-release-tag) "Listeners" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
-//
 // @public
 export type Listeners<E extends EventMap> = {
     [K in keyof E]?: Listener<E[K]>;
 };
 
-// Warning: (ae-missing-release-tag) "Logger" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
-//
 // @public
 export interface Logger {
     // (undocumented)
@@ -718,13 +562,9 @@ export interface Logger {
     warn: (message: string, ...args: unknown[]) => void;
 }
 
-// Warning: (ae-missing-release-tag) "MAX_DURATION_MS" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
-//
 // @public
 export const MAX_DURATION_MS = 2147483647;
 
-// Warning: (ae-missing-release-tag) "Message" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
-//
 // @public
 export interface Message<T = unknown> {
     // (undocumented)
@@ -743,18 +583,12 @@ export interface Message<T = unknown> {
     readonly value: T;
 }
 
-// Warning: (ae-missing-release-tag) "MessageHeaders" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
-//
 // @public
 export type MessageHeaders = Record<string, string>;
 
-// Warning: (ae-missing-release-tag) "murmur2" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
-//
 // @public
 export function murmur2(data: Buffer): number;
 
-// Warning: (ae-missing-release-tag) "Observable" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
-//
 // @public (undocumented)
 export interface Observable<E extends EventMap> {
     // (undocumented)
@@ -763,35 +597,18 @@ export interface Observable<E extends EventMap> {
     on: <K extends keyof E>(event: K, listener: Listener<E[K]>) => this;
 }
 
-// Warning: (ae-missing-release-tag) "OFFSET_PATTERN" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
-//
 // @public
 export const OFFSET_PATTERN: RegExp;
 
-// Warning: (ae-missing-release-tag) "offsetAfter" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
-//
-// @public
-export function offsetAfter(message: RawMessage): TopicPartitionOffset;
-
-// Warning: (ae-missing-release-tag) "offsetDistance" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
-//
-// @public
-export function offsetDistance(from: string, to: string): number;
-
-// Warning: (ae-missing-release-tag) "OutgoingMessage" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
-//
 // @public
 export interface OutgoingMessage<T = unknown> {
     // (undocumented)
     headers?: MessageHeaders;
-    // (undocumented)
-    key?: string | null;
+    key?: string | Buffer | null;
     partition?: number;
     value: T | null;
 }
 
-// Warning: (ae-missing-release-tag) "OutgoingRecord" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
-//
 // @public
 export interface OutgoingRecord {
     // (undocumented)
@@ -800,23 +617,15 @@ export interface OutgoingRecord {
     readonly topic: string;
 }
 
-// Warning: (ae-missing-release-tag) "parseDuration" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
-//
 // @public
-export function parseDuration(value: Duration, name: string): number;
+export function parseDuration(value: Duration, name?: string): number;
 
-// Warning: (ae-missing-release-tag) "partitionForKey" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
-//
 // @public
 export function partitionForKey(key: string | Buffer, partitions: number): number;
 
-// Warning: (ae-missing-release-tag) "partitionKey" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
-//
 // @public
 export const partitionKey: (topic: string, partition: number) => string;
 
-// Warning: (ae-missing-release-tag) "PartitionLag" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
-//
 // @public
 export interface PartitionLag {
     readonly committed: string | null;
@@ -831,16 +640,12 @@ export interface PartitionLag {
     readonly topic: string;
 }
 
-// Warning: (ae-missing-release-tag) "PartitionOffsets" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
-//
 // @public
 export interface PartitionOffsets extends TopicPartition {
     readonly high: string;
     readonly low: string;
 }
 
-// Warning: (ae-missing-release-tag) "ProduceBatch" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
-//
 // @public
 export interface ProduceBatch {
     // (undocumented)
@@ -851,8 +656,6 @@ export interface ProduceBatch {
     readonly topic: string;
 }
 
-// Warning: (ae-missing-release-tag) "ProducedEvent" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
-//
 // @public
 export interface ProducedEvent {
     durationMs: number;
@@ -862,65 +665,42 @@ export interface ProducedEvent {
     topic: string;
 }
 
-// Warning: (ae-missing-release-tag) "ProduceEvents" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
-//
 // @public
 export interface ProduceEvents {
     // (undocumented)
-    messageProduced: ProducedEvent;
+    batchProduced: ProducedEvent;
 }
 
-// Warning: (ae-missing-release-tag) "ProduceKind" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
-//
 // @public
 export type ProduceKind = 'send' | 'retry' | 'dead-letter' | 'redrive' | 'transaction';
 
-// Warning: (ae-missing-release-tag) "Producer" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
-//
-// @public (undocumented)
-export class Producer<T = unknown> {
-    constructor(context: ProducerContext, options?: ProducerOptions<T>);
-    // (undocumented)
+// @public
+export interface Producer<T = unknown> {
     send(topic: string, message: OutgoingMessage<T>): Promise<void>;
     sendBatch(topic: string, messages: readonly OutgoingMessage<T>[]): Promise<void>;
 }
 
-// Warning: (ae-missing-release-tag) "ProducerContext" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
-//
-// @public
-export type ProducerContext = CoreContext<ProducerEvents>;
-
-// Warning: (ae-missing-release-tag) "ProducerEvents" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
-//
 // @public (undocumented)
 export interface ProducerEvents extends ProduceEvents {
     // (undocumented)
     error: HarborErrorEvent;
 }
 
-// Warning: (ae-missing-release-tag) "ProducerOptions" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
-//
 // @public (undocumented)
 export interface ProducerOptions<T = unknown> {
     retry?: ProducerRetryOptions;
     serializer?: Serializer<T>;
 }
 
-// Warning: (ae-missing-release-tag) "ProducerRetryOptions" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
-//
 // @public (undocumented)
 export interface ProducerRetryOptions {
     attempts?: number;
     backoff?: Backoff;
 }
 
-// Warning: (ae-missing-release-tag) "RawHeaders" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
-//
 // @public
 export type RawHeaders = Record<string, Buffer | string | Array<Buffer | string> | undefined>;
 
-// Warning: (ae-missing-release-tag) "RawMessage" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
-//
 // @public
 export interface RawMessage {
     // (undocumented)
@@ -938,8 +718,6 @@ export interface RawMessage {
     readonly value: Buffer | null;
 }
 
-// Warning: (ae-missing-release-tag) "RawRecord" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
-//
 // @public
 export interface RawRecord {
     // (undocumented)
@@ -954,13 +732,9 @@ export interface RawRecord {
     readonly value: Buffer | null;
 }
 
-// Warning: (ae-missing-release-tag) "rawSerializer" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
-//
 // @public
 export function rawSerializer(): SyncSerializer<Buffer>;
 
-// Warning: (ae-missing-release-tag) "RedriveEvents" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
-//
 // @public (undocumented)
 export interface RedriveEvents extends ProduceEvents {
     // (undocumented)
@@ -976,8 +750,6 @@ export interface RedriveEvents extends ProduceEvents {
     };
 }
 
-// Warning: (ae-missing-release-tag) "RedriveOptions" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
-//
 // @public (undocumented)
 export interface RedriveOptions {
     filter?: (message: Message) => boolean | Promise<boolean>;
@@ -990,8 +762,6 @@ export interface RedriveOptions {
     to?: string;
 }
 
-// Warning: (ae-missing-release-tag) "RedriveResult" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
-//
 // @public (undocumented)
 export interface RedriveResult {
     // (undocumented)
@@ -1002,16 +772,18 @@ export interface RedriveResult {
     readonly skipped: number;
 }
 
-// Warning: (ae-missing-release-tag) "reportsOffsets" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
-//
 // @public
 export const reportsOffsets: (admin: {
     fetchTopicOffsets?: unknown;
     fetchCommittedOffsets?: unknown;
 }) => boolean;
 
-// Warning: (ae-missing-release-tag) "RetryInfo" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
-//
+// @public
+export interface RetryContext {
+    readonly attempt: number;
+    readonly topic: string;
+}
+
 // @public
 export interface RetryInfo {
     readonly count: number;
@@ -1020,20 +792,14 @@ export interface RetryInfo {
     readonly originalTopic: string;
 }
 
-// Warning: (ae-missing-release-tag) "RetryLevel" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
-//
 // @public (undocumented)
 export interface RetryLevel {
     readonly delay: Duration;
 }
 
-// Warning: (ae-missing-release-tag) "RetryTopicNaming" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
-//
 // @public (undocumented)
 export type RetryTopicNaming = (topic: string, level: number) => string;
 
-// Warning: (ae-missing-release-tag) "SaslConfig" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
-//
 // @public (undocumented)
 export interface SaslConfig {
     // (undocumented)
@@ -1044,65 +810,40 @@ export interface SaslConfig {
     username: string;
 }
 
-// Warning: (ae-missing-release-tag) "SerializationError" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
-//
 // @public (undocumented)
 export class SerializationError extends HarborError {
     constructor(message: string, options?: ErrorOptions);
 }
 
-// Warning: (ae-missing-release-tag) "Serializer" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
-//
 // @public
 export interface Serializer<T = unknown> {
     // (undocumented)
-    deserialize: (bytes: Buffer, topic: string) => T | Promise<T>;
+    deserialize(bytes: Buffer, topic: string): T | Promise<T>;
     // (undocumented)
-    serialize: (value: T, topic: string) => Buffer | Promise<Buffer>;
+    serialize(value: T, topic: string): Buffer | Promise<Buffer>;
 }
 
-// Warning: (ae-missing-release-tag) "ShutdownTimeoutError" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
-//
 // @public (undocumented)
 export class ShutdownTimeoutError extends HarborError {
     constructor(inFlight: number, timeoutMs: number);
     readonly inFlight: number;
 }
 
-// Warning: (ae-missing-release-tag) "splitPartitionKey" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
-//
 // @public
 export const splitPartitionKey: (key: string) => {
     topic: string;
     partition: number;
 };
 
-// Warning: (ae-missing-release-tag) "stampProducer" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
-//
-// @public
-export function stampProducer(headers: MessageHeaders, names: HeaderNames, stamp: {
-    clientId: string;
-    at: Date;
-    correlationId: () => string;
-}): MessageHeaders;
-
-// Warning: (ae-missing-release-tag) "StopReason" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
-//
 // @public (undocumented)
 export type StopReason = 'shutdown' | 'abort' | 'crash';
 
-// Warning: (ae-missing-release-tag) "stringSerializer" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
-//
 // @public
 export function stringSerializer(): SyncSerializer<string>;
 
-// Warning: (ae-missing-release-tag) "subscribe" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
-//
 // @public
 export function subscribe<E extends EventMap>(target: Observable<E>, listeners: Listeners<E>): () => void;
 
-// Warning: (ae-missing-release-tag) "SubscribeBatchOptions" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
-//
 // @public (undocumented)
 export interface SubscribeBatchOptions<T = unknown> {
     breaker?: ConsumerBreakerOptions | false;
@@ -1111,8 +852,6 @@ export interface SubscribeBatchOptions<T = unknown> {
     size?: number;
 }
 
-// Warning: (ae-missing-release-tag) "SubscribeOptions" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
-//
 // @public (undocumented)
 export interface SubscribeOptions<T = unknown> {
     breaker?: ConsumerBreakerOptions | false;
@@ -1120,31 +859,20 @@ export interface SubscribeOptions<T = unknown> {
     serializer?: Serializer<T>;
 }
 
-// Warning: (ae-missing-release-tag) "SyncSerializer" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
-//
 // @public
 export interface SyncSerializer<T = unknown> extends Serializer<T> {
     // (undocumented)
-    deserialize: (bytes: Buffer, topic: string) => T;
+    deserialize(bytes: Buffer, topic: string): T;
     // (undocumented)
-    serialize: (value: T, topic: string) => Buffer;
+    serialize(value: T, topic: string): Buffer;
 }
 
-// Warning: (ae-missing-release-tag) "systemClock" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
-//
 // @public
-export const systemClock: Clock;
-
-// Warning: (ae-missing-release-tag) "TopicDefaults" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
-//
-// @public (undocumented)
 export interface TopicDefaults {
     partitions?: number;
     replicationFactor?: number;
 }
 
-// Warning: (ae-missing-release-tag) "TopicMissingError" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
-//
 // @public (undocumented)
 export class TopicMissingError extends HarborError {
     constructor(topic: string);
@@ -1152,8 +880,6 @@ export class TopicMissingError extends HarborError {
     readonly topic: string;
 }
 
-// Warning: (ae-missing-release-tag) "TopicPartition" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
-//
 // @public
 export interface TopicPartition {
     // (undocumented)
@@ -1162,28 +888,20 @@ export interface TopicPartition {
     readonly topic: string;
 }
 
-// Warning: (ae-missing-release-tag) "TopicPartitionOffset" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
-//
 // @public (undocumented)
 export interface TopicPartitionOffset extends TopicPartition {
     readonly offset: string;
 }
 
-// Warning: (ae-missing-release-tag) "TopicSpec" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
-//
 // @public (undocumented)
 export interface TopicSpec {
     readonly config?: Record<string, string>;
-    // (undocumented)
     readonly partitions?: number;
-    // (undocumented)
     readonly replicationFactor?: number;
     // (undocumented)
     readonly topic: string;
 }
 
-// Warning: (ae-missing-release-tag) "Transaction" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
-//
 // @public
 export interface Transaction {
     // (undocumented)
@@ -1192,8 +910,6 @@ export interface Transaction {
     sendBatch: <T = unknown>(topic: string, messages: readonly OutgoingMessage<T>[]) => Promise<void>;
 }
 
-// Warning: (ae-missing-release-tag) "TransactionEvents" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
-//
 // @public (undocumented)
 export interface TransactionEvents extends ProduceEvents {
     // (undocumented)
@@ -1206,8 +922,6 @@ export interface TransactionEvents extends ProduceEvents {
     };
 }
 
-// Warning: (ae-missing-release-tag) "TransactionHandle" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
-//
 // @public
 export interface TransactionHandle {
     // (undocumented)
@@ -1219,18 +933,6 @@ export interface TransactionHandle {
     sendOffsets: (consumption: ConsumerHandle, offsets: readonly TopicPartitionOffset[]) => Promise<void>;
 }
 
-// Warning: (ae-missing-release-tag) "TransactionOffsets" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
-//
-// @public
-export interface TransactionOffsets {
-    // (undocumented)
-    readonly consumption: ConsumerHandle;
-    // (undocumented)
-    readonly offsets: readonly TopicPartitionOffset[];
-}
-
-// Warning: (ae-missing-release-tag) "TransactionOptions" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
-//
 // @public (undocumented)
 export interface TransactionOptions {
     serializer?: Serializer;

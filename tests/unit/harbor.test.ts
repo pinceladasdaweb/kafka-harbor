@@ -74,14 +74,16 @@ describe('createHarbor', () => {
       await harbor.producer().send('orders', { value: 1 })
       await consumer.start()
       await new Promise((resolve) => setTimeout(resolve, 10))
-      harbor.enableSignalHandlers(['SIGUSR2'], 0)
-      process.emit('SIGUSR2')
+      // A signal nobody else listens to: under the test runner Node writes a
+      // diagnostic report on SIGUSR2, and Stryker's runner exits on SIGHUP.
+      harbor.enableSignalHandlers(['SIGWINCH'], 0)
+      process.emit('SIGWINCH')
       await new Promise((resolve) => setTimeout(resolve, 20))
     } finally {
       Object.assign(console, original)
     }
     assert.ok(written.some((line) => line.startsWith('error:') && line.includes('listener bug')))
-    assert.ok(written.some((line) => line.startsWith('info:') && line.includes('SIGUSR2')))
+    assert.ok(written.some((line) => line.startsWith('info:') && line.includes('SIGWINCH')))
     assert.ok(written.some((line) => line.startsWith('warn:') && line.includes('handler(s) still running')))
   })
 
@@ -94,11 +96,11 @@ describe('createHarbor', () => {
     await consumer.start()
     await new Promise((resolve) => setTimeout(resolve, 10))
     assert.equal(started, true)
-    h.harbor.enableSignalHandlers(['SIGUSR2'], 0)
-    process.emit('SIGUSR2')
+    h.harbor.enableSignalHandlers(['SIGWINCH'], 0)
+    process.emit('SIGWINCH')
     await new Promise((resolve) => setTimeout(resolve, 20))
     assert.equal(h.harbor.status, 'closed')
-    assert.ok(h.logs.some((entry) => entry.level === 'error' && entry.message.includes('shutdown after SIGUSR2 failed')))
+    assert.ok(h.logs.some((entry) => entry.level === 'error' && entry.message.includes('shutdown after SIGWINCH failed')))
   })
 
   test('the default signals are SIGTERM and SIGINT', async () => {
@@ -327,11 +329,11 @@ describe('createHarbor', () => {
   test('a signal triggers shutdown', async () => {
     const { harbor, logs } = harness()
     await harbor.connect()
-    harbor.enableSignalHandlers(['SIGUSR2'])
-    process.emit('SIGUSR2')
+    harbor.enableSignalHandlers(['SIGWINCH'])
+    process.emit('SIGWINCH')
     await new Promise((resolve) => setTimeout(resolve, 10))
     assert.equal(harbor.status, 'closed')
-    assert.ok(logs.some((entry) => entry.message.includes('SIGUSR2')))
+    assert.ok(logs.some((entry) => entry.message.includes('SIGWINCH')))
   })
 })
 
@@ -399,7 +401,7 @@ describe('error helpers', () => {
   })
 
   test('isHarborError branches on code, not on class identity', () => {
-    assert.equal(isHarborError({ code: ERROR_CODES.SERIALIZATION }), true)
+    assert.equal(isHarborError({ code: ERROR_CODES.SERIALIZATION, retryable: false }), true)
     assert.equal(isHarborError({ code: 'SOMETHING_ELSE' }), false)
     assert.equal(isHarborError(new Error('x')), false)
   })

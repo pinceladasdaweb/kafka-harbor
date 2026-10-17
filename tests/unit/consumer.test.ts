@@ -1,8 +1,8 @@
 import assert from 'node:assert/strict'
 import { describe, test } from 'node:test'
 
-import { ERROR_CODES, type ConsumerEvents, type HarborEvents, type Message } from '../../src/index'
-import { harness, json, text, type Harness } from '../helpers/harness'
+import { ERROR_CODES, FencedError, type ConsumeOptions, type ConsumerEvents, type HarborEvents, type Message, type RawMessage } from '../../src/index'
+import { captureErrors, captureEvents, gate, harness, json, tapConsumption, text, type Harness } from '../helpers/harness'
 import { settle, until } from '../helpers/manual-clock'
 
 type Events = { [K in keyof HarborEvents]: Array<HarborEvents[K]> }
@@ -18,7 +18,7 @@ const capture = (h: Harness): Events => {
     messageFailed: [],
     consumerStopped: [],
     messageRedriven: [],
-    messageProduced: [],
+    batchProduced: [],
     batchProcessed: [],
     circuitStateChanged: [],
     transactionCompleted: []
@@ -397,6 +397,39 @@ describe('Consumer: abort and shutdown', () => {
     await h.harbor.shutdown()
   })
 
+  test('a handler whose transaction was fenced stops the consumer as an abort does: nothing committed, nothing dead-lettered', async () => {
+    const h = harness()
+    const events = capture(h)
+    const consumer = h.harbor.consumer({ groupId: 'g', fromBeginning: true, autoCreateTopics: true, retry: { levels: [{ delay: 0 }] } })
+    // Wrapped by the handler, the fence is still found through the causes.
+    consumer.subscribe('orders', () => { throw new Error('could not ship', { cause: new Error('transaction failed', { cause: new FencedError('orders-service-1') }) }) })
+    await produced(h, 'orders', [1])
+    await consumer.start()
+    await until(() => consumer.status === 'stopped')
+    assert.equal(h.adapter.committed('g', 'orders', 0), undefined)
+    assert.equal(h.adapter.messages('orders-retry-1').length, 0)
+    assert.equal(h.adapter.messages('orders-dlq').length, 0)
+    assert.equal(events.messageFailed[0]?.outcome, 'abort')
+    assert.match(String(events.error[0]?.error), /could not ship/)
+    assert.equal(events.consumerStopped[0]?.reason, 'abort')
+    await h.harbor.shutdown()
+  })
+
+  test('an error whose causes form a cycle, with no fence in them, walks the ladder as usual', async () => {
+    const h = harness()
+    const consumer = h.harbor.consumer({ groupId: 'g', fromBeginning: true, autoCreateTopics: true, retry: { levels: [{ delay: 0 }] } })
+    consumer.subscribe('orders', () => {
+      const loop = new Error('loop') as Error & { cause?: unknown }
+      loop.cause = loop
+      throw loop
+    })
+    await produced(h, 'orders', [1])
+    await consumer.start()
+    await until(() => h.adapter.messages('orders-dlq').length === 1)
+    assert.equal(consumer.status, 'running')
+    await h.harbor.shutdown()
+  })
+
   test('shutdown waits for the in-flight handler, lets it commit, then leaves and disconnects', async () => {
     const h = harness()
     const events = capture(h)
@@ -521,6 +554,22 @@ describe('Consumer: configuration and topics', () => {
     ])
     assert.deepEqual(h.adapter.topics().sort(), ['orders-dlq', 'orders-retry-1', 'orders-retry-2'])
     await h.harbor.shutdown()
+  })
+
+  test('without topic defaults the broker lays the topics out: no partitions or replication factor asked for, only what is configured', async () => {
+    const plain = harness()
+    const consumer = plain.harbor.consumer({ groupId: 'g', autoCreateTopics: true })
+    consumer.subscribe('orders', () => {})
+    await consumer.start()
+    assert.deepEqual(plain.adapter.calls.find((entry) => entry.method === 'createTopics')?.args[0], [{ topic: 'orders-dlq' }])
+    await plain.harbor.shutdown()
+
+    const replicated = harness()
+    const other = replicated.harbor.consumer({ groupId: 'g', autoCreateTopics: true, topicDefaults: { replicationFactor: 3 } })
+    other.subscribe('orders', () => {})
+    await other.start()
+    assert.deepEqual(replicated.adapter.calls.find((entry) => entry.method === 'createTopics')?.args[0], [{ topic: 'orders-dlq', replicationFactor: 3 }])
+    await replicated.harbor.shutdown()
   })
 
   test('without autoCreateTopics, a missing retry or DLQ topic fails start() naming the topic', async () => {
@@ -716,7 +765,7 @@ describe('Consumer: shared retry topics', () => {
       { topic: 'svc-retry-1', partition: 0, offset: '0', groupId: 'g', dlqTopic: 'svc-dlq' },
       { topic: 'svc-retry-1', partition: 0, offset: '1', groupId: 'g', dlqTopic: 'svc-dlq' }
     ])
-    assert.deepEqual(events.messageFailed.map((e) => e.outcome), ['dead-letter', 'dead-letter'])
+    assert.deepEqual(events.messageFailed, [], 'no handler ran: dead letters, not handler failures')
     assert.equal(consumer.status, 'running')
     await h.harbor.shutdown()
   })
@@ -1358,6 +1407,74 @@ describe('Consumer: mutation follow-ups', () => {
     await h.harbor.shutdown()
   })
 
+  test('a handler outliving the stop an abort decided is logged, not reported as another error', async () => {
+    const h = harness({}, { partitions: 2 })
+    const errors = captureErrors(h.harbor)
+    let stuck = false
+    const consumer = h.harbor.consumer({ groupId: 'g', fromBeginning: true, autoCreateTopics: true, concurrency: 2, stopTimeout: '1s' })
+    consumer.subscribe<string>('orders', async (message) => {
+      if (message.value === 'stuck') {
+        stuck = true
+        await new Promise(() => {})
+      }
+      throw h.harbor.abort(new Error('infra'))
+    })
+    const producer = h.harbor.producer<string>()
+    await producer.send('orders', { value: 'stuck', partition: 0 })
+    await consumer.start()
+    await until(() => stuck)
+    await producer.send('orders', { value: 'abort', partition: 1 })
+    await until(() => h.clock.waiting === 1)
+    h.clock.advance(1_000)
+    await until(() => consumer.status === 'stopped')
+    assert.deepEqual(errors.map((event) => (event.error as { code?: string }).code), [ERROR_CODES.ABORT_PROCESSING])
+    assert.ok(h.logs.some((entry) => entry.level === 'warn' && entry.message.includes('1 handler(s) still running after 1000ms')))
+    await h.harbor.shutdown()
+  })
+
+  test('a failure forwarded after the shutdown gave up on it is neither committed nor reported', async () => {
+    const h = harness()
+    const retried = captureEvents(h.harbor, 'messageRetried')
+    let release!: () => void
+    const held = new Promise<void>((resolve) => { release = resolve })
+    let forwarding = false
+    const original = h.adapter.produce
+    h.adapter.produce = async (records) => {
+      if (records.some((record) => record.topic === 'orders-retry-1')) {
+        forwarding = true
+        await held
+      }
+      await original(records)
+    }
+    const consumer = h.harbor.consumer({ groupId: 'g', fromBeginning: true, autoCreateTopics: true, retry: { levels: [{ delay: 0 }] } })
+    consumer.subscribe('orders', () => { throw new Error('fails') })
+    await produced(h, 'orders', [1])
+    await consumer.start()
+    await until(() => forwarding)
+    const closing = h.harbor.shutdown('1s').catch(() => undefined)
+    await until(() => h.clock.waiting >= 1)
+    h.clock.advance(1_000)
+    await closing
+    release()
+    await settle()
+    assert.equal(retried.length, 0)
+    assert.equal(h.adapter.committed('g', 'orders', 0), undefined)
+  })
+
+  test('a handler that throws something other than an object, undefined included, walks the ladder like any failure', async () => {
+    for (const thrown of ['plain text', null, undefined, 42]) {
+      const h = harness()
+      const consumer = h.harbor.consumer({ groupId: 'g', fromBeginning: true, autoCreateTopics: true, retry: { levels: [{ delay: 0 }] } })
+      consumer.subscribe('orders', () => { throw thrown })
+      await produced(h, 'orders', [1])
+      await consumer.start()
+      await until(() => h.adapter.messages('orders-dlq').length === 1)
+      assert.equal(consumer.status, 'running', String(thrown))
+      if (thrown === undefined) assert.match(String(h.adapter.messages('orders-dlq')[0]?.headers['x-last-error']), /threw undefined/)
+      await h.harbor.shutdown()
+    }
+  })
+
   test('every delivery removes its abort listener once settled', async () => {
     const { getEventListeners } = await import('node:events')
     const h = harness()
@@ -1552,5 +1669,301 @@ describe('asynchronous serializers', () => {
     assert.match((refusal as Error).message, /consumer is closed/)
     assert.equal(h.adapter.messages('shipments').length, 0)
     assert.equal(h.adapter.committed('g', 'orders', 0), undefined)
+  })
+})
+
+/** Two subscriptions sharing one retry ladder and one DLQ, routed by the original-topic header. */
+const sharedLadder = { retry: { levels: [{ delay: 0 }], topicNaming: (_topic: string, level: number) => `svc-retry-${level}` }, dlq: { topicNaming: () => 'svc-dlq' } }
+
+const rawMessage = (topic: string, partition: number, offset: string, value: unknown): RawMessage => ({
+  topic,
+  partition,
+  offset,
+  key: null,
+  value: Buffer.from(JSON.stringify(value)),
+  headers: {},
+  timestamp: 1_700_000_000_000
+})
+
+describe('Consumer: revocations and abandoned deliveries', () => {
+  test('a revocation the client asks for while it closes does not wait for handlers the shutdown abandoned', async () => {
+    const h = harness()
+    const original = h.adapter.consume
+    h.adapter.consume = async (options) => {
+      const handle = await original(options)
+      // Like the Confluent client: closing the consumer revokes its partitions and waits for the callback first.
+      return { ...handle, stop: async () => { await options.onPartitionsRevoked?.([{ topic: 'orders', partition: 0 }]); await handle.stop() } }
+    }
+    const held = gate()
+    let started = false
+    const consumer = h.harbor.consumer({ groupId: 'g', fromBeginning: true, autoCreateTopics: true })
+    consumer.subscribe('orders', async () => { started = true; await held.wait })
+    await produced(h, 'orders', [1])
+    await consumer.start()
+    await until(() => started)
+    const closing = h.harbor.shutdown(1_000)
+    await until(() => h.clock.waiting === 1)
+    h.clock.advance(1_000)
+    await assert.rejects(closing, { code: ERROR_CODES.SHUTDOWN_TIMEOUT })
+    assert.equal(h.clock.waiting, 0, 'no wait of maxProcessingTime was left behind')
+    assert.equal(h.adapter.connected, false)
+    held.release()
+  })
+
+  test('a revocation waiting on a running handler ends when the shutdown abandons that handler', async () => {
+    const h = harness()
+    const tap = tapConsumption(h, 'orders')
+    const held = gate()
+    let started = false
+    const consumer = h.harbor.consumer({ groupId: 'g', fromBeginning: true, autoCreateTopics: true })
+    consumer.subscribe('orders', async () => { started = true; await held.wait })
+    await produced(h, 'orders', [1])
+    await consumer.start()
+    await until(() => started)
+    let revoked = false
+    const revoking = (tap().onPartitionsRevoked as NonNullable<ConsumeOptions['onPartitionsRevoked']>)([{ topic: 'orders', partition: 0 }]).then(() => { revoked = true })
+    await until(() => h.clock.waiting === 1)
+    const closing = h.harbor.shutdown(1_000)
+    await until(() => h.clock.waiting === 2)
+    h.clock.advance(1_000)
+    await assert.rejects(closing, { code: ERROR_CODES.SHUTDOWN_TIMEOUT })
+    await revoking
+    assert.equal(revoked, true)
+    assert.equal(h.clock.waiting, 0)
+    assert.equal(h.adapter.committed('g', 'orders', 0), undefined)
+    held.release()
+  })
+
+  test('a failure still being forwarded when the shutdown gives up is not committed and not reported as a failed commit', async () => {
+    const h = harness()
+    const errors = captureErrors(h.harbor)
+    const acknowledged = gate()
+    let forwarding = false
+    const originalProduce = h.adapter.produce
+    h.adapter.produce = async (records) => {
+      const result = await originalProduce(records)
+      if (records.some((record) => record.topic === 'orders-retry-1')) {
+        // The record is on the broker; its acknowledgment is late.
+        forwarding = true
+        await acknowledged.wait
+      }
+      return result
+    }
+    const consumer = h.harbor.consumer({ groupId: 'g', fromBeginning: true, autoCreateTopics: true, retry: { levels: [{ delay: '1m' }] } })
+    consumer.subscribe('orders', () => { throw new Error('no') })
+    await produced(h, 'orders', [1])
+    await consumer.start()
+    await until(() => forwarding)
+    const closing = h.harbor.shutdown(1_000)
+    await until(() => h.clock.waiting === 1)
+    h.clock.advance(1_000)
+    await assert.rejects(closing, { code: ERROR_CODES.SHUTDOWN_TIMEOUT })
+    acknowledged.release()
+    await settle()
+    assert.equal(h.adapter.committed('g', 'orders', 0), undefined, 'redelivered to the next member')
+    assert.equal(h.adapter.messages('orders-retry-1').length, 1, 'the hop that landed is the documented duplicate')
+    assert.deepEqual(errors, [])
+    assert.ok(!h.logs.some((entry) => entry.message.includes('commit failed')))
+  })
+
+  test('a delivery that reaches a consumer already stopping is neither routed nor reported, whatever its topic', async () => {
+    const h = harness()
+    const tap = tapConsumption(h, 'orders')
+    const errors = captureErrors(h.harbor)
+    const held = gate()
+    let started = false
+    const consumer = h.harbor.consumer({ groupId: 'g', fromBeginning: true, autoCreateTopics: true })
+    consumer.subscribe('orders', async () => { started = true; await held.wait })
+    await produced(h, 'orders', [1])
+    await consumer.start()
+    await until(() => started)
+    const closing = h.harbor.shutdown()
+    await settle()
+    assert.equal(consumer.status, 'stopping')
+    await tap().eachMessage(rawMessage('elsewhere', 0, '0', 'stray'))
+    held.release()
+    await closing
+    assert.deepEqual(errors, [], 'no crash for a topic it never subscribed to: it was stopping anyway')
+  })
+
+  test('deliveries that begin while a revocation settles run and commit in order: the client delivered them, so the partition is this member\'s', async () => {
+    const h = harness({}, { partitions: 2 })
+    const tap = tapConsumption(h, 'orders')
+    const held = gate()
+    const seen: unknown[] = []
+    const consumer = h.harbor.consumer({ groupId: 'g', fromBeginning: true, autoCreateTopics: true, concurrency: 2 })
+    consumer.subscribe<string>('orders', async (message) => {
+      seen.push(message.value)
+      if (message.value === 'slow') await held.wait
+    })
+    await h.harbor.producer<string>().send('orders', { value: 'slow', partition: 1 })
+    await consumer.start()
+    await until(() => seen.length === 1)
+    // The settlement waits for the slow handler on partition 1; partition 0, regained meanwhile, keeps delivering.
+    const settling = (tap().onPartitionsRevoked as NonNullable<ConsumeOptions['onPartitionsRevoked']>)([{ topic: 'orders', partition: 0 }, { topic: 'orders', partition: 1 }])
+    for (const offset of [0, 1, 2]) await tap().eachMessage(rawMessage('orders', 0, String(offset), `p0-${offset}`))
+    held.release()
+    await settling
+    assert.deepEqual(seen, ['slow', 'p0-0', 'p0-1', 'p0-2'], 'none skipped: a skipped one would be committed past by the next')
+    assert.equal(h.adapter.committed('g', 'orders', 0), '3')
+    await h.harbor.shutdown()
+  })
+
+  test('a stop waits for an unroutable message being dead-lettered, which commits on its way out', async () => {
+    const h = harness()
+    const errors = captureErrors(h.harbor)
+    const acknowledged = gate()
+    let forwarding = false
+    const original = h.adapter.produce
+    h.adapter.produce = async (records) => {
+      if (records.some((record) => record.topic === 'svc-dlq')) {
+        forwarding = true
+        await acknowledged.wait
+      }
+      await original(records)
+    }
+    const consumer = h.harbor.consumer({ groupId: 'g', fromBeginning: true, autoCreateTopics: true, ...sharedLadder })
+    consumer.subscribe('orders', () => {}).subscribe('payments', () => {})
+    await h.harbor.connect()
+    await consumer.start()
+    await original([{ topic: 'svc-retry-1', key: null, value: Buffer.from('1'), headers: {} }])
+    await until(() => forwarding)
+    const stopping = consumer.stop()
+    await settle()
+    acknowledged.release()
+    await stopping
+    assert.deepEqual(errors, [])
+    assert.equal(h.adapter.messages('svc-dlq').length, 1)
+    assert.equal(h.adapter.committed('g', 'svc-retry-1', 0), '1')
+    await h.harbor.shutdown()
+  })
+
+  test('an unroutable message delivered to a consumer already stopping is not dead-lettered', async () => {
+    const h = harness()
+    const tap = tapConsumption(h, 'svc-retry-1')
+    const held = gate()
+    let started = false
+    const consumer = h.harbor.consumer({ groupId: 'g', fromBeginning: true, autoCreateTopics: true, ...sharedLadder })
+    consumer.subscribe('orders', async () => { started = true; await held.wait }).subscribe('payments', () => {})
+    await produced(h, 'orders', [1])
+    await consumer.start()
+    await until(() => started)
+    const stopping = consumer.stop()
+    await settle()
+    assert.equal(consumer.status, 'stopping')
+    await tap().eachMessage({ topic: 'svc-retry-1', partition: 0, offset: '0', key: null, value: Buffer.from('1'), headers: {}, timestamp: h.clock.now() })
+    held.release()
+    await stopping
+    assert.equal(h.adapter.messages('svc-dlq').length, 0)
+    await h.harbor.shutdown()
+  })
+})
+
+describe('Consumer: what a draining handler may still do', () => {
+  test('a handler the shutdown drains still produces and runs transactions on its way out, and commits', async () => {
+    const h = harness({ transactionalId: 'svc' }, { partitions: 2 })
+    const events = capture(h)
+    const held = gate()
+    let started = 0
+    const consumer = h.harbor.consumer({ groupId: 'g', fromBeginning: true, autoCreateTopics: true, concurrency: 2 })
+    consumer.subscribe<string>('orders', async (message, ctx) => {
+      started++
+      await held.wait
+      if (message.value === 'by transaction') await ctx.transaction(async (tx) => { await tx.send('shipments', { value: message.value }) })
+      else await h.harbor.producer().send('shipments', { value: message.value })
+    })
+    await h.harbor.producer<string>().sendBatch('orders', [{ value: 'by send', partition: 0 }, { value: 'by transaction', partition: 1 }])
+    await consumer.start()
+    await until(() => started === 2)
+    const closing = h.harbor.shutdown()
+    await settle()
+    assert.equal(h.harbor.status, 'closing')
+    held.release()
+    await closing
+    assert.deepEqual(h.adapter.messages('shipments').map((message) => json(message.value)).sort(), ['by send', 'by transaction'])
+    assert.deepEqual(events.messageFailed, [])
+    assert.equal(h.adapter.messages('orders-dlq').length, 0)
+    assert.equal(h.adapter.committed('g', 'orders', 0), '1')
+    assert.equal(h.adapter.committed('g', 'orders', 1), '1')
+  })
+})
+
+describe('Consumer: stop timeouts and the retry predicate', () => {
+  test('stop() takes a duration, and defaults to the consumer\'s stopTimeout', async () => {
+    const h = harness()
+    const held = gate()
+    let started = false
+    const consumer = h.harbor.consumer({ groupId: 'g', fromBeginning: true, autoCreateTopics: true, stopTimeout: '2s' })
+    consumer.subscribe('orders', async () => { started = true; await held.wait })
+    await produced(h, 'orders', [1])
+    await consumer.start()
+    await until(() => started)
+    const stopping = consumer.stop()
+    await until(() => h.clock.waiting === 1)
+    assert.deepEqual(h.clock.sleeps.slice(-1), [2_000])
+    h.clock.advance(2_000)
+    await assert.rejects(stopping, { code: ERROR_CODES.SHUTDOWN_TIMEOUT })
+    held.release()
+
+    const other = harness()
+    const second = other.harbor.consumer({ groupId: 'g', fromBeginning: true, autoCreateTopics: true })
+    const stuck = gate()
+    let running = false
+    second.subscribe('orders', async () => { running = true; await stuck.wait })
+    await produced(other, 'orders', [1])
+    await second.start()
+    await until(() => running)
+    const halting = second.stop('1s')
+    await until(() => other.clock.waiting === 1)
+    assert.deepEqual(other.clock.sleeps.slice(-1), [1_000])
+    other.clock.advance(1_000)
+    await assert.rejects(halting, { code: ERROR_CODES.SHUTDOWN_TIMEOUT })
+    stuck.release()
+    assert.throws(() => other.harbor.consumer({ groupId: 'g', stopTimeout: 'soon' as never }), { code: ERROR_CODES.CONFIG_INVALID, message: /stopTimeout/ })
+    await assert.rejects(other.harbor.consumer({ groupId: 'h' }).stop('soon' as never), { code: ERROR_CODES.CONFIG_INVALID, message: /stop timeout/ })
+  })
+
+  test('a stop the pipeline decides gives the other handlers stopTimeout, and logs the ones it abandons', async () => {
+    const h = harness({}, { partitions: 2 })
+    const events = capture(h)
+    const held = gate()
+    let slow = false
+    const consumer = h.harbor.consumer({ groupId: 'g', fromBeginning: true, autoCreateTopics: true, concurrency: 2, stopTimeout: '3s' })
+    consumer.subscribe<string>('orders', async (message) => {
+      if (message.value === 'slow') {
+        slow = true
+        await held.wait
+        return
+      }
+      await until(() => slow)
+      throw h.harbor.abort(new Error('stop here'))
+    })
+    await h.harbor.producer<string>().sendBatch('orders', [{ value: 'slow', partition: 0 }, { value: 'abort', partition: 1 }])
+    await consumer.start()
+    await until(() => h.clock.waiting === 1)
+    assert.deepEqual(h.clock.sleeps.slice(-1), [3_000])
+    h.clock.advance(3_000)
+    await until(() => events.consumerStopped.length === 1)
+    assert.equal(events.consumerStopped[0]?.reason, 'abort')
+    assert.ok(h.logs.some((entry) => entry.level === 'warn' && entry.message.includes('1 handler(s) still running after 3000ms')))
+    held.release()
+    await h.harbor.shutdown()
+  })
+
+  test('retryIf is told the original topic and the attempt that failed', async () => {
+    const h = harness()
+    const asked: Array<{ topic: string, attempt: number }> = []
+    const consumer = h.harbor.consumer({
+      groupId: 'g',
+      fromBeginning: true,
+      autoCreateTopics: true,
+      retry: { levels: [{ delay: 0 }], retryIf: (_error, failure) => { asked.push({ ...failure }); return true } }
+    })
+    consumer.subscribe('orders', () => { throw new Error('always') })
+    await produced(h, 'orders', [1])
+    await consumer.start()
+    await until(() => h.adapter.messages('orders-dlq').length === 1)
+    assert.deepEqual(asked, [{ topic: 'orders', attempt: 1 }, { topic: 'orders', attempt: 2 }])
+    await h.harbor.shutdown()
   })
 })

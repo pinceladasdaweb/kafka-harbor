@@ -2,7 +2,8 @@ import assert from 'node:assert/strict'
 import { describe, test } from 'node:test'
 
 import { readRetryInfo, writeRetryInfo } from '../../src/headers'
-import { decodeHeaders, headerNames } from '../../src/index'
+import { decodeHeaders } from '../../src/index'
+import { headerNames } from '../../src/headers'
 
 const names = headerNames()
 

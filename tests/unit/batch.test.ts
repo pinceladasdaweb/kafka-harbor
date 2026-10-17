@@ -1,8 +1,8 @@
 import assert from 'node:assert/strict'
 import { describe, test } from 'node:test'
 
-import { BatchFailedError, ERROR_CODES, type HarborEvents, type Instrumentation, type Message } from '../../src/index'
-import { captureErrors, captureEvents, gate, harness, type Harness } from '../helpers/harness'
+import { BatchFailedError, ERROR_CODES, FencedError, type ConsumeOptions, type HarborEvents, type Instrumentation, type Message } from '../../src/index'
+import { captureErrors, captureEvents, gate, harness, tapConsumption, type Harness } from '../helpers/harness'
 import { until } from '../helpers/manual-clock'
 
 interface Order { id: string, total: number }
@@ -12,6 +12,8 @@ const events = (h: Harness): { processed: Array<HarborEvents['messageProcessed']
   failed: captureEvents(h.harbor, 'messageFailed'),
   batches: captureEvents(h.harbor, 'batchProcessed')
 })
+
+type Revoke = NonNullable<ConsumeOptions['onPartitionsRevoked']>
 
 const orders = (...ids: string[]): Array<{ value: Order }> => ids.map((id) => ({ value: { id, total: 1 } }))
 const idsOf = (messages: Array<Message<Order>>): string[] => messages.map((message) => message.value.id)
@@ -196,6 +198,39 @@ describe('consumer.subscribeBatch()', () => {
     assert.equal(errors.length, 1)
     assert.deepEqual([errors[0]?.scope, errors[0]?.groupId, errors[0]?.topic, (errors[0]?.error as { code: string }).code], ['consumer', 'g', 'orders', ERROR_CODES.ABORT_PROCESSING])
     assert.equal(h.adapter.committed('g', 'orders', 0), undefined)
+    await h.harbor.shutdown()
+  })
+
+  test('a BatchFailedError whose cause is harbor.abort() or a FencedError stops the consumer: the named messages are not dead-lettered', async () => {
+    for (const stop of [(h: Harness) => h.harbor.abort(new Error('stop')), () => new FencedError('tx-1')]) {
+      const h = harness()
+      const { failed, batches: runs } = events(h)
+      const stopped: string[] = []
+      h.harbor.on('consumerStopped', (event) => { stopped.push(event.reason) })
+      const consumer = h.harbor.consumer({ groupId: 'g', fromBeginning: true, autoCreateTopics: true })
+      consumer.subscribeBatch<Order>('orders', (messages) => { throw new BatchFailedError(messages.slice(0, 1), stop(h)) }, { size: 2 })
+      await consumer.start()
+      await h.harbor.producer<Order>().sendBatch('orders', orders('a', 'b'))
+      await until(() => stopped.length === 1)
+      assert.deepEqual(stopped, ['abort'])
+      assert.deepEqual(failed.map((event) => event.outcome), ['abort', 'abort'])
+      assert.deepEqual(runs.map((run) => run.outcome), ['abort'])
+      assert.equal(h.adapter.messages('orders-dlq').length, 0)
+      assert.equal(h.adapter.committed('g', 'orders', 0), undefined)
+      await h.harbor.shutdown()
+    }
+  })
+
+  test('a batch handler that rejects with undefined failed: the batch walks the ladder, never counted as processed', async () => {
+    const h = harness()
+    const { batches: runs } = events(h)
+    const consumer = h.harbor.consumer({ groupId: 'g', fromBeginning: true, autoCreateTopics: true, retry: { levels: [] } })
+    // eslint-disable-next-line prefer-promise-reject-errors -- the case under test
+    consumer.subscribeBatch<Order>('orders', async () => { await Promise.reject(undefined) }, { size: 2 })
+    await consumer.start()
+    await h.harbor.producer<Order>().sendBatch('orders', orders('a', 'b'))
+    await until(() => h.adapter.messages('orders-dlq').length === 2)
+    assert.deepEqual(runs.map((run) => run.outcome), ['dead-letter'])
     await h.harbor.shutdown()
   })
 
@@ -394,17 +429,12 @@ describe('consumer.subscribeBatch()', () => {
     plain.subscribeBatch('orders', () => {}).subscribeBatch('invoices', () => {})
   })
 
-  test('a revocation runs the batch still collecting on the partition and commits it before releasing; a delivery that waited through it is left to the next owner', async () => {
+  test('a revocation runs the batch still collecting on the partition and commits it before releasing; a delivery the client makes after that is collected as usual', async () => {
     const h = harness()
     const { processed } = events(h)
     const batches: string[][] = []
     const held = gate()
-    let revoke!: (partitions: Array<{ topic: string, partition: number }>) => Promise<void>
-    const original = h.adapter.consume
-    h.adapter.consume = async (options) => {
-      revoke = options.onPartitionsRevoked as typeof revoke
-      return await original(options)
-    }
+    const tap = tapConsumption(h, 'orders')
     const consumer = h.harbor.consumer({ groupId: 'g', fromBeginning: true, autoCreateTopics: true })
     consumer.subscribeBatch<Order>('orders', async (messages) => {
       batches.push(idsOf(messages))
@@ -415,19 +445,50 @@ describe('consumer.subscribeBatch()', () => {
     await h.harbor.producer<Order>().sendBatch('orders', orders('a', 'b'))
     await until(() => h.clock.waiting === 1)
     let revoked = false
-    const revoking = revoke([{ topic: 'orders', partition: 0 }]).then(() => { revoked = true })
+    const revoking = (tap().onPartitionsRevoked as Revoke)([{ topic: 'orders', partition: 0 }]).then(() => { revoked = true })
     await until(() => batches.length === 1)
     assert.equal(revoked, false, 'the revocation waits for the flushed batch')
-    // A delivery arriving while that batch runs waits for it; once the
-    // partition was revoked meanwhile, it must not start a batch here.
+    // Delivered after the revocation began: the client says the partition
+    // is this member's (it kept it, or got it back), so it is collected; a
+    // message skipped here would be committed past by the next one.
     await h.harbor.producer<Order>().send('orders', { value: { id: 'c', total: 1 } })
     await new Promise((resolve) => setImmediate(resolve))
     held.release()
     await revoking
     await until(() => processed.length === 2)
     assert.equal(h.adapter.committed('g', 'orders', 0), '2', 'the flushed batch committed before the release')
+    await until(() => h.clock.waiting === 1)
+    h.clock.advance(60_000)
+    await until(() => processed.length === 3)
+    assert.deepEqual(batches, [['a', 'b'], ['c']])
+    assert.equal(h.adapter.committed('g', 'orders', 0), '3')
+    await h.harbor.shutdown()
+  })
+
+  test('a delivery waiting for its partition\'s running batch when the partition is revoked is left to the next owner', async () => {
+    const h = harness()
+    const batches: string[][] = []
+    const held = gate()
+    const tap = tapConsumption(h, 'orders')
+    const consumer = h.harbor.consumer({ groupId: 'g', fromBeginning: true, autoCreateTopics: true })
+    consumer.subscribeBatch<Order>('orders', async (messages) => {
+      batches.push(idsOf(messages))
+      if (batches.length === 1) await held.wait
+    }, { size: 10, maxWait: '1s' })
+    await consumer.start()
+    await h.harbor.producer<Order>().sendBatch('orders', orders('a', 'b'))
+    await until(() => h.clock.waiting === 1)
+    h.clock.advance(1_000)
+    await until(() => batches.length === 1)
+    // Delivered while the batch runs: it waits for that batch first.
+    await h.harbor.producer<Order>().send('orders', { value: { id: 'c', total: 1 } })
     await new Promise((resolve) => setImmediate(resolve))
-    assert.equal(h.clock.waiting, 0, 'no batch collects on the revoked partition')
+    const revoking = (tap().onPartitionsRevoked as Revoke)([{ topic: 'orders', partition: 0 }])
+    held.release()
+    await revoking
+    await new Promise((resolve) => setImmediate(resolve))
+    assert.equal(h.adapter.committed('g', 'orders', 0), '2')
+    assert.equal(h.clock.waiting, 0, 'no batch collects for the message that waited through the revocation')
     assert.deepEqual(batches, [['a', 'b']])
     await h.harbor.shutdown()
   })
@@ -577,6 +638,29 @@ describe('consumer.subscribeBatch()', () => {
     assert.equal(processed.length, 0, 'nothing is processed-as-committed')
     assert.equal(batches.length, 0)
     assert.equal(consumer.status, 'running')
+    await h.harbor.shutdown()
+  })
+
+  test('a message that does not decode and crashes the consumer before the handler got the batch is no batch run', async () => {
+    const h = harness()
+    const { failed, batches: runs } = events(h)
+    const stopped: string[] = []
+    h.harbor.on('consumerStopped', (event) => { stopped.push(event.reason) })
+    let handled = 0
+    const consumer = h.harbor.consumer({ groupId: 'g', fromBeginning: true, autoCreateTopics: true, dlq: { enabled: false } })
+    consumer.subscribeBatch<Order>('orders', () => { handled++ }, { size: 2 })
+    await h.harbor.connect()
+    await h.adapter.produce([
+      { topic: 'orders', key: null, value: Buffer.from('not json'), headers: {} },
+      { topic: 'orders', key: null, value: Buffer.from('{"id":"b","total":1}'), headers: {} }
+    ])
+    await consumer.start()
+    await until(() => stopped.length === 1)
+    assert.deepEqual(stopped, ['crash'])
+    assert.deepEqual(failed.map((event) => event.outcome), ['crash'])
+    assert.deepEqual(runs, [], 'the handler never got the batch')
+    assert.equal(handled, 0)
+    assert.equal(h.adapter.committed('g', 'orders', 0), undefined)
     await h.harbor.shutdown()
   })
 })

@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict'
 import { describe, test } from 'node:test'
 
-import { ERROR_CODES, isSerializationError, jsonSerializer, rawSerializer, stringSerializer } from '../../src/index'
+import { ERROR_CODES, isSerializationError, jsonSerializer, rawSerializer, stringSerializer, type TransactionOptions } from '../../src/index'
+import { harness } from '../helpers/harness'
 
 describe('jsonSerializer', () => {
   const codec = jsonSerializer()
@@ -115,5 +116,64 @@ describe('rawSerializer and stringSerializer', () => {
     const codec = stringSerializer()
     assert.equal(codec.deserialize(codec.serialize('olá', 't'), 't'), 'olá')
     assert.throws(() => codec.serialize(42 as unknown as string, 't'), { code: ERROR_CODES.SERIALIZATION })
+  })
+})
+
+describe('jsonSerializer and toJSON', () => {
+  const codec = jsonSerializer()
+
+  test('an object with toJSON is checked as JSON reads it: through what toJSON returns, given its key', () => {
+    class Money {
+      readonly format = (): string => `${this.cents} cents`
+      constructor (readonly cents: number) {}
+      toJSON (): unknown { return { cents: this.cents } }
+    }
+    const keys: string[] = []
+    const traced = { toJSON (key: string): string { keys.push(key); return 'traced' } }
+    const value = { url: new URL('http://example.test/a'), price: new Money(5), traced, list: [traced] }
+    assert.equal(codec.serialize(value, 't').toString(), JSON.stringify(value))
+    assert.deepEqual(keys.slice(0, 2), ['traced', '0'], 'the property name, then the index, as JSON.stringify passes them')
+    keys.length = 0
+    codec.serialize(traced, 't')
+    assert.equal(keys[0], '', 'the root is the empty key')
+  })
+
+  test('what toJSON returns is held to the same rules as any value', () => {
+    assert.throws(() => codec.serialize({ a: { toJSON: () => undefined } }, 't'), (error: unknown) => isSerializationError(error) && /value\.a is a undefined/.test((error as Error).message))
+    assert.throws(() => codec.serialize({ a: { toJSON: () => new Map() } }, 't'), (error: unknown) => isSerializationError(error) && /value\.a is a Map/.test((error as Error).message))
+  })
+
+  test('only own enumerable keys are checked, the ones JSON reads', () => {
+    const inherited = Object.create({ hidden: undefined }) as Record<string, unknown>
+    inherited.shown = 1
+    assert.equal(codec.serialize(inherited, 't').toString(), '{"shown":1}')
+  })
+  test('toJSON is called once per value, as JSON does: what it returns is written by its own keys', () => {
+    class Self {
+      readonly a = 1
+      toJSON (): unknown { return this }
+    }
+    assert.equal(codec.serialize({ x: new Self() }, 't').toString(), '{"x":{"a":1}}')
+    assert.throws(() => codec.serialize({ x: { toJSON: () => new Date(0) } }, 't'), (error: unknown) => isSerializationError(error) && /value\.x is a Date returned by toJSON; JSON writes it as \{\}/.test((error as Error).message))
+    // A function among the keys of what toJSON returned is dropped by JSON, as anywhere else.
+    assert.throws(() => codec.serialize({ x: { toJSON: () => ({ b: 1, toJSON: () => undefined }) } }, 't'), (error: unknown) => isSerializationError(error) && /value\.x\.toJSON is a function/.test((error as Error).message))
+  })
+
+  test('a cycle that runs through toJSON is named as a cycle', () => {
+    const looping: { toJSON: () => unknown } = { toJSON: () => ({ again: looping }) }
+    assert.throws(() => codec.serialize({ x: looping }, 't'), (error: unknown) => isSerializationError(error) && /value\.x\.again closes a cycle/.test((error as Error).message))
+  })
+})
+
+describe('serializers wherever the harbor takes one', () => {
+  test('a serializer of any type fits the harbor, a consumer and a transaction, not only a producer', async () => {
+    const h = harness({ serializer: stringSerializer(), transactionalId: 'svc' })
+    h.harbor.consumer({ groupId: 'g', serializer: rawSerializer() })
+    const options: TransactionOptions = { serializer: jsonSerializer<{ id: string }>() }
+    await h.harbor.transaction(async (tx) => { await tx.send('orders', { value: { id: 'a' } }) }, options)
+    await h.harbor.producer().send('notes', { value: 'plain text' })
+    assert.equal(h.adapter.messages('orders')[0]?.value?.toString(), '{"id":"a"}')
+    assert.equal(h.adapter.messages('notes')[0]?.value?.toString(), 'plain text')
+    await h.harbor.shutdown()
   })
 })

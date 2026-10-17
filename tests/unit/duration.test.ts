@@ -51,4 +51,9 @@ describe('parseDuration', () => {
   test('rejects non-string non-number input', () => {
     assert.throws(() => parseDuration(null as unknown as number, 'x'), { code: ERROR_CODES.CONFIG_INVALID })
   })
+
+  test('without a name, an error speaks of the duration', () => {
+    assert.equal(parseDuration('2s'), 2_000)
+    assert.throws(() => parseDuration('soon'), { message: /^duration / })
+  })
 })

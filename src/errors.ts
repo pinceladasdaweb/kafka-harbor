@@ -6,8 +6,11 @@
  * the CJS build of this package in the same process (a dual-published
  * dependency that requires one while the app imports the other), and then
  * `instanceof HarborError` is false for errors thrown by the other copy. The
- * type guards below therefore check `code`, not the prototype chain, and
- * they are the supported way to branch on an error.
+ * type guards below therefore check the shape (a `code` from this table and
+ * a boolean `retryable`), not the prototype chain, and they are the
+ * supported way to branch on an error. The codes are shared with the sibling
+ * libraries of the same family on purpose: an error that means the same
+ * thing carries the same code.
  */
 import type { Message } from './types'
 
@@ -29,7 +32,9 @@ export const ERROR_CODES = {
   /** A batch handler named the messages of its batch that failed (`BatchFailedError`). */
   BATCH_FAILED: 'BATCH_FAILED',
   /** A message waited its `breaker.hold` for the topic's circuit and it stayed open; it goes down the ladder. */
-  HOLD_EXPIRED: 'HOLD_EXPIRED'
+  HOLD_EXPIRED: 'HOLD_EXPIRED',
+  /** Another producer took the harbor's transactional id; this harbor runs no more transactions (`FencedError`). */
+  FENCED: 'FENCED'
 } as const
 
 export type HarborErrorCode = (typeof ERROR_CODES)[keyof typeof ERROR_CODES]
@@ -87,6 +92,26 @@ export class HoldExpiredError extends HarborError {
 }
 
 /**
+ * A transaction refused because another producer took the harbor's
+ * `transactionalId` (a second instance configured with the same id, or the
+ * replacement of this one after a restart): the broker fenced this
+ * producer, and opening it again would fence the other one back. The
+ * harbor runs no more transactions; a consumer whose handler throws it,
+ * or an error caused by it, stops without committing, as on
+ * `harbor.abort`, so the instance that
+ * lost the id goes quiet instead of dead-lettering what the other one
+ * processes.
+ */
+export class FencedError extends HarborError {
+  readonly transactionalId: string
+
+  constructor (transactionalId: string, options?: ErrorOptions) {
+    super(ERROR_CODES.FENCED, `transactional id "${transactionalId}" is held by another producer; this one was fenced and runs no more transactions`, { ...options, retryable: false })
+    this.transactionalId = transactionalId
+  }
+}
+
+/**
  * Thrown by `harbor.abort(cause)` inside a handler. The consumer does NOT
  * commit the offset and stops fetching: the message will be redelivered
  * after a restart. Reserved for infrastructure bugs where reprocessing is
@@ -94,7 +119,8 @@ export class HoldExpiredError extends HarborError {
  */
 export class AbortProcessingError extends HarborError {
   constructor (cause: unknown) {
-    super(ERROR_CODES.ABORT_PROCESSING, 'handler aborted processing; the offset was not committed', { cause })
+    // Never retried: it stops the consumer, which is the point.
+    super(ERROR_CODES.ABORT_PROCESSING, 'handler aborted processing; the offset was not committed', { cause, retryable: false })
   }
 }
 
@@ -145,12 +171,24 @@ export class ShutdownTimeoutError extends HarborError {
   }
 }
 
+/** A harbor error from any copy of the package: one of its codes, and a boolean `retryable` next to it. */
+const isShaped = (error: unknown): error is { code: unknown, retryable: boolean } =>
+  typeof error === 'object' && error !== null && typeof (error as { retryable?: unknown }).retryable === 'boolean'
+
 const hasCode = (error: unknown, code: HarborErrorCode): boolean =>
-  typeof error === 'object' && error !== null && (error as { code?: unknown }).code === code
+  isShaped(error) && error.code === code
 
 export const isHarborError = (error: unknown): error is HarborError =>
-  typeof error === 'object' && error !== null &&
-  (Object.values(ERROR_CODES) as unknown[]).includes((error as { code?: unknown }).code)
+  isShaped(error) && (Object.values(ERROR_CODES) as unknown[]).includes(error.code)
+
+export const isConfigError = (error: unknown): error is ConfigError =>
+  hasCode(error, ERROR_CODES.CONFIG_INVALID)
+
+export const isAdapterError = (error: unknown): error is AdapterError =>
+  hasCode(error, ERROR_CODES.ADAPTER)
+
+export const isClosedError = (error: unknown): error is ClosedError =>
+  hasCode(error, ERROR_CODES.CLOSED)
 
 export const isAbortProcessingError = (error: unknown): error is AbortProcessingError =>
   hasCode(error, ERROR_CODES.ABORT_PROCESSING)
@@ -166,6 +204,9 @@ export const isShutdownTimeoutError = (error: unknown): error is ShutdownTimeout
 
 export const isHoldExpiredError = (error: unknown): error is HoldExpiredError =>
   hasCode(error, ERROR_CODES.HOLD_EXPIRED)
+
+export const isFencedError = (error: unknown): error is FencedError =>
+  hasCode(error, ERROR_CODES.FENCED)
 
 export const isBatchFailedError = (error: unknown): error is BatchFailedError =>
   hasCode(error, ERROR_CODES.BATCH_FAILED) && Array.isArray((error as { failed?: unknown }).failed)

@@ -10,17 +10,17 @@
  */
 import { circuitBreaker, type BreakerState, type CircuitBreakerOptions, type CircuitBreakerPolicy } from 'breakwater'
 
-import { ConfigError, isAbortProcessingError, isBatchFailedError, isRetryable } from './errors'
+import { ConfigError, isBatchFailedError, isRetryable } from './errors'
 import { parseDuration } from './duration'
 import type { Duration } from './types'
 
 export interface ConsumerBreakerOptions extends CircuitBreakerOptions {
   /**
    * The longest a message waits for the circuit to admit it, counted from
-   * when it was received, retry delay included; then it fails with a
-   * `HoldExpiredError` (retryable) and walks the ladder. Must fit under
-   * `maxProcessingTime`, the longest a delivery may take anyway. Default:
-   * what is left of `maxProcessingTime`.
+   * the moment its handler would have run; then it fails with a
+   * `HoldExpiredError` (retryable) and walks the ladder. Never longer than
+   * what is left of `maxProcessingTime` since the message was delivered,
+   * the longest a delivery may take anyway, which is also the default.
    */
   hold?: Duration
   /**
@@ -59,12 +59,12 @@ export const isCircuitRejection = (error: unknown): boolean =>
 /**
  * What counts as the dependency failing, unless the options say otherwise:
  * a failure the handler declared deterministic (`retryable: false`) is the
- * message's fault, a `harbor.abort()` is a decision, not an outage, and a
- * batch handler that resolved for the rest of its batch (`BatchFailedError`)
- * did reach the dependency.
+ * message's fault, and so are a `harbor.abort()` and a `FencedError`, which
+ * are decisions, not outages; a batch handler that resolved for the rest of
+ * its batch (`BatchFailedError`) did reach the dependency.
  */
 export const defaultFailureIf = (error: unknown): boolean =>
-  isRetryable(error) && !isAbortProcessingError(error) && !isBatchFailedError(error)
+  isRetryable(error) && !isBatchFailedError(error)
 
 export function resolveBreaker (options: ConsumerBreakerOptions | false | undefined, groupId: string, topic: string, maxProcessingTimeMs: number): Breaker | undefined {
   if (options === undefined || options === false) return undefined
