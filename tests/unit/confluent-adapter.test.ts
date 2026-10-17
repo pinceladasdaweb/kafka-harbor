@@ -669,7 +669,10 @@ describe('confluentAdapter: less travelled paths', () => {
     assert.deepEqual(calls.disconnected.sort(), ['admin', 'producer', 'producer'])
   })
 
-  test('without a client option the adapter loads @confluentinc/kafka-javascript itself', async () => {
+  test('without a client option the adapter loads @confluentinc/kafka-javascript itself', async (t) => {
+    // An install with --ignore-scripts (the unit job of the CI) has the package without its native binding.
+    const installed = await import('@confluentinc/kafka-javascript').then(() => true, () => false)
+    if (!installed) return t.skip('the native binding is not installed here')
     // A property librdkafka does not know fails the connect at once, before any broker is reached.
     const adapter = confluentAdapter({ global: { 'bogus.property': true } })
     await assert.rejects(adapter.connect({ clientId: 'probe', brokers: ['127.0.0.1:1'] }), { code: ERROR_CODES.ADAPTER, message: /connect failed: No such configuration property: "bogus.property"/ })
