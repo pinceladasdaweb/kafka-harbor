@@ -661,4 +661,17 @@ describe('confluentAdapter: less travelled paths', () => {
     assert.equal(calls.runConfig?.partitionsConsumedConcurrently, 3)
     await assert.rejects(calls.runConfig!.eachMessage!({ topic: 't', partition: 0, heartbeat: async () => {}, pause: () => () => {}, message: { key: null, value: null, timestamp: '1', offset: '0', attributes: 0, headers: {} } as KafkaJS.KafkaMessage }), /handler/)
   })
+
+  test('a failed connect with a transactionalId disconnects the transactional producer too', async () => {
+    const { module, calls } = fakeClient({ producerConnectError: Object.assign(new Error('refused'), { code: -195 }) })
+    const adapter = confluentAdapter({ client: module })
+    await assert.rejects(adapter.connect({ ...broker, transactionalId: 'orders-service-1' }), { code: ERROR_CODES.ADAPTER, retryable: true })
+    assert.deepEqual(calls.disconnected.sort(), ['admin', 'producer', 'producer'])
+  })
+
+  test('without a client option the adapter loads @confluentinc/kafka-javascript itself', async () => {
+    // A property librdkafka does not know fails the connect at once, before any broker is reached.
+    const adapter = confluentAdapter({ global: { 'bogus.property': true } })
+    await assert.rejects(adapter.connect({ clientId: 'probe', brokers: ['127.0.0.1:1'] }), { code: ERROR_CODES.ADAPTER, message: /connect failed: No such configuration property: "bogus.property"/ })
+  })
 })

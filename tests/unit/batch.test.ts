@@ -496,4 +496,87 @@ describe('consumer.subscribeBatch()', () => {
     assert.throws(() => consumer.subscribeBatch('payments', () => {}), /subscribeBatch\(\) must be called before start\(\)/)
     await h.harbor.shutdown()
   })
+
+  test('a shutdown that gave up while the batch was being decoded does not let the handler start', async () => {
+    const decoding = gate()
+    let decodes = 0
+    const slow = {
+      serialize: (value: unknown): Buffer => Buffer.from(JSON.stringify(value)),
+      deserialize: async (bytes: Buffer): Promise<unknown> => {
+        decodes++
+        await decoding.wait
+        return JSON.parse(bytes.toString('utf8'))
+      }
+    }
+    const h = harness({ serializer: slow })
+    const { processed, batches } = events(h)
+    let runs = 0
+    const consumer = h.harbor.consumer({ groupId: 'g', fromBeginning: true, autoCreateTopics: true })
+    consumer.subscribeBatch<Order>('orders', () => { runs++ }, { size: 1 })
+    await consumer.start()
+    await h.harbor.producer<Order>().sendBatch('orders', orders('a'))
+    await until(() => decodes === 1)
+    const closing = h.harbor.shutdown(1_000)
+    await until(() => h.clock.waiting === 1)
+    h.clock.advance(1_000)
+    await assert.rejects(closing, { code: ERROR_CODES.SHUTDOWN_TIMEOUT })
+    decoding.release()
+    await until(() => h.clock.waiting === 0)
+    assert.equal(runs, 0)
+    assert.equal(h.adapter.committed('g', 'orders', 0), undefined)
+    assert.equal(processed.length, 0)
+    assert.equal(batches.length, 0)
+  })
+
+  test('a batch handler abandoned by the shutdown commits nothing and reports nothing when it finally returns', async () => {
+    const h = harness()
+    const { processed, batches } = events(h)
+    const held = gate()
+    const consumer = h.harbor.consumer({ groupId: 'g', fromBeginning: true, autoCreateTopics: true })
+    consumer.subscribeBatch<Order>('orders', async () => { await held.wait }, { size: 2 })
+    await consumer.start()
+    await h.harbor.producer<Order>().sendBatch('orders', orders('a', 'b'))
+    await until(() => h.adapter.calls.filter((call) => call.method === 'consume').length === 1)
+    await until(() => h.clock.waiting === 0)
+    const closing = h.harbor.shutdown(1_000)
+    await until(() => h.clock.waiting === 1)
+    h.clock.advance(1_000)
+    await assert.rejects(closing, { code: ERROR_CODES.SHUTDOWN_TIMEOUT })
+    held.release()
+    await until(() => h.clock.waiting === 0)
+    assert.equal(h.adapter.committed('g', 'orders', 0), undefined)
+    assert.equal(processed.length, 0)
+    assert.equal(batches.length, 0)
+  })
+
+  test('a batch whose commit fails is reported, not counted as processed, and comes again', async () => {
+    const h = harness()
+    const errors = captureErrors(h.harbor)
+    const { processed, batches } = events(h)
+    const original = h.adapter.consume
+    let failures = 1
+    h.adapter.consume = async (options) => {
+      const handle = await original(options)
+      const commit = handle.commit
+      handle.commit = async (offsets) => {
+        if (failures-- > 0) throw new Error('REBALANCE_IN_PROGRESS')
+        await commit(offsets)
+      }
+      return handle
+    }
+    const seen: string[][] = []
+    const consumer = h.harbor.consumer({ groupId: 'g', fromBeginning: true, autoCreateTopics: true })
+    consumer.subscribeBatch<Order>('orders', (messages) => { seen.push(idsOf(messages)) }, { size: 2 })
+    await consumer.start()
+    await h.harbor.producer<Order>().sendBatch('orders', orders('a', 'b'))
+    await until(() => errors.length === 1)
+    assert.deepEqual(seen, [['a', 'b']])
+    assert.equal(errors[0]?.topic, 'orders')
+    assert.match((errors[0]?.error as Error).message, /REBALANCE_IN_PROGRESS/)
+    assert.equal(h.adapter.committed('g', 'orders', 0), undefined)
+    assert.equal(processed.length, 0, 'nothing is processed-as-committed')
+    assert.equal(batches.length, 0)
+    assert.equal(consumer.status, 'running')
+    await h.harbor.shutdown()
+  })
 })

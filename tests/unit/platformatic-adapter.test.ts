@@ -1024,4 +1024,124 @@ describe('platformaticAdapter: admin', () => {
       return true
     })
   })
+
+  test('a failed connect with a transactionalId closes the transactional producer too', async () => {
+    const { module, calls } = fakeClient({ connectError: networkError() })
+    const adapter = platformaticAdapter({ client: module })
+    await assert.rejects(adapter.connect({ ...broker, transactionalId: 'orders-service-1' }), { code: ERROR_CODES.ADAPTER, retryable: true })
+    assert.deepEqual(calls.closed.sort(), ['admin', 'producer', 'producer'])
+  })
+
+  test('without a client option the adapter loads @platformatic/kafka itself', async () => {
+    const adapter = platformaticAdapter({ admin: { retries: 0 }, producer: { retries: 0 } })
+    await assert.rejects(adapter.connect({ clientId: 'probe', brokers: ['127.0.0.1:1'] }), { code: ERROR_CODES.ADAPTER, message: /connect failed/ })
+  })
+
+  test('a topic the metadata does not know has no partitions to ask about', async () => {
+    const { adapter, calls } = await connected({ metadata: { a: [1] }, offsets: () => [{ name: 'a', partitions: [{ partitionIndex: 0, offset: 3n, timestamp: 0n, leaderEpoch: 0 }] }] })
+    assert.deepEqual(await adapter.admin.fetchTopicOffsets!(['missing', 'a']), [{ topic: 'a', partition: 0, low: '3', high: '3' }])
+    const [query] = calls.offsetQueries as [{ topics: unknown[] }]
+    assert.deepEqual(query.topics, [{ name: 'a', partitions: [{ partitionIndex: 0, timestamp: -1n }] }])
+    await adapter.disconnect()
+  })
+
+  test('a reopen that fails after the stop is neither reported nor retried', async () => {
+    const { handle, errors, consumer, stream } = await consuming({}, { reconnectDelayMs: 5 })
+    let refuse!: () => void
+    const pending = new Promise<void>((resolve) => { refuse = resolve })
+    let reopening = false
+    consumer.consume = async () => {
+      reopening = true
+      await pending
+      throw new Error('late refusal')
+    }
+    stream().destroy(new Error('fetch gave up'))
+    await until(() => reopening, 'the reopen under way')
+    const stopping = handle.stop()
+    refuse()
+    await stopping
+    await settle()
+    assert.equal(errors.length, 1, 'the late refusal is not a failure of a consumption that stopped')
+  })
+
+  test('a partition regained while no stream is open rotates nothing: the next stream starts fresh anyway', async () => {
+    const { handle, received, errors, consumer, stream } = await consuming({}, { reconnectDelayMs: 60_000 })
+    consumer.assignments = [{ topic: 't', partitions: [0] }]
+    consumer.emit('consumer:group:join', { groupId: 'g', memberId: 'm' })
+    stream().push(message({ offset: 0 }))
+    await until(() => received.length === 1, 'a delivery')
+    consumer.assignments = []
+    consumer.emit('consumer:group:join', { groupId: 'g', memberId: 'm' })
+    stream().destroy(new Error('fetch gave up'))
+    await until(() => errors.length === 1, 'the failure reported')
+    consumer.assignments = [{ topic: 't', partitions: [0] }]
+    consumer.emit('consumer:group:join', { groupId: 'g', memberId: 'm' })
+    await settle()
+    assert.equal(consumer.streams.length, 1, 'nothing to rotate while the reconnect wait runs')
+    // The dead stream is forgotten: a client error in the wait is reported, not dropped on a stream that is gone.
+    consumer.emit('error', new Error('rejoin gave up'))
+    assert.equal(errors.length, 2)
+    assert.match((errors[1] as Error).message, /consumer failed: rejoin gave up/)
+    await handle.stop()
+  })
+
+  test('a client error that is not an Error still drops the stream, described', async () => {
+    const { handle, errors, consumer } = await consuming({}, { reconnectDelayMs: 5 })
+    consumer.emit('error', 'not even an error')
+    await until(() => consumer.streams.length === 2, 'a new stream after the client error')
+    assert.match((errors[0] as Error).message, /consume failed: not even an error/)
+    await handle.stop()
+  })
+
+  test('a partition paused while it waits for a worker slot is skipped at its turn and comes back on resume', async () => {
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => { release = resolve })
+    const { handle, received, stream } = await consuming({}, {}, { hold: async (raw) => { if (raw.partition === 0) await gate } })
+    stream().push(message({ partition: 0, offset: 0 }))
+    stream().push(message({ partition: 1, offset: 0 }))
+    await settle()
+    handle.pause!([{ topic: 't', partition: 1 }])
+    release()
+    await until(() => received.length === 1, 'the first delivery')
+    await settle()
+    assert.deepEqual(received.map((raw) => raw.partition), [0], 'the paused partition did not take the slot')
+    handle.resume!([{ topic: 't', partition: 1 }])
+    await until(() => received.length === 2, 'the resumed delivery')
+    await handle.stop()
+  })
+
+  test('a join that keeps everything leaves the stream waiting for room; a stop lets it go', async () => {
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => { release = resolve })
+    const { handle, received, stream, consumer } = await consuming({}, { bufferedMessages: 1 }, { hold: async (raw) => { if (raw.offset === '0') await gate } })
+    consumer.assignments = [{ topic: 't', partitions: [0] }]
+    consumer.emit('consumer:group:join', { groupId: 'g', memberId: 'm' })
+    for (const offset of [0, 1, 2, 3]) stream().push(message({ offset }))
+    await settle()
+    assert.equal(stream().readableLength, 1, 'one in flight, one queued, one waiting for room, one unread')
+    consumer.emit('consumer:group:join', { groupId: 'g', memberId: 'm' })
+    await settle()
+    assert.equal(stream().readableLength, 1, 'nothing changed, nothing was read')
+    const stopping = handle.stop()
+    await stopping
+    release()
+    await settle()
+    assert.deepEqual(received.map((raw) => raw.offset), ['0'])
+  })
+
+  test('a stop asked from onError, while a failure is reported, ends the read loop without a reconnect wait', async () => {
+    const { adapter, calls } = await connected()
+    let stopping: Promise<void> | undefined
+    const handle = await adapter.consume({
+      groupId: 'g',
+      topics: ['t'],
+      eachMessage: async () => {},
+      onError: () => { stopping ??= handle.stop() }
+    })
+    calls.consumers[0]!.streams[0]!.destroy(new Error('fetch gave up'))
+    await until(() => stopping !== undefined, 'the stop from onError')
+    await stopping
+    assert.equal(calls.consumeOptions.length, 1, 'no reconnect was tried')
+    await adapter.disconnect()
+  })
 })

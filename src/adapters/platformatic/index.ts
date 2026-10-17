@@ -424,6 +424,9 @@ class Consumption {
         this.lost.clear()
       }
       const failure = await this.pump(stream)
+      // The stream is dead from here, whoever ended it: a client error or a
+      // regained partition meanwhile has no stream to drop or rotate.
+      this.stream = undefined
       stream = undefined
       if (this.stopped) return
       if (this.rotating) {
@@ -566,23 +569,27 @@ class Consumption {
     this.ready.push(key)
   }
 
-  /** Every free slot takes the partition that has been waiting longest. */
+  /**
+   * Every free slot takes the partition that has been waiting longest. A
+   * partition lines up with a message queued and neither running nor paused
+   * (`markReady`), and leaves the line with its queue (`discard`); only a
+   * pause can come between the two.
+   */
   private dispatch (): void {
     while (!this.stopped && this.active < this.concurrency && this.ready.length > 0) {
       const key = this.ready.shift() as string
       this.waiting.delete(key)
-      if (this.running.has(key) || this.paused.has(key) || (this.queues.get(key)?.length ?? 0) === 0) continue
+      if (this.paused.has(key)) continue
+      const message = (this.queues.get(key) as ClientMessage[]).shift() as ClientMessage
+      this.queued--
       this.running.add(key)
       this.active++
-      this.deliverNext(key).catch(() => undefined)
+      this.deliver(key, message).catch(() => undefined)
     }
   }
 
-  private async deliverNext (key: string): Promise<void> {
+  private async deliver (key: string, message: ClientMessage): Promise<void> {
     try {
-      const message = this.queues.get(key)?.shift()
-      if (message === undefined) return
-      this.queued--
       this.release()
       if (!this.isAssigned(message.topic, message.partition)) {
         this.lastQueued.delete(key)
@@ -639,6 +646,15 @@ class Consumption {
   }
 }
 
+/** The client as installed next to the application; a `client` option replaces it. */
+async function loadInstalledClient (): Promise<PlatformaticClientModule> {
+  // The unit suite loads the installed client through here; V8 still reports
+  // a branch of its own inside the dynamic import, which no test can take.
+  /* c8 ignore next */
+  const installed: unknown = await import('@platformatic/kafka')
+  return installed as PlatformaticClientModule
+}
+
 export function platformaticAdapter (options: PlatformaticAdapterOptions = {}): ClientAdapter {
   refuse([options.global, options.producer, options.consumer, options.admin], RESERVED_CLIENT_KEYS, 'comes from the harbor configuration')
   refuse([options.global, options.consumer], RESERVED_CONSUMER_KEYS, 'is managed by the adapter (the core commits after the handler and reads bytes)')
@@ -660,8 +676,7 @@ export function platformaticAdapter (options: PlatformaticAdapterOptions = {}): 
   const loadClient = async (): Promise<PlatformaticClientModule> => {
     try {
       if (typeof options.client === 'function') return await options.client()
-      if (options.client !== undefined) return options.client
-      return await import('@platformatic/kafka') as unknown as PlatformaticClientModule
+      return options.client ?? await loadInstalledClient()
     } catch (cause) {
       throw new AdapterError('@platformatic/kafka could not be loaded; add it as a dependency to use platformaticAdapter()', { cause, retryable: false })
     }

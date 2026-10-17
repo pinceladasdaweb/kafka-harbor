@@ -171,6 +171,15 @@ const groupByTopic = (records: readonly RawRecord[]): KafkaJS.TopicMessages[] =>
   return [...byTopic].map(([topic, messages]) => ({ topic, messages }))
 }
 
+/** The client as installed next to the application; a `client` option replaces it. */
+async function loadInstalledClient (): Promise<ConfluentClientModule> {
+  // The unit suite loads the installed client through here; V8 still reports
+  // a branch of its own inside the dynamic import, which no test can take.
+  /* c8 ignore next */
+  const installed: unknown = await import('@confluentinc/kafka-javascript')
+  return installed as ConfluentClientModule
+}
+
 export function confluentAdapter (options: ConfluentAdapterOptions = {}): ClientAdapter {
   for (const source of [options.global, options.consumer]) {
     for (const key of RESERVED_CONSUMER_KEYS) {
@@ -200,8 +209,7 @@ export function confluentAdapter (options: ConfluentAdapterOptions = {}): Client
   const loadClient = async (): Promise<ConfluentClientModule> => {
     try {
       if (typeof options.client === 'function') return await options.client()
-      if (options.client !== undefined) return options.client
-      return await import('@confluentinc/kafka-javascript') as unknown as ConfluentClientModule
+      return options.client ?? await loadInstalledClient()
     } catch (cause) {
       throw new AdapterError('@confluentinc/kafka-javascript could not be loaded; add it as a dependency to use confluentAdapter()', { cause, retryable: false })
     }

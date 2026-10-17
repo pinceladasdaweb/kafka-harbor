@@ -244,6 +244,12 @@ interface Pending {
 /** A consumption whose adapter can hold a partition back, which is what lets a retry delay outgrow the poll interval. */
 type PausableHandle = ConsumerHandle & Required<Pick<ConsumerHandle, 'pause' | 'resume'>>
 
+/** The concurrency gate parked messages of one consumption come back through. */
+interface Slots {
+  active: number
+  waiting: Array<() => void>
+}
+
 /** A retry message waiting in memory for its due time, its partition paused meanwhile. */
 interface Parked {
   readonly timer: AbortController
@@ -333,7 +339,7 @@ export class Consumer {
    * slot of their own per consumption: at most `concurrency` of them run
    * at a time, the same bound the adapter keeps for its deliveries.
    */
-  private readonly reentries = new Map<ConsumerHandle, { active: number, waiting: Array<() => void> }>()
+  private readonly reentries = new Map<ConsumerHandle, Slots>()
   /** The breakers of the guarded topics, with the listener that reports their state changes, released on stop. */
   private readonly breakers: Array<{ breaker: Breaker, listener: (change: CircuitStateChange) => void }> = []
   /** The batch being collected on each partition of a batch subscription, keyed by `partitionKey`. */
@@ -872,18 +878,18 @@ export class Consumer {
     this.context.clock.sleep(waitMs, timer.signal).then(async () => {
       if (timer.signal.aborted) return
       this.parked.delete(key)
-      await this.takeSlot(handle)
+      const slots = await this.takeSlot(handle)
       try {
         await this.receive(raw, true)
       } finally {
-        this.freeSlot(handle)
+        this.freeSlot(slots)
         this.resumeQuietly(handle, partition)
       }
     }).catch(() => undefined).finally(finish)
     return true
   }
 
-  private async takeSlot (handle: ConsumerHandle): Promise<void> {
+  private async takeSlot (handle: ConsumerHandle): Promise<Slots> {
     let slots = this.reentries.get(handle)
     if (slots === undefined) {
       slots = { active: 0, waiting: [] }
@@ -891,11 +897,10 @@ export class Consumer {
     }
     if (slots.active >= this.concurrency) await new Promise<void>((resolve) => slots.waiting.push(resolve))
     slots.active++
+    return slots
   }
 
-  private freeSlot (handle: ConsumerHandle): void {
-    const slots = this.reentries.get(handle)
-    if (slots === undefined) return
+  private freeSlot (slots: Slots): void {
     slots.active--
     slots.waiting.shift()?.()
   }

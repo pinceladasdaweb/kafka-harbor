@@ -1492,4 +1492,65 @@ describe('asynchronous serializers', () => {
     assert.equal(h.adapter.messages('orders').length, 0)
     await h.harbor.shutdown()
   })
+
+  test('a shutdown that gave up while the message was being decoded does not let the handler start', async () => {
+    let release!: () => void
+    const decoding = new Promise<void>((resolve) => { release = resolve })
+    let decodes = 0
+    const slow = {
+      serialize: (value: unknown): Buffer => Buffer.from(JSON.stringify(value)),
+      deserialize: async (bytes: Buffer): Promise<unknown> => {
+        decodes++
+        await decoding
+        return JSON.parse(bytes.toString('utf8'))
+      }
+    }
+    const h = harness({ serializer: slow })
+    const events = capture(h)
+    let handled = 0
+    const consumer = h.harbor.consumer({ groupId: 'g', fromBeginning: true, autoCreateTopics: true })
+    consumer.subscribe('orders', () => { handled++ })
+    await produced(h, 'orders', [1])
+    await consumer.start()
+    await until(() => decodes === 1)
+    const closing = h.harbor.shutdown(1_000)
+    await until(() => h.clock.waiting === 1)
+    h.clock.advance(1_000)
+    await assert.rejects(closing, { code: ERROR_CODES.SHUTDOWN_TIMEOUT })
+    release()
+    await settle()
+    assert.equal(handled, 0, 'the handler never ran on the stopped consumer')
+    assert.equal(h.adapter.committed('g', 'orders', 0), undefined)
+    assert.equal(events.messageProcessed.length, 0)
+  })
+
+  test('a handler abandoned by the shutdown is refused a transaction: the consumption it would commit through is gone', async () => {
+    const h = harness({ transactionalId: 'orders-service' })
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => { release = resolve })
+    let refusal: unknown
+    const consumer = h.harbor.consumer({ groupId: 'g', fromBeginning: true, autoCreateTopics: true })
+    consumer.subscribe('orders', async (_message, ctx) => {
+      await gate
+      try {
+        await ctx.transaction(async (tx) => { await tx.send('shipments', { value: 'late' }) })
+      } catch (error) {
+        refusal = error
+      }
+    })
+    await produced(h, 'orders', [1])
+    await consumer.start()
+    await until(() => h.adapter.calls.some((call) => call.method === 'consume'))
+    await settle()
+    const closing = h.harbor.shutdown(1_000)
+    await until(() => h.clock.waiting === 1)
+    h.clock.advance(1_000)
+    await assert.rejects(closing, { code: ERROR_CODES.SHUTDOWN_TIMEOUT })
+    release()
+    await until(() => refusal !== undefined)
+    assert.equal((refusal as { code: string }).code, ERROR_CODES.CLOSED)
+    assert.match((refusal as Error).message, /consumer is closed/)
+    assert.equal(h.adapter.messages('shipments').length, 0)
+    assert.equal(h.adapter.committed('g', 'orders', 0), undefined)
+  })
 })

@@ -288,4 +288,40 @@ describe('retry delays with a partition that pauses', () => {
     assert.equal(h.adapter.committed('g', 'orders-retry-1', 0), '2')
     await h.harbor.shutdown()
   })
+
+  test('a stop while a delivery waits behind a parked message, or sleeps out its delay without pause, leaves it uncommitted', async () => {
+    // Through a pause that does nothing, the second retry message waits on the first one's wait; the stop ends both.
+    const leaky = harness()
+    const leakyOriginal = leaky.adapter.consume
+    leaky.adapter.consume = async (options) => ({ ...(await leakyOriginal(options)), pause: () => {} })
+    const retried: unknown[] = []
+    const leakyConsumer = leaky.harbor.consumer({ groupId: 'g', fromBeginning: true, autoCreateTopics: true, retry: { levels: [{ delay: '2s' }] } })
+    leakyConsumer.subscribe('orders', (message) => {
+      if (message.topic === 'orders') throw new Error('first time')
+      retried.push(message.value)
+    })
+    await leakyConsumer.start()
+    await leaky.harbor.producer().sendBatch('orders', [{ value: 'a' }, { value: 'b' }])
+    await until(() => leaky.logs.some((entry) => entry.level === 'warn' && entry.message.includes('delivered orders-retry-1[0]@1 on a paused partition')))
+    await leaky.harbor.shutdown()
+    assert.deepEqual(retried, [])
+    assert.equal(leaky.adapter.committed('g', 'orders-retry-1', 0), undefined)
+    assert.equal(leaky.adapter.messages('orders-retry-1').length, 2, 'both are left for the next member')
+    assert.equal(leaky.clock.waiting, 0)
+
+    // Without pause/resume the delivery sleeps; the stop wakes it and it goes without running the handler.
+    const plain = harness()
+    withoutPause(plain)
+    let attempts = 0
+    const consumer = plain.harbor.consumer({ groupId: 'g', fromBeginning: true, autoCreateTopics: true, retry: { levels: [{ delay: '30s' }] } })
+    consumer.subscribe('orders', () => { attempts++; throw new Error('always') })
+    await consumer.start()
+    await plain.harbor.producer().send('orders', { value: 1 })
+    await until(() => plain.clock.waiting === 1)
+    await plain.harbor.shutdown()
+    assert.equal(attempts, 1, 'the retry never ran')
+    assert.equal(plain.adapter.committed('g', 'orders-retry-1', 0), undefined)
+    assert.equal(plain.adapter.messages('orders-dlq').length, 0)
+    assert.equal(plain.clock.waiting, 0)
+  })
 })

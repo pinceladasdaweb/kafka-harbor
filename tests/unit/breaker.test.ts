@@ -442,4 +442,37 @@ describe('consumer circuit breaker', () => {
     setOpen(false)
     assert.equal(changes.length, 2, 'nothing reported after the stop')
   })
+
+  test('a stop that begins while the message is decoded ends the hold before it starts: no look at the circuit, nothing committed', async () => {
+    const h = harness()
+    const { policy, setOpen } = fakeBreaker()
+    const failed = captureEvents(h.harbor, 'messageFailed')
+    let release!: () => void
+    const decoding = new Promise<void>((resolve) => { release = resolve })
+    let decodes = 0
+    const slow = {
+      serialize: (value: unknown): Buffer => Buffer.from(JSON.stringify(value)),
+      deserialize: async (bytes: Buffer): Promise<unknown> => {
+        decodes++
+        await decoding
+        return JSON.parse(bytes.toString('utf8'))
+      }
+    }
+    let handled = 0
+    const consumer = h.harbor.consumer({ groupId: 'g', fromBeginning: true, autoCreateTopics: true, serializer: slow })
+    consumer.subscribe('orders', () => { handled++ }, { breaker: { policy } })
+    await consumer.start()
+    setOpen(true)
+    await h.harbor.producer().send('orders', { value: 'a' })
+    await until(() => decodes === 1)
+    const stopping = consumer.stop()
+    await settle()
+    release()
+    await stopping
+    assert.equal(handled, 0)
+    assert.equal(h.adapter.committed('g', 'orders', 0), undefined)
+    assert.equal(failed.length, 0)
+    assert.ok(!h.clock.sleeps.includes(1_000), 'the hold never slept: the stop was already under way')
+    await h.harbor.shutdown()
+  })
 })
